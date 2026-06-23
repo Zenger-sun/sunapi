@@ -11,6 +11,11 @@ type Settings struct {
 	DefaultOutputPricePer1K float64 `json:"default_output_price_per_1k" yaml:"default_output_price_per_1k"`
 	CurrencySymbol          string  `json:"currency_symbol" yaml:"currency_symbol"`
 	AutoOpenBrowser         bool    `json:"auto_open_browser" yaml:"auto_open_browser"`
+	DefaultStartPage        string  `json:"default_start_page" yaml:"default_start_page"`
+	ShowDashboard           bool    `json:"show_dashboard" yaml:"show_dashboard"`
+	ShowAPIKeys             bool    `json:"show_api_keys" yaml:"show_api_keys"`
+	ShowUsageLogs           bool    `json:"show_usage_logs" yaml:"show_usage_logs"`
+	ShowPlayground          bool    `json:"show_playground" yaml:"show_playground"`
 }
 
 type Channel struct {

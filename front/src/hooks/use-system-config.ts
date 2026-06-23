@@ -50,6 +50,11 @@ interface StatusApiResponse {
     usd_exchange_rate?: number
     custom_currency_symbol?: string
     custom_currency_exchange_rate?: number
+    default_start_page?: string
+    show_dashboard?: boolean
+    show_api_keys?: boolean
+    show_usage_logs?: boolean
+    show_playground?: boolean
   }
 }
 
@@ -108,6 +113,11 @@ export function mapStatusDataToConfig(
     footerHtml: data.footer_html,
     demoSiteEnabled: data.demo_site_enabled,
     displayTokenStatEnabled: data.display_token_stat_enabled,
+    defaultStartPage: data.default_start_page || '/home',
+    showDashboard: data.show_dashboard ?? true,
+    showApiKeys: data.show_api_keys ?? true,
+    showUsageLogs: data.show_usage_logs ?? true,
+    showPlayground: data.show_playground ?? true,
     currency,
   }
 }

@@ -69,6 +69,34 @@ func (s *Store) AdminUserByUsername(ctx context.Context, username string) (Admin
 	return user, err
 }
 
+func (s *Store) UpdateAdminPassword(ctx context.Context, userID int64, passwordHash string) (AdminUser, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(
+		ctx,
+		`UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?`,
+		passwordHash,
+		now,
+		userID,
+	)
+	if err != nil {
+		return AdminUser{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return AdminUser{}, err
+	}
+	if affected == 0 {
+		return AdminUser{}, sql.ErrNoRows
+	}
+	var user AdminUser
+	err = s.db.QueryRowContext(
+		ctx,
+		`SELECT id, username, password_hash, created_at, updated_at FROM admin_users WHERE id = ? LIMIT 1`,
+		userID,
+	).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.CreatedAt, &user.UpdatedAt)
+	return user, err
+}
+
 func (s *Store) AdminUserBySession(ctx context.Context, token string) (AdminUser, bool, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {

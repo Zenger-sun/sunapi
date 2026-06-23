@@ -109,6 +109,11 @@ func RegisterRoutes(engine *gin.Engine, store *Store, writer *ConfigWriter) {
 			"github_oauth":                  false,
 			"oidc_enabled":                  false,
 			"server_address":                localServerURL(settings),
+			"default_start_page":            settings.DefaultStartPage,
+			"show_dashboard":                settings.ShowDashboard,
+			"show_api_keys":                 settings.ShowAPIKeys,
+			"show_usage_logs":               settings.ShowUsageLogs,
+			"show_playground":               settings.ShowPlayground,
 			"version":                       "local",
 			"start_time":                    startedAt.Unix(),
 		})

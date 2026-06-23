@@ -37,6 +37,7 @@ const consolePathPrefixes = [
   '/dashboard',
   '/channels',
   '/groups',
+  '/keys',
   '/settings',
   '/usage-logs',
 ]
@@ -65,7 +66,7 @@ function isTopNavLinkActive(pathname: string, link: TopNavLink) {
   if (link.isActive) return true
   if (link.external || /^https?:\/\//.test(link.href)) return false
 
-  if (normalizePath(link.href) === '/dashboard') {
+  if (normalizePath(link.href) === '/dashboard' || normalizePath(link.href) === '/channels') {
     return isConsolePath(pathname)
   }
 

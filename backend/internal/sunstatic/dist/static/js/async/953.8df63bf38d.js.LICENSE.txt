@@ -1,0 +1,24 @@
+/*!
+ * wordcloud2.js
+ * http://timdream.org/wordcloud2.js/
+ *
+ * Copyright 2011 - 2019 Tim Guan-tin Chien and contributors.
+ * Released under the MIT license
+ */
+
+/**
+ * @license React
+ * react-is.production.min.js
+ *
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/**
+ * @license lucide-react v1.21.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */

@@ -108,11 +108,12 @@ func main() {
 				url := browserURL(cfg)
 				homeURL := strings.TrimRight(url, "/") + "/home"
 				consoleURL := strings.TrimRight(url, "/") + "/dashboard"
+				startURL := strings.TrimRight(url, "/") + settings.DefaultStartPage
 				fmt.Printf("SunAPI home: %s\n", homeURL)
 				fmt.Printf("SunAPI console: %s\n", consoleURL)
 				fmt.Printf("OpenAI-compatible endpoint: %s\n", url)
 				if settings.AutoOpenBrowser && !noBrowser {
-					go openBrowser(homeURL)
+					go openBrowser(startURL)
 				}
 			},
 		}).

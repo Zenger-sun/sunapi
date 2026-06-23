@@ -12,6 +12,11 @@ export interface AdminCredentials {
   password: string
 }
 
+export interface AdminPasswordPayload {
+  current_password: string
+  new_password: string
+}
+
 function unwrapAuthStatus(data: unknown): AdminAuthStatus {
   const payload = data as {
     success?: boolean
@@ -51,10 +56,14 @@ export function adminAuthErrorMessage(error: unknown, fallback: string) {
       return '请先登录'
     case 'invalid username or password':
       return '密码不正确'
+    case 'invalid current password':
+      return '当前密码不正确'
     case 'username and password are required':
       return '请输入管理员密码'
     case 'username and password are required; password must be at least 8 characters':
       return '请设置至少 8 位管理员密码'
+    case 'current password is required; new password must be at least 8 characters':
+      return '请输入当前密码，并设置至少 8 位新密码'
     case 'admin user already initialized':
       return '管理员已初始化，请直接登录'
     default:
@@ -87,4 +96,11 @@ export async function loginAdmin(credentials: AdminCredentials) {
 export async function logoutAdmin() {
   const res = await api.post('/api/auth/logout', {})
   return res.data
+}
+
+export async function updateAdminPassword(payload: AdminPasswordPayload) {
+  const res = await api.post('/api/auth/password', payload, {
+    skipErrorHandler: true,
+  })
+  return unwrapUser(res.data)
 }

@@ -58,22 +58,25 @@ function joinPath(base: string, pathname: string): string {
 
 const setupSteps = [
   {
-    title: '添加上游渠道',
+    title: '创建分组',
     description:
-      '进入控制台的渠道页面，填写上游 Base URL、API Key、模型名称和输入/输出单价。',
-    href: '/channels',
-  },
-  {
-    title: '配置分组',
-    description:
-      '默认分组为 default。需要区分不同用途时，可在分组页设置名称和价格倍率。',
+      '先进入分组页创建可用分组。创建渠道时需要选择分组，分组也会参与后续价格倍率统计。',
     href: '/groups',
+    action: '去创建分组',
   },
   {
-    title: '接入本机入口',
+    title: '添加并测试渠道',
     description:
-      '应用请求 SunAPI，本地服务会自动选择可用渠道并记录 Token、调用次数和成本。',
-    href: '/dashboard',
+      '进入渠道页填写上游 Base URL、API Key、模型名称和价格，选择分组后保存并测试。测试通过后即可进入创作台使用。',
+    href: '/channels',
+    action: '去创建渠道',
+  },
+  {
+    title: '创建 API 密钥',
+    description:
+      '作为中转站使用时，先在 API 密钥页创建 Token，再使用一键 Codex 或一键 Claude 完成客户端接入。',
+    href: '/keys',
+    action: '去创建 Token',
   },
 ]
 
@@ -183,7 +186,7 @@ export function Docs() {
                   className='mt-4 px-0'
                   render={<Link to={step.href} />}
                 >
-                  去配置
+                  {step.action}
                 </Button>
               </div>
             ))}

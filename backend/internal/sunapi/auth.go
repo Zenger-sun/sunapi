@@ -24,6 +24,11 @@ type adminCredentialsPayload struct {
 	Password string `json:"password"`
 }
 
+type adminPasswordUpdatePayload struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
 func RegisterAuthRoutes(api *gin.RouterGroup, store *Store) {
 	api.GET("/auth/status", func(c *gin.Context) {
 		initialized, err := store.AdminInitialized(c.Request.Context())
@@ -143,6 +148,44 @@ func RegisterAuthRoutes(api *gin.RouterGroup, store *Store) {
 		}
 		clearAdminSessionCookie(c)
 		ok(c, gin.H{})
+	})
+
+	api.POST("/auth/password", RequireAdmin(store), func(c *gin.Context) {
+		var payload adminPasswordUpdatePayload
+		if !bindJSON(c, &payload) {
+			return
+		}
+		currentPassword := payload.CurrentPassword
+		newPassword := payload.NewPassword
+		if strings.TrimSpace(currentPassword) == "" || len(newPassword) < 8 {
+			fail(c, http.StatusBadRequest, errors.New("current password is required; new password must be at least 8 characters"))
+			return
+		}
+		userValue, exists := c.Get("sunapi_admin_user")
+		if !exists {
+			fail(c, http.StatusUnauthorized, errors.New("admin login required"))
+			return
+		}
+		user, okUser := userValue.(AdminUser)
+		if !okUser {
+			fail(c, http.StatusUnauthorized, errors.New("admin login required"))
+			return
+		}
+		if compareAdminPassword(user.PasswordHash, currentPassword) != nil {
+			fail(c, http.StatusUnauthorized, errors.New("invalid current password"))
+			return
+		}
+		passwordHash, err := hashAdminPassword(newPassword)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		updated, err := store.UpdateAdminPassword(c.Request.Context(), user.ID, passwordHash)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, adminUserResponse(updated, true))
 	})
 }
 

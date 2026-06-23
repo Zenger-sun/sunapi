@@ -24,24 +24,38 @@ import {
   Settings,
 } from 'lucide-react'
 import { type SidebarData } from '@/components/layout/types'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 export function useSidebarData(): SidebarData {
+  const config = useSystemConfigStore((state) => state.config)
+  const showDashboard = config.showDashboard ?? true
+  const showApiKeys = config.showApiKeys ?? true
+  const showUsageLogs = config.showUsageLogs ?? true
+
   return {
     navGroups: [
       {
         id: 'general',
         title: '常规',
         items: [
-          {
-            title: '数据看板',
-            url: '/dashboard',
-            icon: BarChart3,
-          },
-          {
-            title: 'API 密钥',
-            url: '/keys',
-            icon: KeyRound,
-          },
+          ...(showDashboard
+            ? [
+                {
+                  title: '数据看板',
+                  url: '/dashboard',
+                  icon: BarChart3,
+                },
+              ]
+            : []),
+          ...(showApiKeys
+            ? [
+                {
+                  title: 'API 密钥',
+                  url: '/keys',
+                  icon: KeyRound,
+                },
+              ]
+            : []),
           {
             title: '渠道&分组',
             url: '/channels',
@@ -49,11 +63,15 @@ export function useSidebarData(): SidebarData {
             configUrls: ['/channels', '/groups'],
             icon: Radio,
           },
-          {
-            title: '使用日志',
-            url: '/usage-logs',
-            icon: FileText,
-          },
+          ...(showUsageLogs
+            ? [
+                {
+                  title: '使用日志',
+                  url: '/usage-logs',
+                  icon: FileText,
+                },
+              ]
+            : []),
           {
             title: '设置',
             url: '/settings',

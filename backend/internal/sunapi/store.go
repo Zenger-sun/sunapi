@@ -82,7 +82,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			default_input_price_per_1k REAL NOT NULL,
 			default_output_price_per_1k REAL NOT NULL,
 			currency_symbol TEXT NOT NULL,
-			auto_open_browser INTEGER NOT NULL
+			auto_open_browser INTEGER NOT NULL,
+			default_start_page TEXT NOT NULL DEFAULT '/home',
+			show_dashboard INTEGER NOT NULL DEFAULT 1,
+			show_api_keys INTEGER NOT NULL DEFAULT 1,
+			show_usage_logs INTEGER NOT NULL DEFAULT 1,
+			show_playground INTEGER NOT NULL DEFAULT 1
 		)`,
 		`CREATE TABLE IF NOT EXISTS groups (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,6 +240,21 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureColumn(ctx, "settings", "default_start_page", "TEXT NOT NULL DEFAULT '/home'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "settings", "show_dashboard", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "settings", "show_api_keys", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "settings", "show_usage_logs", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "settings", "show_playground", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "usage_logs", "username", "TEXT NOT NULL DEFAULT 'local'"); err != nil {
 		return err
 	}
@@ -313,8 +333,8 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	now := time.Now().Unix()
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO settings
-		(id, system_name, listen_host, listen_port, default_group, default_input_price_per_1k, default_output_price_per_1k, currency_symbol, auto_open_browser)
-		VALUES (1, 'SunAPI', '127.0.0.1', 8317, 'default', 0, 0, '$', 1)`); err != nil {
+		(id, system_name, listen_host, listen_port, default_group, default_input_price_per_1k, default_output_price_per_1k, currency_symbol, auto_open_browser, default_start_page, show_dashboard, show_api_keys, show_usage_logs, show_playground)
+		VALUES (1, 'SunAPI', '127.0.0.1', 8317, 'default', 0, 0, '$', 1, '/home', 1, 1, 1, 1)`); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO groups
@@ -378,9 +398,10 @@ func (s *Store) tableHasColumn(ctx context.Context, table, column string) (bool,
 
 func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	var settings Settings
-	var autoOpen int
+	var autoOpen, showDashboard, showAPIKeys, showUsageLogs, showPlayground int
 	err := s.db.QueryRowContext(ctx, `SELECT system_name, listen_host, listen_port, default_group,
-		default_input_price_per_1k, default_output_price_per_1k, currency_symbol, auto_open_browser
+		default_input_price_per_1k, default_output_price_per_1k, currency_symbol, auto_open_browser,
+		default_start_page, show_dashboard, show_api_keys, show_usage_logs, show_playground
 		FROM settings WHERE id = 1`).Scan(
 		&settings.SystemName,
 		&settings.ListenHost,
@@ -390,9 +411,21 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 		&settings.DefaultOutputPricePer1K,
 		&settings.CurrencySymbol,
 		&autoOpen,
+		&settings.DefaultStartPage,
+		&showDashboard,
+		&showAPIKeys,
+		&showUsageLogs,
+		&showPlayground,
 	)
+	if err != nil {
+		return settings, err
+	}
 	settings.AutoOpenBrowser = autoOpen != 0
-	return settings, err
+	settings.ShowDashboard = showDashboard != 0
+	settings.ShowAPIKeys = showAPIKeys != 0
+	settings.ShowUsageLogs = showUsageLogs != 0
+	settings.ShowPlayground = showPlayground != 0
+	return normalizeSettings(settings), nil
 }
 
 func (s *Store) UpdateSettings(ctx context.Context, settings Settings) (Settings, error) {
@@ -404,10 +437,15 @@ func (s *Store) UpdateSettings(ctx context.Context, settings Settings) (Settings
 	if settings.AutoOpenBrowser {
 		autoOpen = 1
 	}
+	showDashboard := boolToInt(settings.ShowDashboard)
+	showAPIKeys := boolToInt(settings.ShowAPIKeys)
+	showUsageLogs := boolToInt(settings.ShowUsageLogs)
+	showPlayground := boolToInt(settings.ShowPlayground)
 	_, err := s.db.ExecContext(ctx, `UPDATE settings SET
 		system_name = ?, listen_host = ?, listen_port = ?, default_group = ?,
 		default_input_price_per_1k = ?, default_output_price_per_1k = ?,
-		currency_symbol = ?, auto_open_browser = ?
+		currency_symbol = ?, auto_open_browser = ?, default_start_page = ?,
+		show_dashboard = ?, show_api_keys = ?, show_usage_logs = ?, show_playground = ?
 		WHERE id = 1`,
 		settings.SystemName,
 		settings.ListenHost,
@@ -417,8 +455,20 @@ func (s *Store) UpdateSettings(ctx context.Context, settings Settings) (Settings
 		settings.DefaultOutputPricePer1K,
 		settings.CurrencySymbol,
 		autoOpen,
+		settings.DefaultStartPage,
+		showDashboard,
+		showAPIKeys,
+		showUsageLogs,
+		showPlayground,
 	)
 	return settings, err
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func normalizeSettings(settings Settings) Settings {
@@ -444,7 +494,17 @@ func normalizeSettings(settings Settings) Settings {
 	if settings.DefaultOutputPricePer1K < 0 {
 		settings.DefaultOutputPricePer1K = 0
 	}
+	settings.DefaultStartPage = normalizeStartPage(settings.DefaultStartPage)
 	return settings
+}
+
+func normalizeStartPage(page string) string {
+	switch strings.TrimSpace(page) {
+	case "/dashboard", "/channels", "/groups", "/keys", "/playground", "/docs", "/settings":
+		return strings.TrimSpace(page)
+	default:
+		return "/home"
+	}
 }
 
 func normalizeGroupName(name string) string {

@@ -53,6 +53,52 @@ func TestAdminAuthProtectsManagementRoutes(t *testing.T) {
 	}
 }
 
+func TestAdminPasswordCanBeChanged(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	engine := gin.New()
+	RegisterRoutes(engine, store, nil)
+
+	setup := performJSON(engine, http.MethodPost, "/api/auth/setup", adminCredentialsPayload{
+		Username: "admin",
+		Password: "password123",
+	}, "")
+	if setup.Code != http.StatusOK {
+		t.Fatalf("setup status = %d, body = %s", setup.Code, setup.Body.String())
+	}
+	sessionCookie := setup.Result().Cookies()[0]
+
+	change := performJSON(engine, http.MethodPost, "/api/auth/password", adminPasswordUpdatePayload{
+		CurrentPassword: "password123",
+		NewPassword:     "password456",
+	}, sessionCookie.String())
+	if change.Code != http.StatusOK {
+		t.Fatalf("change password status = %d, body = %s", change.Code, change.Body.String())
+	}
+
+	oldLogin := performJSON(engine, http.MethodPost, "/api/auth/login", adminCredentialsPayload{
+		Username: "admin",
+		Password: "password123",
+	}, "")
+	if oldLogin.Code != http.StatusUnauthorized {
+		t.Fatalf("old password login status = %d, want %d", oldLogin.Code, http.StatusUnauthorized)
+	}
+
+	newLogin := performJSON(engine, http.MethodPost, "/api/auth/login", adminCredentialsPayload{
+		Username: "admin",
+		Password: "password456",
+	}, "")
+	if newLogin.Code != http.StatusOK {
+		t.Fatalf("new password login status = %d, body = %s", newLogin.Code, newLogin.Body.String())
+	}
+}
+
 func performJSON(engine http.Handler, method, target string, body any, cookie string) *httptest.ResponseRecorder {
 	var reader *bytes.Reader
 	if body == nil {

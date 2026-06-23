@@ -103,6 +103,11 @@ export type AppSettings = {
   default_output_price_per_1k: number
   currency_symbol: string
   auto_open_browser: boolean
+  default_start_page: string
+  show_dashboard: boolean
+  show_api_keys: boolean
+  show_usage_logs: boolean
+  show_playground: boolean
 }
 
 export type DashboardData = {
