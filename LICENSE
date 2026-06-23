@@ -1,0 +1,14 @@
+SunAPI Open Source Edition License Map
+
+This source distribution is a license-aware aggregate. Different parts of the
+tree are distributed under different licenses:
+
+- front/: GNU Affero General Public License v3.0 or later where the file
+  headers and front/LICENSE apply.
+- backend/: MIT License. See backend/LICENSE.
+- Third-party dependency notices: see THIRD-PARTY-LICENSES.md where provided,
+  package manifests, Go module metadata, and file-level notices.
+
+Unless a file says otherwise, preserve its existing copyright, attribution, and
+license notices. This file is not a separate license grant for code that already
+carries an explicit license header.

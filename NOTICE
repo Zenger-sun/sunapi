@@ -1,0 +1,26 @@
+SunAPI Open Source Edition Notices
+
+SunAPI Open Source Edition is a source distribution containing:
+
+- front/
+- backend/
+
+The frontend includes AGPL-covered work derived from new-api.
+See front/LICENSE for the GNU Affero General Public License text.
+
+new-api
+Copyright (c) QuantumNous and contributors.
+Original project: https://github.com/QuantumNous/new-api
+
+Required attribution from upstream NOTICE:
+
+"Frontend design and development by New API contributors."
+
+The backend includes MIT-licensed work from CLIProxyAPI / Router-For.ME.
+See backend/LICENSE and backend/README.md.
+
+Third-party dependency notices are tracked in THIRD-PARTY-LICENSES.md where
+available and should be regenerated for each final release artifact.
+
+Preserve this NOTICE file with source releases, binary releases, Docker images,
+desktop installers, and hosted-service source archives.

@@ -1,0 +1,9 @@
+front/node_modules/
+front/dist/
+front/.tanstack/
+backend/.cache/
+backend/.tmp/
+backend/static/
+backend/sunapi.exe
+*.log
+*.tmp
