@@ -1,0 +1,303 @@
+#!/bin/sh
+set -eu
+
+APP_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+SERVER="$APP_DIR/Contents/MacOS/sunapi-server"
+RUN_ID="$$.$(date +%s)"
+CONSOLE_DIR="${TMPDIR:-/tmp}/SunAPI"
+CONSOLE_SCRIPT="$CONSOLE_DIR/SunAPI Console $RUN_ID.command"
+CLEANUP_SCRIPT="$CONSOLE_DIR/SunAPI Cleanup $RUN_ID.sh"
+CONSOLE_PID_FILE="$CONSOLE_DIR/SunAPI Console $RUN_ID.pid"
+CONSOLE_TITLE="SunAPI Console $RUN_ID"
+LAUNCHER_LOG_DIR="${HOME}/Library/Logs/SunAPI"
+LAUNCHER_LOG="$LAUNCHER_LOG_DIR/launcher.log"
+SERVER_LOG="$LAUNCHER_LOG_DIR/server.log"
+
+log_launcher() {
+  printf '%s\n' "$1" >> "$LAUNCHER_LOG" 2>/dev/null || true
+}
+
+quote_sh() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+if [ ! -x "$SERVER" ]; then
+  log_launcher "sunapi-server is missing or not executable: $SERVER"
+  exit 1
+fi
+
+mkdir -p "$CONSOLE_DIR" "$LAUNCHER_LOG_DIR"
+TERMINAL_START_WINDOW_COUNT="$(osascript 2>/dev/null <<'APPLESCRIPT' || printf 0
+if application "Terminal" is running then
+  tell application "Terminal" to return count of windows
+else
+  return 0
+end if
+APPLESCRIPT
+)"
+case "$TERMINAL_START_WINDOW_COUNT" in
+  ''|*[!0-9]*) TERMINAL_START_WINDOW_COUNT=0 ;;
+esac
+
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'set -u'
+  printf 'CONSOLE_SCRIPT=%s\n' "$(quote_sh "$CONSOLE_SCRIPT")"
+  printf 'CONSOLE_PID_FILE=%s\n' "$(quote_sh "$CONSOLE_PID_FILE")"
+  printf 'CONSOLE_TITLE=%s\n' "$(quote_sh "$CONSOLE_TITLE")"
+  printf 'LAUNCHER_LOG=%s\n' "$(quote_sh "$LAUNCHER_LOG")"
+  printf 'TERMINAL_START_WINDOW_COUNT=%s\n' "$(quote_sh "$TERMINAL_START_WINDOW_COUNT")"
+  cat <<'SCRIPT'
+log_line() {
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LAUNCHER_LOG" 2>/dev/null || true
+}
+
+terminal_is_running() {
+  [ "$(osascript -e 'application "Terminal" is running' 2>/dev/null || printf false)" = "true" ]
+}
+
+if terminal_is_running; then
+  osascript - "$CONSOLE_TITLE" "$TERMINAL_START_WINDOW_COUNT" <<'APPLESCRIPT' >> "$LAUNCHER_LOG" 2>&1 || true
+on run argv
+  set consoleTitle to item 1 of argv
+  set terminalStartWindowCount to item 2 of argv
+  tell application "Terminal"
+    repeat 20 times
+      set closedItem to false
+      repeat with candidateWindow in windows
+        set matchingTab to missing value
+        set tabCount to 0
+        try
+          set tabCount to count of tabs of candidateWindow
+          repeat with candidateTab in tabs of candidateWindow
+            try
+              if name of candidateTab contains consoleTitle then
+                set matchingTab to candidateTab
+                exit repeat
+              end if
+            end try
+          end repeat
+        end try
+
+        if matchingTab is not missing value then
+          if tabCount > 1 then
+            close matchingTab saving no
+          else
+            close candidateWindow saving no
+          end if
+          set closedItem to true
+          exit repeat
+        end if
+
+        try
+          if name of candidateWindow contains consoleTitle then
+            close candidateWindow saving no
+            set closedItem to true
+            exit repeat
+          end if
+        end try
+      end repeat
+      if closedItem is false then exit repeat
+      delay 0.1
+    end repeat
+
+    if terminalStartWindowCount is "0" then
+      repeat 20 times
+        if (count of windows) is 0 then exit repeat
+        delay 0.1
+      end repeat
+      if (count of windows) is 0 then quit saving no
+    end if
+  end tell
+end run
+APPLESCRIPT
+fi
+
+log_line "Cleaned SunAPI console title=$CONSOLE_TITLE"
+rm -f "$CONSOLE_SCRIPT" "$CONSOLE_PID_FILE" "$0"
+SCRIPT
+} > "$CLEANUP_SCRIPT"
+
+chmod 700 "$CLEANUP_SCRIPT"
+
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'set -u'
+  printf 'SERVER=%s\n' "$(quote_sh "$SERVER")"
+  printf 'CLEANUP_SCRIPT=%s\n' "$(quote_sh "$CLEANUP_SCRIPT")"
+  printf 'CONSOLE_TITLE=%s\n' "$(quote_sh "$CONSOLE_TITLE")"
+  printf 'LAUNCHER_LOG=%s\n' "$(quote_sh "$LAUNCHER_LOG")"
+  printf 'SERVER_LOG=%s\n' "$(quote_sh "$SERVER_LOG")"
+  printf 'RUN_ID=%s\n' "$(quote_sh "$RUN_ID")"
+  printf 'CONSOLE_PID_FILE=%s\n' "$(quote_sh "$CONSOLE_PID_FILE")"
+  cat <<'SCRIPT'
+server_pid=
+tee_pid=
+tail_pid=
+cleanup_started=0
+started_at=0
+SERVER_OUTPUT_FIFO="${TMPDIR:-/tmp}/SunAPI/server-output-$RUN_ID.fifo"
+
+log_line() {
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LAUNCHER_LOG"
+}
+
+stop_server() {
+  pid="${server_pid:-}"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    log_line "Stopping sunapi-server pid=$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log_line "Force stopping sunapi-server pid=$pid"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
+  if [ -n "${tee_pid:-}" ] && kill -0 "$tee_pid" 2>/dev/null; then
+    kill -TERM "$tee_pid" 2>/dev/null || true
+    wait "$tee_pid" 2>/dev/null || true
+  fi
+  if [ -n "${tail_pid:-}" ] && kill -0 "$tail_pid" 2>/dev/null; then
+    kill -TERM "$tail_pid" 2>/dev/null || true
+    wait "$tail_pid" 2>/dev/null || true
+  fi
+  rm -f "$SERVER_OUTPUT_FIFO"
+}
+
+cleanup_terminal_window() {
+  if [ -x "$CLEANUP_SCRIPT" ]; then
+    nohup /bin/sh "$CLEANUP_SCRIPT" >/dev/null 2>&1 &
+  else
+    rm -f "$0"
+  fi
+}
+
+wait_for_error_ack() {
+  printf '\nSunAPI exited with status %s shortly after startup.\n' "$1"
+  printf 'The most common cause is that another SunAPI instance is already using port 8317.\n'
+  printf 'Log file: %s\n' "$SERVER_LOG"
+  printf '\nPress Return to close this console.'
+  IFS= read -r _ || true
+}
+
+follow_server_log() {
+  touch "$SERVER_LOG" 2>/dev/null || true
+  printf 'Following backend log: %s\n' "$SERVER_LOG"
+  printf 'Close this window or press Ctrl-C to stop following logs.\n\n'
+  tail -n 120 -F "$SERVER_LOG" &
+  tail_pid=$!
+  wait "$tail_pid" 2>/dev/null || true
+  tail_pid=
+}
+
+port_is_listening() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+configured_port() {
+  config_file="${HOME}/Library/Application Support/SunAPI/config.yaml"
+  port="$(awk '/^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "$config_file" 2>/dev/null || true)"
+  case "$port" in
+    ''|*[!0-9]*) printf '8317\n' ;;
+    *) printf '%s\n' "$port" ;;
+  esac
+}
+
+cleanup_and_exit() {
+  trap - HUP INT TERM
+  stop_server
+  if [ "$cleanup_started" != "1" ]; then
+    cleanup_started=1
+    cleanup_terminal_window
+  fi
+  exit 0
+}
+
+trap cleanup_and_exit HUP INT TERM
+
+printf '%s\n' "$$" > "$CONSOLE_PID_FILE"
+printf '\033]0;%s\007' "$CONSOLE_TITLE"
+printf 'SunAPI console started. Close this window or press Ctrl-C to stop SunAPI.\n\n'
+cd "$(dirname "$SERVER")" || exit 1
+listen_port="$(configured_port)"
+if port_is_listening "$listen_port"; then
+  printf 'SunAPI already appears to be running on http://127.0.0.1:%s\n' "$listen_port"
+  printf 'Opening the existing dashboard instead of starting a second server.\n\n'
+  open "http://127.0.0.1:$listen_port/dashboard" >/dev/null 2>&1 || true
+  follow_server_log
+  if [ "$cleanup_started" != "1" ]; then
+    cleanup_started=1
+    cleanup_terminal_window
+  fi
+  exit 0
+fi
+{
+  printf '\n[%s] Starting SunAPI: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$SERVER"
+} | tee -a "$SERVER_LOG" 2>/dev/null || true
+rm -f "$SERVER_OUTPUT_FIFO"
+mkfifo "$SERVER_OUTPUT_FIFO"
+tee -a "$SERVER_LOG" < "$SERVER_OUTPUT_FIFO" &
+tee_pid=$!
+"$SERVER" > "$SERVER_OUTPUT_FIFO" 2>&1 &
+server_pid=$!
+started_at=$(date +%s)
+log_line "sunapi-server pid=$server_pid title=$CONSOLE_TITLE"
+
+set +e
+wait "$server_pid"
+status=$?
+set -e
+server_pid=
+elapsed=$(( $(date +%s) - started_at ))
+wait "$tee_pid" 2>/dev/null || true
+tee_pid=
+rm -f "$SERVER_OUTPUT_FIFO"
+
+trap - HUP INT TERM
+if [ "$status" -ne 0 ] && [ "$elapsed" -lt 5 ]; then
+  wait_for_error_ack "$status"
+fi
+if [ "$cleanup_started" != "1" ]; then
+  cleanup_started=1
+  cleanup_terminal_window
+fi
+exit "$status"
+SCRIPT
+} > "$CONSOLE_SCRIPT"
+
+chmod 700 "$CONSOLE_SCRIPT"
+
+log_launcher "Opening SunAPI console: $CONSOLE_SCRIPT"
+log_launcher "Server: $SERVER"
+
+if ! open "$CONSOLE_SCRIPT" >> "$LAUNCHER_LOG" 2>&1; then
+  if ! open -a Terminal "$CONSOLE_SCRIPT" >> "$LAUNCHER_LOG" 2>&1; then
+    rm -f "$CONSOLE_SCRIPT" "$CONSOLE_PID_FILE"
+    log_launcher "Failed to open the SunAPI console in Terminal."
+    exit 1
+  fi
+fi
+
+waited=0
+while [ ! -s "$CONSOLE_PID_FILE" ] && [ "$waited" -lt 50 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if [ -s "$CONSOLE_PID_FILE" ]; then
+  console_pid="$(cat "$CONSOLE_PID_FILE" 2>/dev/null || true)"
+  case "$console_pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      while kill -0 "$console_pid" 2>/dev/null; do
+        sleep 1
+      done
+      ;;
+  esac
+fi
+
+exit 0
