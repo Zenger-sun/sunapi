@@ -17,6 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useNavigate } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
 import { SectionPageLayout } from '@/components/layout'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Groups } from '@/features/groups'
@@ -46,6 +47,7 @@ export function Channels({ defaultTab = 'channels' }: ChannelsProps) {
 
 function ChannelsFrame({ defaultTab }: { defaultTab: ChannelGroupTab }) {
   const navigate = useNavigate()
+  const { t } = useTranslation()
 
   const handleTabChange = (value: string) => {
     if (value === 'groups') {
@@ -57,7 +59,7 @@ function ChannelsFrame({ defaultTab }: { defaultTab: ChannelGroupTab }) {
 
   return (
     <SectionPageLayout>
-      <SectionPageLayout.Title>渠道&分组</SectionPageLayout.Title>
+      <SectionPageLayout.Title>{t('Channels & Groups')}</SectionPageLayout.Title>
       <SectionPageLayout.Actions>
         {defaultTab === 'channels' && <ChannelsPrimaryButtons />}
       </SectionPageLayout.Actions>
@@ -72,13 +74,13 @@ function ChannelsFrame({ defaultTab }: { defaultTab: ChannelGroupTab }) {
               value='channels'
               className='h-6 rounded-full px-3 text-sm data-active:shadow-none'
             >
-              渠道
+              {t('Channels')}
             </TabsTrigger>
             <TabsTrigger
               value='groups'
               className='h-6 rounded-full px-3 text-sm data-active:shadow-none'
             >
-              分组定价
+              {t('Group pricing')}
             </TabsTrigger>
           </TabsList>
           <TabsContent value='channels' className='mt-0'>

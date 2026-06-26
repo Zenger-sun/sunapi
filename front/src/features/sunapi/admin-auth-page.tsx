@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, KeyRound, Loader2, ShieldCheck } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
 import { useSystemConfig } from '@/hooks/use-system-config'
@@ -33,6 +34,7 @@ interface AdminAuthPageProps {
 const ADMIN_USERNAME = 'admin'
 
 export function AdminAuthPage({ mode }: AdminAuthPageProps) {
+  const { t } = useTranslation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { systemName, logo } = useSystemConfig()
@@ -75,31 +77,40 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
   useEffect(() => {
     if (!statusQuery.error) return
     setErrorText(
-      adminAuthErrorMessage(statusQuery.error, '无法读取本地认证状态，请稍后重试')
+      adminAuthErrorMessage(
+        statusQuery.error,
+        t('Failed to read local authentication status. Please try again later'),
+        t
+      )
     )
-  }, [statusQuery.error])
+  }, [statusQuery.error, t])
 
   const copy = useMemo(
     () =>
       isSetup
         ? {
             icon: ShieldCheck,
-            title: '首次设置管理员密码',
-            description:
-              '本地服务尚未初始化，请为 admin 管理员创建登录密码。',
-            helper: '之后进入控制台和创作台都需要使用这个密码。',
-            submit: '创建并进入控制台',
-            success: '管理员密码已设置',
+            title: t('First-time admin password setup'),
+            description: t(
+              'The local service is not initialized yet. Create a login password for the admin account.'
+            ),
+            helper: t(
+              'You will use this password to enter the console and playground later.'
+            ),
+            submit: t('Create and enter console'),
+            success: t('Admin password has been set'),
           }
         : {
             icon: KeyRound,
-            title: '管理员登录',
-            description: '使用首次设置时创建的密码进入本地控制台。',
-            helper: '当前系统只保留 admin 管理员账号。',
-            submit: '进入控制台',
-            success: '登录成功',
+            title: t('Admin sign in'),
+            description: t(
+              'Use the password created during first setup to enter the local console.'
+            ),
+            helper: t('This local system keeps only the admin account.'),
+            submit: t('Enter console'),
+            success: t('Signed in successfully!'),
           },
-    [isSetup]
+    [isSetup, t]
   )
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -108,15 +119,19 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
     setErrorText('')
 
     if (!nextPassword) {
-      setErrorText(isSetup ? '请设置管理员密码' : '请输入管理员密码')
+      setErrorText(
+        isSetup
+          ? t('Please set an admin password')
+          : t('Please enter the admin password')
+      )
       return
     }
     if (isSetup && nextPassword.length < 8) {
-      setErrorText('管理员密码至少需要 8 位')
+      setErrorText(t('Admin password must be at least 8 characters'))
       return
     }
     if (isSetup && nextPassword !== confirmPassword.trim()) {
-      setErrorText('两次输入的密码不一致')
+      setErrorText(t('The two passwords do not match'))
       return
     }
 
@@ -141,7 +156,8 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
       setErrorText(
         adminAuthErrorMessage(
           error,
-          isSetup ? '管理员密码设置失败' : '登录失败'
+          isSetup ? t('Failed to set admin password') : t('Sign in failed'),
+          t
         )
       )
     },
@@ -155,7 +171,7 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
       <Link
         to='/home'
         className='focus-visible:ring-ring/40 absolute top-6 left-6 inline-flex items-center gap-2 rounded-md px-1.5 py-1 text-sm font-semibold outline-none transition-colors hover:bg-accent focus-visible:ring-2'
-        aria-label='返回首页'
+        aria-label={t('Back to Home')}
       >
         <img
           src={logo}
@@ -183,20 +199,26 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
         <CardContent>
           <form className='space-y-4' onSubmit={handleSubmit}>
             <div className='rounded-lg border bg-muted/40 px-3 py-2 text-sm'>
-              <span className='text-muted-foreground'>管理员账号</span>
+              <span className='text-muted-foreground'>
+                {t('Admin account')}
+              </span>
               <span className='ml-2 font-medium'>{ADMIN_USERNAME}</span>
             </div>
 
             <div className='space-y-2'>
               <Label htmlFor='admin-password'>
-                {isSetup ? '设置密码' : '密码'}
+                {isSetup ? t('Set password') : t('Password')}
               </Label>
               <Input
                 id='admin-password'
                 type='password'
                 value={password}
                 autoComplete={isSetup ? 'new-password' : 'current-password'}
-                placeholder={isSetup ? '至少 8 位' : '请输入管理员密码'}
+                placeholder={
+                  isSetup
+                    ? t('At least 8 characters')
+                    : t('Please enter the admin password')
+                }
                 onChange={(event) => setPassword(event.target.value)}
                 disabled={loading}
               />
@@ -204,13 +226,15 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
 
             {isSetup && (
               <div className='space-y-2'>
-                <Label htmlFor='admin-password-confirm'>确认密码</Label>
+                <Label htmlFor='admin-password-confirm'>
+                  {t('Confirm password')}
+                </Label>
                 <Input
                   id='admin-password-confirm'
                   type='password'
                   value={confirmPassword}
                   autoComplete='new-password'
-                  placeholder='再次输入管理员密码'
+                  placeholder={t('Enter the admin password again')}
                   onChange={(event) => setConfirmPassword(event.target.value)}
                   disabled={loading}
                 />

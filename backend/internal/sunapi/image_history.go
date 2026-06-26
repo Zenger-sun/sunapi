@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -38,11 +40,19 @@ func persistPlaygroundImageURLs(ctx context.Context, dataDir, id string, urls []
 		}
 		data, mediaType, err := readImageURL(ctx, rawURL)
 		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"task_id":     id,
+				"image_index": index + 1,
+			}).Warn("sunapi image task debug: generated image download failed")
 			out = append(out, truncateRunes(rawURL, 2048))
 			continue
 		}
 		localURL, err := savePlaygroundImageFile(dataDir, id, index, createdAt, mediaType, data)
 		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"task_id":     id,
+				"image_index": index + 1,
+			}).Warn("sunapi image task debug: generated image save failed")
 			out = append(out, truncateRunes(rawURL, 2048))
 			continue
 		}

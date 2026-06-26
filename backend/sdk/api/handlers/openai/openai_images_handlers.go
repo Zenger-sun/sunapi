@@ -2139,6 +2139,8 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			case "response.output_item.done":
 				collectImagesOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 				continue
+			case "response.failed", "response.incomplete", "response.cancelled", "response.error":
+				return nil, false, imagesResponsesTerminalError(payload)
 			case "response.completed":
 			default:
 				continue
@@ -2189,6 +2191,37 @@ func collectImagesFromResponsesStream(ctx context.Context, data <-chan []byte, e
 			}
 		}
 	}
+}
+
+func imagesResponsesTerminalError(payload []byte) *interfaces.ErrorMessage {
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	message := firstImagesResponsesErrorText(payload,
+		"response.error.message",
+		"response.incomplete_details.reason",
+		"response.status_details.error.message",
+		"error.message",
+		"message",
+	)
+	if message == "" {
+		message = eventType
+	}
+	statusCode := http.StatusBadGateway
+	if eventType == "response.incomplete" {
+		statusCode = http.StatusGatewayTimeout
+	}
+	return &interfaces.ErrorMessage{
+		StatusCode: statusCode,
+		Error:      fmt.Errorf("upstream %s: %s", strings.TrimPrefix(eventType, "response."), message),
+	}
+}
+
+func firstImagesResponsesErrorText(payload []byte, paths ...string) string {
+	for _, path := range paths {
+		if text := strings.TrimSpace(gjson.GetBytes(payload, path).String()); text != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func collectImagesOutputItemDone(payload []byte, itemsByIndex map[int64][]byte, fallback *[][]byte) {
@@ -2437,6 +2470,9 @@ func (h *OpenAIAPIHandler) forwardImagesStream(ctx context.Context, c *gin.Conte
 			switch gjson.GetBytes(payload, "type").String() {
 			case "response.output_item.done":
 				collectImagesOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
+			case "response.failed", "response.incomplete", "response.cancelled", "response.error":
+				emitError(imagesResponsesTerminalError(payload))
+				return true
 			case "response.image_generation_call.partial_image":
 				b64 := strings.TrimSpace(gjson.GetBytes(payload, "partial_image_b64").String())
 				if b64 == "" {

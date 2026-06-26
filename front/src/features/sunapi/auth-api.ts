@@ -48,7 +48,11 @@ function unwrapAuthPayload(data: unknown): AuthUser {
   return payload.data as AuthUser
 }
 
-export function adminAuthErrorMessage(error: unknown, fallback: string) {
+export function adminAuthErrorMessage(
+  error: unknown,
+  fallback: string,
+  translate: (key: string) => string = (key) => key
+) {
   const err = error as {
     response?: { status?: number; data?: { message?: unknown; error?: unknown } }
     message?: unknown
@@ -65,21 +69,23 @@ export function adminAuthErrorMessage(error: unknown, fallback: string) {
 
   switch (message) {
     case 'admin setup required':
-      return '首次使用前需要先设置管理员密码'
+      return translate('Set the admin password before first use')
     case 'admin login required':
-      return '请先登录'
+      return translate('Please sign in first')
     case 'invalid username or password':
-      return '密码不正确'
+      return translate('Incorrect password')
     case 'invalid current password':
-      return '当前密码不正确'
+      return translate('Current password is incorrect')
     case 'username and password are required':
-      return '请输入管理员密码'
+      return translate('Please enter the admin password')
     case 'username and password are required; password must be at least 8 characters':
-      return '请设置至少 8 位管理员密码'
+      return translate('Please set an admin password with at least 8 characters')
     case 'current password is required; new password must be at least 8 characters':
-      return '请输入当前密码，并设置至少 8 位新密码'
+      return translate(
+        'Please enter the current password and set a new password with at least 8 characters'
+      )
     case 'admin user already initialized':
-      return '管理员已初始化，请直接登录'
+      return translate('Admin is already initialized. Please sign in directly')
     default:
       return message || fallback
   }

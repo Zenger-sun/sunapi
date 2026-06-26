@@ -55,27 +55,27 @@ interface ImageParamsPanelProps {
 const RESOLUTION_OPTIONS: {
   value: ImageResolutionPreset
   label: string
-  hint: string
+  hintKey: string
 }[] = [
-  { value: 'auto', label: 'Auto', hint: '按提示词自动选择清晰度' },
-  { value: '1k', label: '1K', hint: '速度快，适合预览' },
-  { value: '2k', label: '2K', hint: '更清晰，适合常用出图' },
-  { value: '4k', label: '4K', hint: '高精细，需模型支持' },
+  { value: 'auto', label: 'Auto', hintKey: 'Choose resolution from the prompt' },
+  { value: '1k', label: '1K', hintKey: 'Fast, good for previews' },
+  { value: '2k', label: '2K', hintKey: 'Sharper, good for regular images' },
+  { value: '4k', label: '4K', hintKey: 'High detail, model support required' },
 ]
 
 const ASPECT_RATIO_OPTIONS: {
   value: ImageAspectRatio
   label: string
-  hint: string
+  hintKey: string
 }[] = [
-  { value: 'auto', label: 'Auto', hint: '按提示词自动选择画面比例' },
-  { value: '1:1', label: '1:1', hint: '方图 / 头像 / 产品图' },
-  { value: '16:9', label: '16:9', hint: '横屏 / 封面 / 桌面壁纸' },
-  { value: '9:16', label: '9:16', hint: '竖屏 / 手机壁纸 / 短视频' },
-  { value: '4:3', label: '4:3', hint: '经典横幅 / 演示图' },
-  { value: '3:4', label: '3:4', hint: '竖幅 / 人像' },
-  { value: '3:2', label: '3:2', hint: '摄影横幅' },
-  { value: '2:3', label: '2:3', hint: '海报竖幅' },
+  { value: 'auto', label: 'Auto', hintKey: 'Choose aspect ratio from the prompt' },
+  { value: '1:1', label: '1:1', hintKey: 'Square / avatar / product image' },
+  { value: '16:9', label: '16:9', hintKey: 'Landscape / cover / desktop wallpaper' },
+  { value: '9:16', label: '9:16', hintKey: 'Portrait / phone wallpaper / short video' },
+  { value: '4:3', label: '4:3', hintKey: 'Classic banner / presentation image' },
+  { value: '3:4', label: '3:4', hintKey: 'Portrait frame / people' },
+  { value: '3:2', label: '3:2', hintKey: 'Photography landscape' },
+  { value: '2:3', label: '2:3', hintKey: 'Poster portrait' },
 ]
 
 export function ImageParamsPanel({
@@ -109,7 +109,7 @@ export function ImageParamsPanel({
       >
         <span className='flex items-center gap-2 text-xs font-medium'>
           <Settings2Icon className='text-muted-foreground size-3.5' />
-          {t('生成参数')}
+          {t('Generation parameters')}
         </span>
         <ChevronDownIcon
           className={cn(
@@ -122,7 +122,7 @@ export function ImageParamsPanel({
         <div
           className={cn('grid gap-3', compact ? 'grid-cols-1' : 'grid-cols-2')}
         >
-          <Field label={t('清晰度')}>
+          <Field label={t('Resolution')}>
             <Select
               value={value.resolution}
               onValueChange={(v) =>
@@ -139,7 +139,7 @@ export function ImageParamsPanel({
                     <span className='flex flex-col'>
                       <span className='text-xs'>{opt.label}</span>
                       <span className='text-muted-foreground text-[10px]'>
-                        {t(opt.hint)}
+                        {t(opt.hintKey)}
                       </span>
                     </span>
                   </SelectItem>
@@ -148,7 +148,7 @@ export function ImageParamsPanel({
             </Select>
           </Field>
 
-          <Field label={t('比例')}>
+          <Field label={t('Aspect ratio')}>
             <Select
               value={value.aspectRatio}
               onValueChange={(v) =>
@@ -165,7 +165,7 @@ export function ImageParamsPanel({
                     <span className='flex flex-col'>
                       <span className='text-xs'>{opt.label}</span>
                       <span className='text-muted-foreground text-[10px]'>
-                        {t(opt.hint)}
+                        {t(opt.hintKey)}
                       </span>
                     </span>
                   </SelectItem>
@@ -174,7 +174,7 @@ export function ImageParamsPanel({
             </Select>
           </Field>
 
-          <Field label={t('质量')}>
+          <Field label={t('Quality')}>
             <Select
               value={value.quality}
               onValueChange={(v) =>
@@ -186,14 +186,14 @@ export function ImageParamsPanel({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value='auto'>{t('自动')}</SelectItem>
-                <SelectItem value='standard'>{t('标准')}</SelectItem>
-                <SelectItem value='hd'>{t('高清')}</SelectItem>
+                <SelectItem value='auto'>{t('Auto')}</SelectItem>
+                <SelectItem value='standard'>{t('Standard')}</SelectItem>
+                <SelectItem value='hd'>{t('HD')}</SelectItem>
               </SelectContent>
             </Select>
           </Field>
 
-          <Field label={t('风格')}>
+          <Field label={t('Style')}>
             <Select
               value={value.style}
               onValueChange={(v) =>
@@ -205,14 +205,14 @@ export function ImageParamsPanel({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value='auto'>{t('自动')}</SelectItem>
-                <SelectItem value='vivid'>{t('鲜艳')}</SelectItem>
-                <SelectItem value='natural'>{t('自然')}</SelectItem>
+                <SelectItem value='auto'>{t('Auto')}</SelectItem>
+                <SelectItem value='vivid'>{t('Vivid')}</SelectItem>
+                <SelectItem value='natural'>{t('Natural')}</SelectItem>
               </SelectContent>
             </Select>
           </Field>
 
-          <Field label={t('数量')}>
+          <Field label={t('Count')}>
             <Select
               value={String(value.n)}
               onValueChange={(v) => update('n', Number(v))}
@@ -224,7 +224,7 @@ export function ImageParamsPanel({
               <SelectContent>
                 {[1, 2, 3, 4].map((n) => (
                   <SelectItem key={n} value={String(n)}>
-                    {t('{{count}} 张', { count: n })}
+                    {t('{{count}} image(s)', { count: n })}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -232,17 +232,19 @@ export function ImageParamsPanel({
           </Field>
         </div>
 
-        <Field label={t('负面提示词（可选）')}>
+        <Field label={t('Negative prompt (optional)')}>
           <Textarea
             value={value.negativePrompt}
             onChange={(e) => update('negativePrompt', e.target.value)}
-            placeholder={t('不想出现的内容，例如：模糊、低质、水印、畸形手')}
+            placeholder={t(
+              'Avoid content such as blur, low quality, watermark, malformed hands'
+            )}
             className='min-h-16 resize-none text-xs'
             disabled={disabled}
           />
         </Field>
 
-        <Field label={t('种子（可选）')}>
+        <Field label={t('Seed (optional)')}>
           <div
             className={cn(
               'flex gap-2',
@@ -256,7 +258,7 @@ export function ImageParamsPanel({
                 const v = event.target.value
                 update('seed', v === '' ? null : Number(v))
               }}
-              placeholder={t('随机')}
+              placeholder={t('Random')}
               className='h-8 text-xs'
               disabled={disabled}
             />
@@ -269,7 +271,7 @@ export function ImageParamsPanel({
               disabled={disabled}
             >
               <SparklesIcon className='size-3' />
-              {t('随机')}
+              {t('Random')}
             </Button>
           </div>
         </Field>
@@ -284,13 +286,13 @@ export function ImagePromptTips() {
     <div className='border-border/60 bg-card/40 text-muted-foreground rounded-lg border p-3 text-[11px] leading-relaxed'>
       <div className='text-foreground mb-1.5 flex items-center gap-1.5 text-xs font-medium'>
         <WandSparklesIcon className='size-3.5' />
-        {t('提示词建议')}
+        {t('Prompt tips')}
       </div>
       <ul className='list-disc space-y-1 pl-4'>
-        <li>{t('说明主体、风格、光线、构图和用途。')}</li>
-        <li>{t('先选比例，再按需要提高到 2K 或 4K。')}</li>
-        <li>{t('需要改图或保持角色一致时，把参考图放进输入框。')}</li>
-        <li>{t('固定种子可以尽量复现相近结果。')}</li>
+        <li>{t('Describe the subject, style, lighting, composition, and use case.')}</li>
+        <li>{t('Pick an aspect ratio first, then raise resolution to 2K or 4K when needed.')}</li>
+        <li>{t('Add reference images when editing or keeping a character consistent.')}</li>
+        <li>{t('Use a fixed seed to reproduce similar results when possible.')}</li>
       </ul>
     </div>
   )

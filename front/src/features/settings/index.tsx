@@ -32,10 +32,9 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { SectionPageLayout } from '@/components/layout'
-import { ConfirmDialog } from '@/components/confirm-dialog'
-import { PasswordInput } from '@/components/password-input'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -55,7 +54,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { useSystemConfigStore } from '@/stores/system-config-store'
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { SectionPageLayout } from '@/components/layout'
+import { PasswordInput } from '@/components/password-input'
 import {
   type AppSettings,
   clearUsageLogs,
@@ -75,37 +76,41 @@ const DEFAULT_PRICE_FIELDS = {
 }
 
 const startPageOptions = [
-  { value: '/home', label: '首页' },
-  { value: '/dashboard', label: '数据看板' },
-  { value: '/channels', label: '渠道&分组' },
-  { value: '/keys', label: 'API 密钥' },
-  { value: '/playground', label: '创作台' },
-  { value: '/docs', label: '文档' },
+  { value: '/home', labelKey: 'Home' },
+  { value: '/dashboard', labelKey: 'Dashboard' },
+  { value: '/channels', labelKey: 'Channels & Groups' },
+  { value: '/keys', labelKey: 'API Keys' },
+  { value: '/playground', labelKey: 'Playground' },
+  { value: '/docs', labelKey: 'Docs' },
 ]
 
 const optionalNavItems = [
   {
     key: 'show_dashboard',
-    title: '数据看板',
-    description: '隐藏后保留统计能力，只从导航中移除入口。',
+    titleKey: 'Dashboard',
+    descriptionKey:
+      'Hide this entry from navigation while keeping analytics available.',
     icon: BarChart3,
   },
   {
     key: 'show_api_keys',
-    title: 'API 密钥',
-    description: '只使用创作台时可以隐藏中转 Token 管理。',
+    titleKey: 'API Keys',
+    descriptionKey:
+      'Hide relay token management when you only use the playground.',
     icon: KeyRound,
   },
   {
     key: 'show_usage_logs',
-    title: '使用日志',
-    description: '不需要排查调用明细时可以隐藏日志入口。',
+    titleKey: 'Usage Logs',
+    descriptionKey:
+      'Hide the log entry when you do not need request-level diagnostics.',
     icon: FileText,
   },
   {
     key: 'show_playground',
-    title: '创作台',
-    description: '只把 SunAPI 当本地中转站时可以隐藏创作入口。',
+    titleKey: 'Playground',
+    descriptionKey:
+      'Hide creative tools when SunAPI is only used as a local relay.',
     icon: Sparkles,
   },
 ] satisfies Array<{
@@ -113,20 +118,22 @@ const optionalNavItems = [
     AppSettings,
     'show_dashboard' | 'show_api_keys' | 'show_usage_logs' | 'show_playground'
   >
-  title: string
-  description: string
+  titleKey: string
+  descriptionKey: string
   icon: React.ElementType
 }>
 
 const lockedNavItems = [
   {
-    title: '渠道&分组',
-    description: '创建分组、维护渠道和同步上游模型的核心入口。',
+    titleKey: 'Channels & Groups',
+    descriptionKey:
+      'Core entry for creating groups, maintaining channels, and syncing upstream models.',
     icon: Radio,
   },
   {
-    title: '设置',
-    description: '用于恢复导航和调整服务参数，始终保留。',
+    titleKey: 'Settings',
+    descriptionKey:
+      'Always available so you can restore navigation and adjust service settings.',
     icon: SettingsIcon,
   },
 ]
@@ -134,16 +141,17 @@ const lockedNavItems = [
 function settingsWithDefaults(settings: AppSettings): AppSettings {
   return {
     ...DEFAULT_PRICE_FIELDS,
-    default_start_page: '/home',
-    show_dashboard: true,
-    show_api_keys: true,
-    show_usage_logs: true,
-    show_playground: true,
     ...settings,
+    default_start_page: settings.default_start_page || '/home',
+    show_dashboard: settings.show_dashboard ?? true,
+    show_api_keys: settings.show_api_keys ?? true,
+    show_usage_logs: settings.show_usage_logs ?? true,
+    show_playground: settings.show_playground ?? true,
   }
 }
 
 export function Settings() {
+  const { t } = useTranslation()
   const queryClient = useQueryClient()
   const setSystemConfig = useSystemConfigStore((state) => state.setConfig)
   const settingsQuery = useQuery({
@@ -182,7 +190,7 @@ export function Settings() {
         showUsageLogs: nextSettings.show_usage_logs,
         showPlayground: nextSettings.show_playground,
       })
-      toast.success('设置已保存')
+      toast.success(t('Settings saved'))
       queryClient.invalidateQueries({ queryKey: ['sunapi-dashboard'] })
       queryClient.invalidateQueries({ queryKey: ['status'] })
     },
@@ -196,10 +204,12 @@ export function Settings() {
       }),
     onSuccess: () => {
       setPasswordForm({ current: '', next: '', confirm: '' })
-      toast.success('管理员密码已更新')
+      toast.success(t('Admin password updated'))
     },
     onError: (error) => {
-      toast.error(adminAuthErrorMessage(error, '密码修改失败'))
+      toast.error(
+        adminAuthErrorMessage(error, t('Failed to update password'), t)
+      )
     },
   })
 
@@ -207,7 +217,9 @@ export function Settings() {
     mutationFn: clearUsageLogs,
     onSuccess: (result) => {
       setClearLogsOpen(false)
-      toast.success(`已清空 ${result.deleted} 条使用日志`)
+      toast.success(
+        t('Cleared {{count}} usage log entries', { count: result.deleted })
+      )
       queryClient.invalidateQueries({ queryKey: ['sunapi-dashboard'] })
       queryClient.invalidateQueries({ queryKey: ['logs'] })
       queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
@@ -220,15 +232,15 @@ export function Settings() {
 
   const handlePasswordSubmit = () => {
     if (!passwordForm.current.trim()) {
-      toast.error('请输入当前密码')
+      toast.error(t('Please enter the current password'))
       return
     }
     if (passwordForm.next.length < 8) {
-      toast.error('新密码至少需要 8 位')
+      toast.error(t('New password must be at least 8 characters'))
       return
     }
     if (passwordForm.next !== passwordForm.confirm) {
-      toast.error('两次输入的新密码不一致')
+      toast.error(t('The new passwords do not match'))
       return
     }
     passwordMutation.mutate()
@@ -236,9 +248,11 @@ export function Settings() {
 
   return (
     <SectionPageLayout>
-      <SectionPageLayout.Title>设置</SectionPageLayout.Title>
+      <SectionPageLayout.Title>{t('Settings')}</SectionPageLayout.Title>
       <SectionPageLayout.Description>
-        管理本地服务、界面入口、管理员安全和数据维护。
+        {t(
+          'Manage local service, visible entries, admin security, and data maintenance.'
+        )}
       </SectionPageLayout.Description>
       <SectionPageLayout.Actions>
         <Button
@@ -247,7 +261,7 @@ export function Settings() {
           onClick={() => saveMutation.mutate()}
         >
           <Save className='size-4' />
-          保存
+          {t('Save')}
         </Button>
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
@@ -255,14 +269,16 @@ export function Settings() {
           <div className='grid gap-4 xl:grid-cols-2'>
             <Card className='rounded-lg'>
               <CardHeader>
-                <CardTitle>服务</CardTitle>
+                <CardTitle>{t('Service')}</CardTitle>
                 <CardDescription>
-                  端口和监听地址需要重启 exe 后生效。
+                  {t(
+                    'Port and listen address changes take effect after restarting the exe.'
+                  )}
                 </CardDescription>
               </CardHeader>
               <CardContent className='grid gap-4'>
                 <div className='grid gap-2'>
-                  <Label htmlFor='system-name'>产品名称</Label>
+                  <Label htmlFor='system-name'>{t('Product name')}</Label>
                   <Input
                     id='system-name'
                     value={form.system_name}
@@ -273,7 +289,7 @@ export function Settings() {
                 </div>
                 <div className='grid gap-4 md:grid-cols-2'>
                   <div className='grid gap-2'>
-                    <Label htmlFor='listen-host'>监听地址</Label>
+                    <Label htmlFor='listen-host'>{t('Listen address')}</Label>
                     <Input
                       id='listen-host'
                       value={form.listen_host}
@@ -283,7 +299,7 @@ export function Settings() {
                     />
                   </div>
                   <div className='grid gap-2'>
-                    <Label htmlFor='listen-port'>端口</Label>
+                    <Label htmlFor='listen-port'>{t('Port')}</Label>
                     <Input
                       id='listen-port'
                       type='number'
@@ -297,11 +313,11 @@ export function Settings() {
                   </div>
                 </div>
                 <div className='grid gap-2'>
-                  <Label>默认打开页面</Label>
+                  <Label>{t('Default start page')}</Label>
                   <Select
                     value={form.default_start_page}
                     onValueChange={(value) =>
-                      updateForm({ default_start_page: value })
+                      updateForm({ default_start_page: value ?? '/home' })
                     }
                   >
                     <SelectTrigger className='w-full'>
@@ -311,7 +327,7 @@ export function Settings() {
                       <SelectGroup>
                         {startPageOptions.map((option) => (
                           <SelectItem key={option.value} value={option.value}>
-                            {option.label}
+                            {t(option.labelKey)}
                           </SelectItem>
                         ))}
                       </SelectGroup>
@@ -320,9 +336,11 @@ export function Settings() {
                 </div>
                 <div className='flex items-center justify-between gap-4 rounded-lg border p-3'>
                   <div className='grid gap-1'>
-                    <Label>启动后打开页面</Label>
+                    <Label>{t('Open page after startup')}</Label>
                     <p className='text-muted-foreground text-xs'>
-                      exe 启动完成后自动打开上面选择的页面。
+                      {t(
+                        'After the exe starts, automatically open the page selected above.'
+                      )}
                     </p>
                   </div>
                   <Switch
@@ -337,9 +355,11 @@ export function Settings() {
 
             <Card className='rounded-lg'>
               <CardHeader>
-                <CardTitle>界面显示</CardTitle>
+                <CardTitle>{t('Interface Display')}</CardTitle>
                 <CardDescription>
-                  根据使用模式隐藏不需要的入口，核心入口始终保留。
+                  {t(
+                    'Hide entries you do not need for your usage mode. Core entries always stay visible.'
+                  )}
                 </CardDescription>
               </CardHeader>
               <CardContent className='grid gap-3'>
@@ -353,9 +373,9 @@ export function Settings() {
                       <div className='flex min-w-0 items-start gap-3'>
                         <Icon className='text-muted-foreground mt-0.5 size-4 shrink-0' />
                         <div className='grid gap-1'>
-                          <Label>{item.title}</Label>
+                          <Label>{t(item.titleKey)}</Label>
                           <p className='text-muted-foreground text-xs'>
-                            {item.description}
+                            {t(item.descriptionKey)}
                           </p>
                         </div>
                       </div>
@@ -374,21 +394,21 @@ export function Settings() {
                     const Icon = item.icon
                     return (
                       <div
-                        key={item.title}
+                        key={item.titleKey}
                         className='bg-muted/35 flex items-center justify-between gap-4 rounded-lg border p-3'
                       >
                         <div className='flex min-w-0 items-start gap-3'>
                           <Icon className='text-muted-foreground mt-0.5 size-4 shrink-0' />
                           <div className='grid gap-1'>
-                            <Label>{item.title}</Label>
+                            <Label>{t(item.titleKey)}</Label>
                             <p className='text-muted-foreground text-xs'>
-                              {item.description}
+                              {t(item.descriptionKey)}
                             </p>
                           </div>
                         </div>
                         <div className='text-muted-foreground flex items-center gap-1.5 text-xs font-medium'>
                           <Lock className='size-3.5' />
-                          固定
+                          {t('Fixed')}
                         </div>
                       </div>
                     )
@@ -397,21 +417,25 @@ export function Settings() {
 
                 <div className='text-muted-foreground flex items-center gap-2 pt-1 text-xs'>
                   <Check className='size-3.5' />
-                  当前显示 {visibleOptionalCount + lockedNavItems.length} 个控制台入口
+                  {t('Currently showing {{count}} console entries', {
+                    count: visibleOptionalCount + lockedNavItems.length,
+                  })}
                 </div>
               </CardContent>
             </Card>
 
             <Card className='rounded-lg'>
               <CardHeader>
-                <CardTitle>管理员安全</CardTitle>
+                <CardTitle>{t('Admin Security')}</CardTitle>
                 <CardDescription>
-                  当前系统只保留 admin 管理员账号。
+                  {t('This local system keeps only the admin account.')}
                 </CardDescription>
               </CardHeader>
               <CardContent className='grid gap-4'>
                 <div className='grid gap-2'>
-                  <Label htmlFor='current-password'>当前密码</Label>
+                  <Label htmlFor='current-password'>
+                    {t('Current password')}
+                  </Label>
                   <PasswordInput
                     id='current-password'
                     value={passwordForm.current}
@@ -426,7 +450,7 @@ export function Settings() {
                 </div>
                 <div className='grid gap-4 md:grid-cols-2'>
                   <div className='grid gap-2'>
-                    <Label htmlFor='new-password'>新密码</Label>
+                    <Label htmlFor='new-password'>{t('New password')}</Label>
                     <PasswordInput
                       id='new-password'
                       value={passwordForm.next}
@@ -440,7 +464,9 @@ export function Settings() {
                     />
                   </div>
                   <div className='grid gap-2'>
-                    <Label htmlFor='confirm-password'>确认新密码</Label>
+                    <Label htmlFor='confirm-password'>
+                      {t('Confirm new password')}
+                    </Label>
                     <PasswordInput
                       id='confirm-password'
                       value={passwordForm.confirm}
@@ -462,7 +488,7 @@ export function Settings() {
                     onClick={handlePasswordSubmit}
                   >
                     <ShieldCheck className='size-4' />
-                    修改密码
+                    {t('Change password')}
                   </Button>
                 </div>
               </CardContent>
@@ -470,9 +496,11 @@ export function Settings() {
 
             <Card className='rounded-lg'>
               <CardHeader>
-                <CardTitle>数据维护</CardTitle>
+                <CardTitle>{t('Data Maintenance')}</CardTitle>
                 <CardDescription>
-                  清理本地统计数据不会删除渠道、分组和 API 密钥。
+                  {t(
+                    'Cleaning local analytics data will not delete channels, groups, or API keys.'
+                  )}
                 </CardDescription>
               </CardHeader>
               <CardContent className='grid gap-3'>
@@ -480,9 +508,11 @@ export function Settings() {
                   <div className='flex min-w-0 items-start gap-3'>
                     <Trash2 className='text-muted-foreground mt-0.5 size-4 shrink-0' />
                     <div className='grid gap-1'>
-                      <Label>清空使用日志</Label>
+                      <Label>{t('Clear usage logs')}</Label>
                       <p className='text-muted-foreground text-xs'>
-                        删除调用明细和统计来源，适合重新开始统计。
+                        {t(
+                          'Delete request details and analytics source data when you want to restart statistics.'
+                        )}
                       </p>
                     </div>
                   </div>
@@ -492,13 +522,15 @@ export function Settings() {
                     size='sm'
                     onClick={() => setClearLogsOpen(true)}
                   >
-                    清空
+                    {t('Clear')}
                   </Button>
                 </div>
                 <div className='bg-muted/35 flex items-center gap-3 rounded-lg border p-3'>
                   <RotateCcw className='text-muted-foreground size-4 shrink-0' />
                   <p className='text-muted-foreground text-xs'>
-                    配置导入、导出和更细的数据清理会放在后续维护项里。
+                    {t(
+                      'Config import, export, and finer data cleanup will be added in future maintenance tools.'
+                    )}
                   </p>
                 </div>
               </CardContent>
@@ -510,10 +542,12 @@ export function Settings() {
       <ConfirmDialog
         open={clearLogsOpen}
         onOpenChange={setClearLogsOpen}
-        title='清空使用日志'
-        desc='此操作会删除本地调用日志和统计数据，渠道、分组、API 密钥不会被删除。'
+        title={t('Clear usage logs')}
+        desc={t(
+          'This will delete local request logs and analytics data. Channels, groups, and API keys will not be deleted.'
+        )}
         destructive
-        confirmText='清空'
+        confirmText={t('Clear')}
         isLoading={clearLogsMutation.isPending}
         handleConfirm={() => clearLogsMutation.mutate()}
       />

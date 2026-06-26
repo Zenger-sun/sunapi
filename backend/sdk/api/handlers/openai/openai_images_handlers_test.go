@@ -456,6 +456,25 @@ func TestCollectImagesFromResponsesStreamUsesOutputItemDoneFallback(t *testing.T
 	}
 }
 
+func TestCollectImagesFromResponsesStreamStopsOnTerminalEvent(t *testing.T) {
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	close(errs)
+	data <- []byte(`data: {"type":"response.failed","response":{"error":{"message":"safety stop"}}}` + "\n\n")
+	close(data)
+
+	out, errMsg := collectImagesFromResponsesStream(context.Background(), data, errs, "url")
+	if errMsg == nil {
+		t.Fatalf("collectImagesFromResponsesStream returned nil error; body=%s", string(out))
+	}
+	if errMsg.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusBadGateway)
+	}
+	if !strings.Contains(errMsg.Error.Error(), "safety stop") {
+		t.Fatalf("error = %v, want safety stop", errMsg.Error)
+	}
+}
+
 func TestImagesGenerationsRejectsUnsupportedModel(t *testing.T) {
 	handler := &OpenAIAPIHandler{}
 	body := strings.NewReader(`{"model":"gpt-5.4-mini","prompt":"draw a square"}`)

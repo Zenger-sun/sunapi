@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useCallback } from 'react'
+import { useCallback, useEffect } from 'react'
 import {
   INTERFACE_LANGUAGE_OPTIONS,
   normalizeInterfaceLanguage,
@@ -37,12 +37,22 @@ import {
 export function LanguageSwitcher() {
   const { i18n, t } = useTranslation()
   const user = useAuthStore((s) => s.auth.user)
+  const setUser = useAuthStore((s) => s.auth.setUser)
   const currentLanguage = normalizeInterfaceLanguage(i18n.language)
+
+  useEffect(() => {
+    if (!user?.language) return
+    const userLanguage = normalizeInterfaceLanguage(user.language)
+    if (userLanguage !== currentLanguage) {
+      void i18n.changeLanguage(userLanguage)
+    }
+  }, [currentLanguage, i18n, user?.language])
 
   const handleChangeLanguage = useCallback(
     async (code: string) => {
       await i18n.changeLanguage(code)
       if (user) {
+        setUser({ ...user, language: code })
         try {
           await api.put('/api/user/self', { language: code })
         } catch {
@@ -50,7 +60,7 @@ export function LanguageSwitcher() {
         }
       }
     },
-    [i18n, user]
+    [i18n, setUser, user]
   )
 
   return (

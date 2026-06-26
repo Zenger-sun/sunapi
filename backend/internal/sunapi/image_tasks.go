@@ -19,7 +19,15 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const playgroundImageTaskTimeout = 30 * time.Minute
+const (
+	playgroundImageTaskTimeout            = 30 * time.Minute
+	playgroundImageTaskMaxConcurrency     = 5
+	playgroundImageTaskStatusSaveAttempts = 5
+	playgroundImageTaskStatusSaveTimeout  = 20 * time.Second
+	playgroundImageTaskStatusSaveBackoff  = 100 * time.Millisecond
+)
+
+var playgroundImageTaskSemaphore = make(chan struct{}, playgroundImageTaskMaxConcurrency)
 
 type playgroundImageTaskPayload struct {
 	PlaygroundImageGeneration
@@ -85,33 +93,56 @@ func normalizePlaygroundImageTaskRequest(raw json.RawMessage, item PlaygroundIma
 }
 
 func runPlaygroundImageTask(store *Store, imageHandlers *openai.OpenAIAPIHandler, userID int64, item PlaygroundImageGeneration, requestBody []byte) {
-	startedAt := time.Now()
+	queuedAt := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), playgroundImageTaskTimeout)
 	defer cancel()
 
 	path, usesReferences := playgroundImageTaskRoute(requestBody)
 	logFields := playgroundImageTaskLogFields(item, requestBody, path, usesReferences)
+	log.Infof("sunapi image task debug: queued %s", playgroundImageTaskLogLine(logFields))
+
+	select {
+	case playgroundImageTaskSemaphore <- struct{}{}:
+		defer func() {
+			<-playgroundImageTaskSemaphore
+		}()
+	case <-ctx.Done():
+		item.DurationMS = time.Since(queuedAt).Milliseconds()
+		fields := playgroundImageTaskCopyLogFields(logFields)
+		fields["duration_ms"] = item.DurationMS
+		fields["error"] = ctx.Err().Error()
+		log.Warnf("sunapi image task debug: timed out waiting for concurrency slot %s", playgroundImageTaskLogLine(fields))
+		savePlaygroundImageTaskFailure(store, userID, item, ctx.Err().Error())
+		return
+	}
+
+	queueWaitMS := time.Since(queuedAt).Milliseconds()
+	logFields["queue_wait_ms"] = queueWaitMS
 	log.Infof("sunapi image task debug: started %s", playgroundImageTaskLogLine(logFields))
 
+	upstreamStartedAt := time.Now()
 	body, statusCode, err := executePlaygroundImageTaskRequest(ctx, store, imageHandlers, requestBody)
-	item.DurationMS = time.Since(startedAt).Milliseconds()
+	upstreamMS := time.Since(upstreamStartedAt).Milliseconds()
+	item.DurationMS = time.Since(queuedAt).Milliseconds()
 	if err != nil {
 		fields := playgroundImageTaskCopyLogFields(logFields)
 		fields["duration_ms"] = item.DurationMS
+		fields["upstream_ms"] = upstreamMS
 		fields["error"] = err.Error()
 		log.Warnf("sunapi image task debug: internal request failed %s", playgroundImageTaskLogLine(fields))
-		savePlaygroundImageTaskFailure(ctx, store, userID, item, err.Error())
+		savePlaygroundImageTaskFailure(store, userID, item, err.Error())
 		return
 	}
 	if statusCode < http.StatusOK || statusCode >= http.StatusBadRequest {
 		message := playgroundImageTaskErrorMessage(statusCode, body)
 		fields := playgroundImageTaskCopyLogFields(logFields)
 		fields["duration_ms"] = item.DurationMS
+		fields["upstream_ms"] = upstreamMS
 		fields["status_code"] = statusCode
 		fields["error_message"] = message
 		fields["response_excerpt"] = playgroundImageTaskBodyExcerpt(body, 1000)
 		log.Warnf("sunapi image task debug: image handler returned error %s", playgroundImageTaskLogLine(fields))
-		savePlaygroundImageTaskFailure(ctx, store, userID, item, message)
+		savePlaygroundImageTaskFailure(store, userID, item, message)
 		return
 	}
 
@@ -119,31 +150,53 @@ func runPlaygroundImageTask(store *Store, imageHandlers *openai.OpenAIAPIHandler
 	if err != nil {
 		fields := playgroundImageTaskCopyLogFields(logFields)
 		fields["duration_ms"] = item.DurationMS
+		fields["upstream_ms"] = upstreamMS
 		fields["status_code"] = statusCode
 		fields["error"] = err.Error()
 		fields["response_excerpt"] = playgroundImageTaskBodyExcerpt(body, 1000)
 		log.Warnf("sunapi image task debug: image response parse failed %s", playgroundImageTaskLogLine(fields))
-		savePlaygroundImageTaskFailure(ctx, store, userID, item, err.Error())
+		savePlaygroundImageTaskFailure(store, userID, item, err.Error())
 		return
 	}
+	rawURLCount := len(urls)
+	persistStartedAt := time.Now()
 	urls = persistPlaygroundImageURLs(ctx, store.DataDir(), item.ID, urls, item.CreatedAt)
+	persistMS := time.Since(persistStartedAt).Milliseconds()
+	item.DurationMS = time.Since(queuedAt).Milliseconds()
 	if len(urls) == 0 {
 		fields := playgroundImageTaskCopyLogFields(logFields)
 		fields["duration_ms"] = item.DurationMS
+		fields["upstream_ms"] = upstreamMS
+		fields["persist_ms"] = persistMS
 		fields["status_code"] = statusCode
+		fields["raw_url_count"] = rawURLCount
 		fields["response_excerpt"] = playgroundImageTaskBodyExcerpt(body, 1000)
 		log.Warnf("sunapi image task debug: image response had no usable urls %s", playgroundImageTaskLogLine(fields))
-		savePlaygroundImageTaskFailure(ctx, store, userID, item, "image response is empty")
+		savePlaygroundImageTaskFailure(store, userID, item, "image response is empty")
 		return
 	}
 
 	item.Status = "succeeded"
 	item.ErrorMessage = ""
 	item.URLs = urls
-	_, _ = store.SavePlaygroundImageGeneration(ctx, userID, item)
+	if err := savePlaygroundImageTaskState(store, userID, item); err != nil {
+		fields := playgroundImageTaskCopyLogFields(logFields)
+		fields["duration_ms"] = item.DurationMS
+		fields["upstream_ms"] = upstreamMS
+		fields["persist_ms"] = persistMS
+		fields["status_code"] = statusCode
+		fields["raw_url_count"] = rawURLCount
+		fields["url_count"] = len(urls)
+		fields["save_error"] = err.Error()
+		log.Warnf("sunapi image task debug: status save failed %s", playgroundImageTaskLogLine(fields))
+		return
+	}
 	fields := playgroundImageTaskCopyLogFields(logFields)
 	fields["duration_ms"] = item.DurationMS
+	fields["upstream_ms"] = upstreamMS
+	fields["persist_ms"] = persistMS
 	fields["status_code"] = statusCode
+	fields["raw_url_count"] = rawURLCount
 	fields["url_count"] = len(urls)
 	log.Infof("sunapi image task debug: succeeded %s", playgroundImageTaskLogLine(fields))
 }
@@ -289,11 +342,16 @@ func playgroundImageTaskLogLine(fields log.Fields) string {
 		"response_format",
 		"n",
 		"seed_present",
+		"queue_wait_ms",
 		"duration_ms",
+		"upstream_ms",
+		"persist_ms",
 		"status_code",
+		"raw_url_count",
 		"url_count",
 		"error",
 		"error_message",
+		"save_error",
 		"response_excerpt",
 		"request_json_error",
 	}
@@ -443,12 +501,44 @@ func playgroundImageTaskErrorMessage(statusCode int, body []byte) string {
 	return "image generation failed"
 }
 
-func savePlaygroundImageTaskFailure(ctx context.Context, store *Store, userID int64, item PlaygroundImageGeneration, message string) {
+func savePlaygroundImageTaskState(store *Store, userID int64, item PlaygroundImageGeneration) error {
+	if store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), playgroundImageTaskStatusSaveTimeout)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; attempt <= playgroundImageTaskStatusSaveAttempts; attempt++ {
+		if _, err := store.SavePlaygroundImageGeneration(ctx, userID, item); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt == playgroundImageTaskStatusSaveAttempts {
+			break
+		}
+
+		delay := playgroundImageTaskStatusSaveBackoff * time.Duration(1<<(attempt-1))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return lastErr
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func savePlaygroundImageTaskFailure(store *Store, userID int64, item PlaygroundImageGeneration, message string) {
 	if store == nil {
 		return
 	}
 	item.Status = "failed"
 	item.ErrorMessage = message
 	item.URLs = []string{}
-	_, _ = store.SavePlaygroundImageGeneration(ctx, userID, item)
+	if err := savePlaygroundImageTaskState(store, userID, item); err != nil {
+		log.WithError(err).WithField("task_id", item.ID).Warn("sunapi image task debug: failed to persist failure status")
+	}
 }

@@ -25,10 +25,11 @@ import {
   Route,
   Settings2,
 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { useStatus } from '@/hooks/use-status'
+import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/copy-button'
 import { PublicLayout } from '@/components/layout'
-import { Button } from '@/components/ui/button'
-import { useStatus } from '@/hooks/use-status'
 
 function getRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object'
@@ -56,49 +57,51 @@ function joinPath(base: string, pathname: string): string {
   return `${normalizeServerAddress(base)}${pathname}`
 }
 
-const setupSteps = [
-  {
-    title: '创建分组',
-    description:
-      '先进入分组页创建可用分组。创建渠道时需要选择分组，分组也会参与后续价格倍率统计。',
-    href: '/groups',
-    action: '去创建分组',
-  },
-  {
-    title: '添加并测试渠道',
-    description:
-      '进入渠道页填写上游 Base URL、API Key、模型名称和价格，选择分组后保存并测试。测试通过后即可进入创作台使用。',
-    href: '/channels',
-    action: '去创建渠道',
-  },
-  {
-    title: '创建 API 密钥',
-    description:
-      '作为中转站使用时，先在 API 密钥页创建 Token，再使用一键 Codex 或一键 Claude 完成客户端接入。',
-    href: '/keys',
-    action: '去创建 Token',
-  },
-]
-
-const clientRows = [
-  {
-    name: 'Claude / Anthropic 兼容客户端',
-    baseURL: '本地入口',
-    note: 'Base URL 不要额外添加 /v1。',
-  },
-  {
-    name: 'OpenAI 兼容客户端',
-    baseURL: '本地入口 + /v1',
-    note: '例如 chat/completions、responses 等 OpenAI 风格接口。',
-  },
-]
-
 export function Docs() {
+  const { t } = useTranslation()
   const { status } = useStatus()
   const endpoint = normalizeServerAddress(
     getStatusString(status, 'server_address') ?? getBrowserOrigin()
   )
   const openAIBaseURL = joinPath(endpoint, '/v1')
+  const setupSteps = [
+    {
+      title: t('Create groups'),
+      description: t(
+        'Create usable groups first. Channels must be assigned to groups, and groups are also used for later price multiplier statistics.'
+      ),
+      href: '/groups',
+      action: t('Create group'),
+    },
+    {
+      title: t('Add and test channels'),
+      description: t(
+        'Open Channels, fill in the upstream Base URL, API key, model names, and prices, choose a group, then save and test. After the test passes, you can use it in Playground.'
+      ),
+      href: '/channels',
+      action: t('Create channel'),
+    },
+    {
+      title: t('Create API keys'),
+      description: t(
+        'When using SunAPI as a relay, create a token on the API Keys page first, then use one-click Codex or one-click Claude to connect your client.'
+      ),
+      href: '/keys',
+      action: t('Create token'),
+    },
+  ]
+  const clientRows = [
+    {
+      name: t('Claude / Anthropic compatible clients'),
+      baseURL: t('Local endpoint'),
+      note: t('Do not append /v1 to the Base URL.'),
+    },
+    {
+      name: t('OpenAI compatible clients'),
+      baseURL: t('Local endpoint + /v1'),
+      note: t('For OpenAI-style APIs such as chat/completions and responses.'),
+    },
+  ]
 
   return (
     <PublicLayout showMainContainer={false}>
@@ -108,23 +111,24 @@ export function Docs() {
             <div className='flex flex-col gap-5'>
               <div className='border-border bg-card/70 inline-flex w-fit items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium'>
                 <BookOpen className='size-3.5' />
-                SunAPI 本地配置教学
+                {t('SunAPI local setup guide')}
               </div>
               <div className='space-y-3'>
                 <h1 className='max-w-3xl text-4xl leading-tight font-semibold tracking-normal md:text-5xl'>
-                  把上游模型接成本机统一入口
+                  {t('Connect upstream models to one local endpoint')}
                 </h1>
                 <p className='text-muted-foreground max-w-3xl text-base leading-7'>
-                  这个单机版本只保留渠道、分组、调用日志和统计。添加一个上游渠道后，
-                  本机入口会转发请求，并自动汇总 Token、调用次数和估算价格。
+                  {t(
+                    'This local edition keeps channels, groups, request logs, and analytics. After you add an upstream channel, the local endpoint forwards requests and aggregates tokens, request counts, and estimated cost.'
+                  )}
                 </p>
               </div>
               <div className='flex flex-wrap gap-3'>
                 <Button render={<Link to='/dashboard' />}>
-                  前往控制台
+                  {t('Go to Console')}
                 </Button>
                 <Button variant='outline' render={<Link to='/playground' />}>
-                  打开创作台
+                  {t('Open Playground')}
                 </Button>
               </div>
             </div>
@@ -132,20 +136,22 @@ export function Docs() {
             <div className='bg-card rounded-2xl border p-4 shadow-xs'>
               <div className='flex items-center justify-between gap-3'>
                 <div>
-                  <div className='text-sm font-semibold'>本地入口</div>
+                  <div className='text-sm font-semibold'>
+                    {t('Local endpoint')}
+                  </div>
                   <div className='text-muted-foreground text-xs'>
-                    控制台展示和 Claude 客户端使用此地址
+                    {t('Use this address in the console and Claude clients')}
                   </div>
                 </div>
                 <CopyButton
                   value={endpoint}
                   variant='outline'
                   size='sm'
-                  tooltip='复制入口'
-                  successTooltip='已复制'
+                  tooltip={t('Copy endpoint')}
+                  successTooltip={t('Copied')}
                 >
                   <Copy className='size-3.5' />
-                  复制
+                  {t('Copy')}
                 </CopyButton>
               </div>
               <div className='bg-muted/40 mt-4 rounded-xl border px-3 py-3 font-mono text-sm font-semibold break-all'>
@@ -161,7 +167,7 @@ export function Docs() {
                     <div className='min-w-0'>
                       <div className='font-medium'>{row.name}</div>
                       <div className='text-muted-foreground text-xs'>
-                        {row.baseURL}，{row.note}
+                        {row.baseURL}, {row.note}
                       </div>
                     </div>
                   </div>
@@ -196,11 +202,12 @@ export function Docs() {
             <div className='bg-card rounded-2xl border p-5'>
               <div className='flex items-center gap-2 text-base font-semibold'>
                 <Cable className='size-4' />
-                OpenAI 兼容配置
+                {t('OpenAI compatible configuration')}
               </div>
               <p className='text-muted-foreground mt-2 text-sm leading-6'>
-                OpenAI SDK、Cherry Studio、Chatbox 等使用 OpenAI 协议的客户端，
-                Base URL 填下面这个地址。
+                {t(
+                  'For clients that use the OpenAI protocol, such as the OpenAI SDK, Cherry Studio, and Chatbox, use the Base URL below.'
+                )}
               </p>
               <div className='bg-muted/40 mt-4 rounded-xl border px-3 py-3 font-mono text-sm break-all'>
                 {openAIBaseURL}
@@ -210,11 +217,12 @@ export function Docs() {
             <div className='bg-card rounded-2xl border p-5'>
               <div className='flex items-center gap-2 text-base font-semibold'>
                 <Route className='size-4' />
-                Claude 兼容配置
+                {t('Claude compatible configuration')}
               </div>
               <p className='text-muted-foreground mt-2 text-sm leading-6'>
-                Claude Code 或 Anthropic 兼容客户端的 Base URL 使用本地入口即可，
-                客户端自身会请求对应的 Claude API 路径。
+                {t(
+                  'For Claude Code or Anthropic-compatible clients, use the local endpoint as the Base URL. The client will request the matching Claude API path itself.'
+                )}
               </p>
               <div className='bg-muted/40 mt-4 rounded-xl border px-3 py-3 font-mono text-sm break-all'>
                 {endpoint}
@@ -225,17 +233,23 @@ export function Docs() {
           <section className='bg-card rounded-2xl border p-5'>
             <div className='flex items-center gap-2 text-base font-semibold'>
               <Settings2 className='size-4' />
-              统计与价格
+              {t('Analytics and pricing')}
             </div>
             <div className='text-muted-foreground mt-4 grid gap-3 text-sm md:grid-cols-3'>
               <p>
-                每次转发完成后会写入调用日志，记录模型、渠道、分组、Token、耗时和状态码。
+                {t(
+                  'After each forwarded request completes, SunAPI writes a request log with model, channel, group, tokens, latency, and status code.'
+                )}
               </p>
               <p>
-                价格由渠道的输入/输出单价和分组倍率估算，只用于本地统计，不做计费。
+                {t(
+                  'Cost is estimated from channel input/output prices and group multipliers. It is for local analytics only, not billing.'
+                )}
               </p>
               <p>
-                数据看板会按模型和时间聚合请求数、Token、RPM、TPM 与总消耗。
+                {t(
+                  'The dashboard aggregates requests, tokens, RPM, TPM, and total cost by model and time.'
+                )}
               </p>
             </div>
           </section>

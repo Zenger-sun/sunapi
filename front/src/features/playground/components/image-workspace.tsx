@@ -83,14 +83,44 @@ interface ImageWorkspaceProps {
   onUnlock?: () => void
 }
 
+const MAX_CONCURRENT_IMAGE_TASKS = 5
+
 function generateId() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
 }
 
+function generationDurationMs(item: ImageGenerationItem, now: number) {
+  if (typeof item.durationMs === 'number' && item.durationMs >= 0) {
+    return item.durationMs
+  }
+  if (item.status === 'running') {
+    return Math.max(0, now - item.createdAt)
+  }
+  if (item.updatedAt && item.createdAt) {
+    return Math.max(0, item.updatedAt - item.createdAt)
+  }
+  return null
+}
+
+function formatGenerationDuration(ms: number) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m ${seconds.toString().padStart(2, '0')}s`
+  }
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return `${hours}h ${minutes.toString().padStart(2, '0')}m`
+}
+
 function useImageStore() {
   const [items, setItems] = useState<ImageGenerationItem[]>([])
-  const [generating, setGenerating] = useState(false)
-  return { items, setItems, generating, setGenerating }
+  const [submittingCount, setSubmittingCount] = useState(0)
+  return { items, setItems, submittingCount, setSubmittingCount }
 }
 
 function mergeImageHistory(
@@ -157,11 +187,28 @@ export function ImageWorkspace({
   onUnlock,
 }: ImageWorkspaceProps) {
   const { t } = useTranslation()
-  const { items, setItems, generating, setGenerating } = useImageStore()
+  const { items, setItems, submittingCount, setSubmittingCount } =
+    useImageStore()
   const [prompt, setPrompt] = useState('')
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
-  const hasRunningTasks = items.some((item) => item.status === 'running')
+  const activeTaskCountRef = useRef(0)
+  const runningTasksCount = items.filter(
+    (item) => item.status === 'running'
+  ).length
+  const activeTaskCount = runningTasksCount + submittingCount
+  activeTaskCountRef.current = activeTaskCount
+  const hasRunningTasks = runningTasksCount > 0
+  const isAtConcurrencyLimit = activeTaskCount >= MAX_CONCURRENT_IMAGE_TASKS
+
+  const reserveImageTaskSlot = () => {
+    if (activeTaskCountRef.current >= MAX_CONCURRENT_IMAGE_TASKS) {
+      return false
+    }
+    activeTaskCountRef.current += 1
+    setSubmittingCount((count) => count + 1)
+    return true
+  }
 
   const refreshHistory = useCallback(async () => {
     const history = await getImageGenerationHistory()
@@ -170,8 +217,8 @@ export function ImageWorkspace({
   }, [setItems])
 
   useEffect(() => {
-    onGeneratingChange?.(generating)
-  }, [generating, onGeneratingChange])
+    onGeneratingChange?.(activeTaskCount > 0)
+  }, [activeTaskCount, onGeneratingChange])
 
   useEffect(() => {
     void refreshHistory().catch(() => undefined)
@@ -225,7 +272,10 @@ export function ImageWorkspace({
       setItems((prev) => mergeImageHistory(prev, [savedItem]))
       void refreshHistory().catch(() => undefined)
     } catch (error) {
-      const messageText = getImageErrorMessage(error, t('\u56fe\u7247\u4efb\u52a1\u63d0\u4ea4\u5931\u8d25'))
+      const messageText = getImageErrorMessage(
+        error,
+        t('\u56fe\u7247\u4efb\u52a1\u63d0\u4ea4\u5931\u8d25')
+      )
       const failedItem: ImageGenerationItem = {
         ...taskItem,
         urls: [],
@@ -246,13 +296,45 @@ export function ImageWorkspace({
   const handleSubmit = async (message: PromptInputMessage) => {
     const text = (message.text ?? prompt).trim()
     if (!text) {
-      toast.info(t('\u8bf7\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247'))
+      toast.info(
+        t('\u8bf7\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247')
+      )
       composerRef.current?.focus()
       return
     }
-    if (generating) return
+    if (isAtConcurrencyLimit) {
+      toast.info(
+        t(
+          '\u6700\u591a\u540c\u65f6\u8fd0\u884c {{count}} \u4e2a\u56fe\u7247\u4efb\u52a1',
+          {
+            count: MAX_CONCURRENT_IMAGE_TASKS,
+          }
+        )
+      )
+      return
+    }
 
-    setGenerating(true)
+    if (!reserveImageTaskSlot()) {
+      toast.info(
+        t(
+          '\u6700\u591a\u540c\u65f6\u8fd0\u884c {{count}} \u4e2a\u56fe\u7247\u4efb\u52a1',
+          {
+            count: MAX_CONCURRENT_IMAGE_TASKS,
+          }
+        )
+      )
+      return
+    }
+    let submittingReleased = false
+    let slotTransferredToTask = false
+    const releaseSubmittingSlot = () => {
+      if (submittingReleased) return
+      submittingReleased = true
+      if (!slotTransferredToTask) {
+        activeTaskCountRef.current = Math.max(0, activeTaskCountRef.current - 1)
+      }
+      setSubmittingCount((count) => Math.max(0, count - 1))
+    }
 
     try {
       const imageFiles = (message.files ?? []).filter(
@@ -261,7 +343,8 @@ export function ImageWorkspace({
       const referenceImages: MessageAttachment[] = await Promise.all(
         imageFiles.map(async (inputFile) => {
           const file = inputFile.file
-          if (!file) throw new Error(t('\u53c2\u8003\u56fe\u8bfb\u53d6\u5931\u8d25'))
+          if (!file)
+            throw new Error(t('\u53c2\u8003\u56fe\u8bfb\u53d6\u5931\u8d25'))
           const uploaded = await uploadPlaygroundAttachment(file)
           return {
             id: uploaded.id,
@@ -290,8 +373,9 @@ export function ImageWorkspace({
         createdAt,
       }
       setItems((prev) => [newItem, ...prev])
+      slotTransferredToTask = true
       setPrompt('')
-      await runGeneration({
+      const generationPromise = runGeneration({
         itemId,
         createdAt,
         text,
@@ -300,19 +384,54 @@ export function ImageWorkspace({
         targetModel: model,
         targetGroup: group,
       })
+      releaseSubmittingSlot()
+      await generationPromise
     } catch (error) {
-      const messageText = getImageErrorMessage(error, t('\u56fe\u7247\u751f\u6210\u5931\u8d25'))
+      const messageText = getImageErrorMessage(
+        error,
+        t('\u56fe\u7247\u751f\u6210\u5931\u8d25')
+      )
       toast.error(messageText)
     } finally {
-      setGenerating(false)
+      releaseSubmittingSlot()
     }
   }
 
   const handleRetry = async (item: ImageGenerationItem) => {
-    if (generating) return
-    setGenerating(true)
+    if (isAtConcurrencyLimit) {
+      toast.info(
+        t(
+          '\u6700\u591a\u540c\u65f6\u8fd0\u884c {{count}} \u4e2a\u56fe\u7247\u4efb\u52a1',
+          {
+            count: MAX_CONCURRENT_IMAGE_TASKS,
+          }
+        )
+      )
+      return
+    }
+    if (!reserveImageTaskSlot()) {
+      toast.info(
+        t(
+          '\u6700\u591a\u540c\u65f6\u8fd0\u884c {{count}} \u4e2a\u56fe\u7247\u4efb\u52a1',
+          {
+            count: MAX_CONCURRENT_IMAGE_TASKS,
+          }
+        )
+      )
+      return
+    }
+    let submittingReleased = false
+    let slotTransferredToTask = false
+    const releaseSubmittingSlot = () => {
+      if (submittingReleased) return
+      submittingReleased = true
+      if (!slotTransferredToTask) {
+        activeTaskCountRef.current = Math.max(0, activeTaskCountRef.current - 1)
+      }
+      setSubmittingCount((count) => Math.max(0, count - 1))
+    }
     try {
-      await runGeneration({
+      const generationPromise = runGeneration({
         itemId: item.id,
         createdAt: item.createdAt,
         text: item.prompt,
@@ -321,8 +440,11 @@ export function ImageWorkspace({
         targetModel: item.model || model,
         targetGroup: item.group || group,
       })
+      slotTransferredToTask = true
+      releaseSubmittingSlot()
+      await generationPromise
     } finally {
-      setGenerating(false)
+      releaseSubmittingSlot()
     }
   }
 
@@ -392,7 +514,9 @@ export function ImageWorkspace({
             value={prompt}
             onChange={setPrompt}
             onSubmit={handleSubmit}
-            isGenerating={generating}
+            isGenerating={isAtConcurrencyLimit}
+            activeTaskCount={activeTaskCount}
+            maxConcurrentTasks={MAX_CONCURRENT_IMAGE_TASKS}
             isLocked={isLocked}
             onUnlock={onUnlock}
             model={model}
@@ -420,6 +544,8 @@ interface ImageComposerProps {
   onChange: (value: string) => void
   onSubmit: (message: PromptInputMessage) => void | Promise<void>
   isGenerating: boolean
+  activeTaskCount: number
+  maxConcurrentTasks: number
   isLocked?: boolean
   onUnlock?: () => void
   model: string
@@ -436,6 +562,8 @@ const ImageComposer = ({
   onChange,
   onSubmit,
   isGenerating,
+  activeTaskCount,
+  maxConcurrentTasks,
   isLocked,
   onUnlock,
   model,
@@ -468,10 +596,14 @@ const ImageComposer = ({
       onError={(error) => {
         const message =
           error.code === 'max_files'
-            ? t('\u6700\u591a\u53ea\u80fd\u6dfb\u52a0 4 \u5f20\u53c2\u8003\u56fe')
+            ? t(
+                '\u6700\u591a\u53ea\u80fd\u6dfb\u52a0 4 \u5f20\u53c2\u8003\u56fe'
+              )
             : error.code === 'max_file_size'
               ? t('\u53c2\u8003\u56fe\u4e0d\u80fd\u8d85\u8fc7 12MB')
-              : t('\u53ea\u80fd\u6dfb\u52a0\u56fe\u7247\u4f5c\u4e3a\u53c2\u8003\u56fe')
+              : t(
+                  '\u53ea\u80fd\u6dfb\u52a0\u56fe\u7247\u4f5c\u4e3a\u53c2\u8003\u56fe'
+                )
         toast.error(message)
       }}
       onSubmit={handleSubmit}
@@ -482,7 +614,9 @@ const ImageComposer = ({
         ref={ref}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={t('\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247...')}
+        placeholder={t(
+          '\u63cf\u8ff0\u4f60\u60f3\u751f\u6210\u7684\u56fe\u7247...'
+        )}
         disabled={isGenerating || isLocked}
         className='px-5 md:text-base'
       />
@@ -490,7 +624,14 @@ const ImageComposer = ({
       <PromptInputFooter className='p-2.5'>
         <div className='text-muted-foreground inline-flex items-center gap-1.5 px-1.5 text-xs'>
           <ImageIcon className='size-3.5' />
-          {hasImageModel ? t('\u56fe\u7247\u751f\u6210') : t('\u5f53\u524d\u5206\u7ec4\u65e0\u56fe\u7247\u6a21\u578b')}
+          {hasImageModel
+            ? t('\u56fe\u7247\u751f\u6210')
+            : t('\u5f53\u524d\u5206\u7ec4\u65e0\u56fe\u7247\u6a21\u578b')}
+          {hasImageModel && activeTaskCount > 0 && (
+            <span className='bg-muted text-muted-foreground rounded px-1 py-0.5 text-[10px]'>
+              {activeTaskCount}/{maxConcurrentTasks}
+            </span>
+          )}
           {isLocked && (
             <button
               type='button'
@@ -498,7 +639,9 @@ const ImageComposer = ({
               className='text-muted-foreground hover:text-foreground ml-2 inline-flex items-center gap-1 text-[10px] underline-offset-2 hover:underline'
             >
               <AlertCircleIcon className='size-3' />
-              {t('\u540e\u7aef\u4e0d\u53ef\u7528\uff0c\u70b9\u51fb\u89e3\u9501\u9884\u89c8')}
+              {t(
+                '\u540e\u7aef\u4e0d\u53ef\u7528\uff0c\u70b9\u51fb\u89e3\u9501\u9884\u89c8'
+              )}
             </button>
           )}
         </div>
@@ -603,7 +746,9 @@ function Gallery({
             </div>
           </div>
           <div className='text-xs leading-relaxed'>
-            {t('\u5728\u4e0b\u65b9\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u56fe\u7247\u4f1a\u751f\u6210\u5728\u8fd9\u91cc\u3002')}
+            {t(
+              '\u5728\u4e0b\u65b9\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u56fe\u7247\u4f1a\u751f\u6210\u5728\u8fd9\u91cc\u3002'
+            )}
           </div>
         </div>
       </div>
@@ -648,6 +793,20 @@ function GenerationCard({
 }: GenerationCardProps) {
   const { t } = useTranslation()
   const imageSrc = useAuthenticatedImageSource(item.urls[0] || '')
+  const [now, setNow] = useState(() => Date.now())
+  const durationMs = generationDurationMs(item, now)
+  const durationText =
+    typeof durationMs === 'number' ? formatGenerationDuration(durationMs) : null
+
+  useEffect(() => {
+    if (item.status !== 'running') return
+    setNow(Date.now())
+    const timer = window.setInterval(() => {
+      setNow(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [item.id, item.status])
+
   return (
     <div className='border-border/60 bg-card/60 group/card flex w-full min-w-0 flex-col overflow-hidden rounded-lg border shadow-sm transition-shadow hover:shadow-md'>
       <div className='bg-muted/25 relative aspect-[4/3] w-full overflow-hidden'>
@@ -703,7 +862,9 @@ function GenerationCard({
               <Skeleton className='h-40 w-40 rounded-md' />
               <span className='text-muted-foreground inline-flex items-center gap-1 text-[11px]'>
                 <ClockIcon className='size-3' />
-                {t('\u751f\u6210\u4e2d...')}
+                {durationText
+                  ? `${t('Generating...')} ${durationText}`
+                  : t('Generating...')}
               </span>
             </div>
           </div>
@@ -712,7 +873,7 @@ function GenerationCard({
           <div className='text-muted-foreground flex size-full flex-col items-center justify-center gap-2 px-6 text-center'>
             <AlertCircleIcon className='text-destructive size-6' />
             <span className='line-clamp-3 text-xs leading-relaxed'>
-              {item.errorMessage || t('\u751f\u6210\u5931\u8d25')}
+              {item.errorMessage || t('Generation failed')}
             </span>
             <Button
               type='button'
@@ -722,7 +883,7 @@ function GenerationCard({
               className='mt-1 h-7 gap-1.5 px-2 text-[11px]'
             >
               <RotateCcwIcon className='size-3' />
-              {t('\u91cd\u8bd5')}
+              {t('Retry')}
             </Button>
           </div>
         )}
@@ -768,23 +929,25 @@ function GenerationCard({
           )}
           <span className='bg-muted shrink-0 rounded px-1.5 py-0.5'>
             {item.params.resolution === 'auto'
-              ? t('自动')
+              ? t('Auto')
               : item.params.resolution.toUpperCase()}
           </span>
           <span className='bg-muted shrink-0 rounded px-1.5 py-0.5'>
             {item.params.aspectRatio === 'auto'
-              ? t('自动')
+              ? t('Auto')
               : item.params.aspectRatio}
           </span>
           {item.referenceImages && item.referenceImages.length > 0 && (
             <span className='bg-muted shrink-0 rounded px-1.5 py-0.5'>
-              {t('\u53c2\u8003\u56fe {{count}}', { count: item.referenceImages.length })}
+              {t('Reference images {{count}}', {
+                count: item.referenceImages.length,
+              })}
             </span>
           )}
-          {typeof item.durationMs === 'number' && (
-            <span className='inline-flex shrink-0 items-center gap-0.5'>
+          {durationText && (
+            <span className='bg-muted inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 py-0.5'>
               <ClockIcon className='size-2.5' />
-              {(item.durationMs / 1000).toFixed(1)}s
+              {t('Duration')} {durationText}
             </span>
           )}
         </div>

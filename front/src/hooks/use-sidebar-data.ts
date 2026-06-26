@@ -16,17 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import {
-  BarChart3,
-  FileText,
-  KeyRound,
-  Radio,
-  Settings,
-} from 'lucide-react'
-import { type SidebarData } from '@/components/layout/types'
+import { BarChart3, FileText, KeyRound, Radio, Settings } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { useSystemConfigStore } from '@/stores/system-config-store'
+import { type SidebarData } from '@/components/layout/types'
 
 export function useSidebarData(): SidebarData {
+  const { t } = useTranslation()
   const config = useSystemConfigStore((state) => state.config)
   const showDashboard = config.showDashboard ?? true
   const showApiKeys = config.showApiKeys ?? true
@@ -36,12 +32,12 @@ export function useSidebarData(): SidebarData {
     navGroups: [
       {
         id: 'general',
-        title: '常规',
+        title: t('General'),
         items: [
           ...(showDashboard
             ? [
                 {
-                  title: '数据看板',
+                  title: t('Dashboard'),
                   url: '/dashboard',
                   icon: BarChart3,
                 },
@@ -50,14 +46,14 @@ export function useSidebarData(): SidebarData {
           ...(showApiKeys
             ? [
                 {
-                  title: 'API 密钥',
+                  title: t('API Keys'),
                   url: '/keys',
                   icon: KeyRound,
                 },
               ]
             : []),
           {
-            title: '渠道&分组',
+            title: t('Channels & Groups'),
             url: '/channels',
             activeUrls: ['/channels', '/groups'],
             configUrls: ['/channels', '/groups'],
@@ -66,14 +62,14 @@ export function useSidebarData(): SidebarData {
           ...(showUsageLogs
             ? [
                 {
-                  title: '使用日志',
+                  title: t('Usage Logs'),
                   url: '/usage-logs',
                   icon: FileText,
                 },
               ]
             : []),
           {
-            title: '设置',
+            title: t('Settings'),
             url: '/settings',
             icon: Settings,
           },

@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useTranslation } from 'react-i18next'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
 export type TopNavLink = {
@@ -27,14 +28,17 @@ export type TopNavLink = {
 }
 
 export function useTopNavLinks(): TopNavLink[] {
+  const { t } = useTranslation()
   const config = useSystemConfigStore((state) => state.config)
   const showDashboard = config.showDashboard ?? true
   const showPlayground = config.showPlayground ?? true
 
   return [
-    { title: '首页', href: '/home' },
-    { title: '控制台', href: showDashboard ? '/dashboard' : '/channels' },
-    ...(showPlayground ? [{ title: '创作台', href: '/playground' }] : []),
-    { title: '文档', href: '/docs' },
+    { title: t('Home'), href: '/home' },
+    { title: t('Console'), href: showDashboard ? '/dashboard' : '/channels' },
+    ...(showPlayground
+      ? [{ title: t('Playground'), href: '/playground' }]
+      : []),
+    { title: t('Docs'), href: '/docs' },
   ]
 }

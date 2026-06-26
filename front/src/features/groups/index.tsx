@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Edit, Plus, Trash2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { SectionPageLayout } from '@/components/layout'
 import { Badge } from '@/components/ui/badge'
@@ -74,6 +75,7 @@ function toForm(group?: Group | null): GroupPayload {
 }
 
 export function Groups({ embedded = false }: GroupsProps) {
+  const { t } = useTranslation()
   const queryClient = useQueryClient()
   const [editing, setEditing] = useState<Group | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -93,7 +95,7 @@ export function Groups({ embedded = false }: GroupsProps) {
     mutationFn: () =>
       editing ? updateGroup(editing.id, form) : createGroup(form),
     onSuccess: () => {
-      toast.success(editing ? '分组已更新' : '分组已创建')
+      toast.success(editing ? t('Group updated') : t('Group created'))
       setDialogOpen(false)
       setEditing(null)
       invalidate()
@@ -103,7 +105,7 @@ export function Groups({ embedded = false }: GroupsProps) {
   const deleteMutation = useMutation({
     mutationFn: deleteGroup,
     onSuccess: () => {
-      toast.success('分组已删除')
+      toast.success(t('Group deleted'))
       invalidate()
     },
   })
@@ -123,7 +125,7 @@ export function Groups({ embedded = false }: GroupsProps) {
       }}
     >
       <Plus className='size-4' />
-      新增分组
+      {t('New group')}
     </Button>
   )
 
@@ -134,15 +136,17 @@ export function Groups({ embedded = false }: GroupsProps) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>名称</TableHead>
-              <TableHead>说明</TableHead>
-              <TableHead className='text-right'>倍率</TableHead>
-              <TableHead className='text-right'>渠道</TableHead>
-              <TableHead className='text-right'>调用</TableHead>
+              <TableHead>{t('Name')}</TableHead>
+              <TableHead>{t('Description')}</TableHead>
+              <TableHead className='text-right'>{t('Multiplier')}</TableHead>
+              <TableHead className='text-right'>{t('Channels')}</TableHead>
+              <TableHead className='text-right'>{t('Requests')}</TableHead>
               <TableHead className='text-right'>Token</TableHead>
-              <TableHead className='text-right'>费用</TableHead>
-              <TableHead>更新时间</TableHead>
-              <TableHead className='w-[120px] text-right'>操作</TableHead>
+              <TableHead className='text-right'>{t('Cost')}</TableHead>
+              <TableHead>{t('Updated at')}</TableHead>
+              <TableHead className='w-[120px] text-right'>
+                {t('Operation')}
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -206,11 +210,13 @@ export function Groups({ embedded = false }: GroupsProps) {
     <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{editing ? '编辑分组' : '新增分组'}</DialogTitle>
+          <DialogTitle>
+            {editing ? t('Edit group') : t('New group')}
+          </DialogTitle>
         </DialogHeader>
         <div className='grid gap-4 py-2'>
           <div className='grid gap-2'>
-            <Label>名称</Label>
+            <Label>{t('Name')}</Label>
             <Input
               value={form.name}
               disabled={editing?.name === 'default'}
@@ -220,7 +226,7 @@ export function Groups({ embedded = false }: GroupsProps) {
             />
           </div>
           <div className='grid gap-2'>
-            <Label>说明</Label>
+            <Label>{t('Description')}</Label>
             <Input
               value={form.description || ''}
               onChange={(event) =>
@@ -232,7 +238,7 @@ export function Groups({ embedded = false }: GroupsProps) {
             />
           </div>
           <div className='grid gap-2'>
-            <Label>价格倍率</Label>
+            <Label>{t('Price multiplier')}</Label>
             <Input
               type='number'
               min='0'
@@ -249,13 +255,13 @@ export function Groups({ embedded = false }: GroupsProps) {
         </div>
         <DialogFooter>
           <Button variant='outline' onClick={() => setDialogOpen(false)}>
-            取消
+            {t('Cancel')}
           </Button>
           <Button
             disabled={!form.name.trim() || saveMutation.isPending}
             onClick={() => saveMutation.mutate()}
           >
-            保存
+            {t('Save')}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -273,9 +279,11 @@ export function Groups({ embedded = false }: GroupsProps) {
 
   return (
     <SectionPageLayout>
-      <SectionPageLayout.Title>分组</SectionPageLayout.Title>
+      <SectionPageLayout.Title>{t('Groups')}</SectionPageLayout.Title>
       <SectionPageLayout.Description>
-        用分组管理渠道池，并按倍率计算本地估算价格。
+        {t(
+          'Use groups to manage channel pools and calculate local estimated cost by multiplier.'
+        )}
       </SectionPageLayout.Description>
       <SectionPageLayout.Actions>{actions}</SectionPageLayout.Actions>
       <SectionPageLayout.Content>{content}</SectionPageLayout.Content>

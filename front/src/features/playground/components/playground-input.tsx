@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState } from 'react'
+import { useState, type ComponentType, type CSSProperties } from 'react'
 import {
   PaperclipIcon,
   FileIcon,
@@ -70,38 +70,51 @@ interface PlaygroundInputProps {
   onGroupChange: (value: string) => void
 }
 
-const suggestions = [
+type PlaygroundSuggestion = {
+  icon: ComponentType<{ size?: number; style?: CSSProperties }> | null
+  labelKey: string
+  promptKey: string
+  color?: string
+  hideOnMobile?: boolean
+}
+
+const suggestions: PlaygroundSuggestion[] = [
   {
     icon: BarChartIcon,
-    label: '分析数据',
-    prompt: '分析最近的调用日志，找出异常趋势',
+    labelKey: 'Analyze data',
+    promptKey: 'Analyze recent usage logs and find unusual trends',
     color: '#76d0eb',
   },
   {
     icon: BoxIcon,
-    label: '给我惊喜',
-    prompt: '给我一个有意思的提示词',
+    labelKey: 'Surprise me',
+    promptKey: 'Give me an interesting prompt',
     color: '#76d0eb',
   },
   {
     icon: NotepadTextIcon,
-    label: '总结文本',
-    prompt: '总结一下本月的渠道用量',
+    labelKey: 'Summarize text',
+    promptKey: 'Summarize this month channel usage',
     color: '#ea8444',
   },
   {
     icon: CodeSquareIcon,
-    label: '代码',
-    prompt: '帮我写一个 React Hook',
+    labelKey: 'Code',
+    promptKey: 'Help me write a React Hook',
     color: '#6c71ff',
   },
   {
     icon: GraduationCapIcon,
-    label: '获取建议',
-    prompt: '我应该用哪个模型来翻译文档？',
+    labelKey: 'Get advice',
+    promptKey: 'Which model should I use to translate documents?',
     color: '#76d0eb',
   },
-  { icon: null, label: '更多', prompt: '给我更多提示建议' },
+  {
+    icon: null,
+    labelKey: 'More',
+    promptKey: 'Give me more prompt suggestions',
+    hideOnMobile: true,
+  },
 ]
 
 export function PlaygroundInput({
@@ -283,19 +296,21 @@ export function PlaygroundInput({
       </PromptInput>
 
       <Suggestions>
-        {suggestions.map(({ icon: Icon, label, prompt, color }) => (
-          <Suggestion
-            className={`text-xs font-normal sm:text-sm ${
-              label === '更多' ? 'hidden sm:flex' : ''
-            }`}
-            key={label}
-            onClick={() => handleSuggestionClick(prompt)}
-            suggestion={prompt}
-          >
-            {Icon && <Icon size={16} style={{ color }} />}
-            {label}
-          </Suggestion>
-        ))}
+        {suggestions.map(
+          ({ icon: Icon, labelKey, promptKey, color, hideOnMobile }) => (
+            <Suggestion
+              className={`text-xs font-normal sm:text-sm ${
+                hideOnMobile ? 'hidden sm:flex' : ''
+              }`}
+              key={labelKey}
+              onClick={() => handleSuggestionClick(t(promptKey))}
+              suggestion={t(promptKey)}
+            >
+              {Icon && <Icon size={16} style={{ color }} />}
+              {t(labelKey)}
+            </Suggestion>
+          )
+        )}
       </Suggestions>
     </div>
   )
