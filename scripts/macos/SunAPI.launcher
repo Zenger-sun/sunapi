@@ -199,6 +199,19 @@ port_is_listening() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
 }
 
+sunapi_pid_on_port() {
+  for pid in $(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null); do
+    command_path="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    case "$command_path" in
+      */sunapi-server|sunapi-server)
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 configured_port() {
   config_file="${HOME}/Library/Application Support/SunAPI/config.yaml"
   port="$(awk '/^[[:space:]]*port:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "$config_file" 2>/dev/null || true)"
@@ -226,10 +239,22 @@ printf 'SunAPI console started. Close this window or press Ctrl-C to stop SunAPI
 cd "$(dirname "$SERVER")" || exit 1
 listen_port="$(configured_port)"
 if port_is_listening "$listen_port"; then
+  existing_pid="$(sunapi_pid_on_port "$listen_port" || true)"
   printf 'SunAPI already appears to be running on http://127.0.0.1:%s\n' "$listen_port"
-  printf 'Opening the existing dashboard instead of starting a second server.\n\n'
+  if [ -n "$existing_pid" ]; then
+    server_pid="$existing_pid"
+    log_line "Attached to existing sunapi-server pid=$server_pid title=$CONSOLE_TITLE"
+    printf 'Attached to the existing SunAPI backend process pid=%s.\n' "$server_pid"
+    printf 'Close this window or press Ctrl-C to stop SunAPI.\n\n'
+  else
+    printf 'The port is already in use by another process, so SunAPI will not start a second server.\n'
+    printf 'Close this window or press Ctrl-C to stop following logs.\n\n'
+  fi
   open "http://127.0.0.1:$listen_port/dashboard" >/dev/null 2>&1 || true
   follow_server_log
+  if [ -n "${server_pid:-}" ]; then
+    cleanup_and_exit
+  fi
   if [ "$cleanup_started" != "1" ]; then
     cleanup_started=1
     cleanup_terminal_window

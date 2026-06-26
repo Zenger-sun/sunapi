@@ -64,6 +64,17 @@ go test ./...
 go build ./cmd/server
 ```
 
+### macOS App
+
+```powershell
+./scripts/package-macos.sh
+```
+
+The macOS app uses a native launcher stub plus `scripts/macos/SunAPI.launcher`.
+It opens a dedicated SunAPI Terminal console, prints `sunapi-server` logs there,
+and stops the server when that console is closed. Launcher diagnostics are
+written to `~/Library/Logs/SunAPI/launcher.log`.
+
 ## Security
 
 Do not treat source availability as a security weakness. Security controls should

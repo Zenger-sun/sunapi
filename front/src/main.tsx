@@ -31,6 +31,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { getStatus } from '@/lib/api'
 import { installBuildMetadata } from '@/lib/build-metadata'
 import { DEFAULT_SYSTEM_NAME, normalizeLogoUrl } from '@/lib/constants'
+import { clearAdminSessionToken } from '@/features/sunapi/admin-session-token'
 import '@/lib/dayjs'
 import { applyFaviconToDom } from '@/lib/dom-utils'
 import { initializeFrontendCache } from '@/lib/frontend-cache'
@@ -85,6 +86,7 @@ const queryClient = new QueryClient({
         if (error.response?.status === 401) {
           toast.error(i18next.t('Session expired!'))
           useAuthStore.getState().auth.reset()
+          clearAdminSessionToken()
           router.navigate({ to: '/login' })
         }
         if (error.response?.status === 500) {

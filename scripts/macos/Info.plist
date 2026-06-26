@@ -3,7 +3,13 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
-  <string>zh_CN</string>
+  <string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+    <string>zh_CN</string>
+  </array>
   <key>CFBundleDisplayName</key>
   <string>SunAPI</string>
   <key>CFBundleExecutable</key>
@@ -11,7 +17,7 @@
   <key>CFBundleIconFile</key>
   <string>SunAPI.icns</string>
   <key>CFBundleIdentifier</key>
-  <string>app.sunapi.local</string>
+  <string>@BUNDLE_ID@</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -21,12 +27,16 @@
   <key>CFBundleShortVersionString</key>
   <string>@VERSION@</string>
   <key>CFBundleVersion</key>
-  <string>@VERSION@</string>
+  <string>@BUILD_NUMBER@</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
+  <key>LSHasLocalizedDisplayName</key>
+  <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
 </dict>
 </plist>

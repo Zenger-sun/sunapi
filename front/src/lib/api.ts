@@ -20,6 +20,10 @@ import axios, { type AxiosRequestConfig } from 'axios'
 import { t } from 'i18next'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
+import {
+  clearAdminSessionToken,
+  getAdminSessionToken,
+} from '@/features/sunapi/admin-session-token'
 
 declare module 'axios' {
   export interface AxiosRequestConfig {
@@ -121,6 +125,7 @@ api.interceptors.response.use(
     if (status === 401) {
       try {
         useAuthStore.getState().auth.reset()
+        clearAdminSessionToken()
       } catch {
         /* empty */
       }
@@ -168,6 +173,11 @@ export function getCommonHeaders(): Record<string, string> {
     headers['Sun-Api-User'] = uid
   }
 
+  const adminSessionToken = getAdminSessionToken()
+  if (adminSessionToken) {
+    headers.Authorization = `Bearer ${adminSessionToken}`
+  }
+
   return headers
 }
 
@@ -181,6 +191,11 @@ api.interceptors.request.use((config) => {
   if (uid) {
     // Custom header for user identification
     ;(config.headers as Record<string, string>)['Sun-Api-User'] = uid
+  }
+  const adminSessionToken = getAdminSessionToken()
+  if (adminSessionToken) {
+    ;(config.headers as Record<string, string>).Authorization =
+      `Bearer ${adminSessionToken}`
   }
   return config
 })

@@ -17,8 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useEffect, useMemo, useState } from 'react'
-import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { useAuthenticatedImageSource } from '@/lib/authenticated-media'
 import { Button } from '@/components/ui/button'
 import {
   HoverCard,
@@ -400,45 +400,4 @@ function MessageImageAttachment({
       </HoverCardContent>
     </HoverCard>
   )
-}
-
-function useAuthenticatedImageSource(url: string) {
-  const [src, setSrc] = useState(() => (url.startsWith('/api/') ? '' : url))
-
-  useEffect(() => {
-    if (!url.startsWith('/api/')) {
-      setSrc(url)
-      return
-    }
-
-    let objectUrl: string | null = null
-    let cancelled = false
-
-    setSrc('')
-    api
-      .get(url, {
-        responseType: 'blob',
-        skipBusinessError: true,
-        skipErrorHandler: true,
-      })
-      .then((response) => {
-        if (cancelled) return
-        objectUrl = URL.createObjectURL(response.data as Blob)
-        setSrc(objectUrl)
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setSrc('')
-        }
-      })
-
-    return () => {
-      cancelled = true
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl)
-      }
-    }
-  }, [url])
-
-  return src
 }

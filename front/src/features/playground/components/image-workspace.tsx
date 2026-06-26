@@ -30,6 +30,10 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import {
+  fetchAuthenticatedBlob,
+  useAuthenticatedImageSource,
+} from '@/lib/authenticated-media'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -324,8 +328,7 @@ export function ImageWorkspace({
 
   const handleDownload = async (url: string) => {
     try {
-      const response = await fetch(url)
-      const blob = await response.blob()
+      const blob = await fetchAuthenticatedBlob(url)
       const objectUrl = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = objectUrl
@@ -644,6 +647,7 @@ function GenerationCard({
   onDelete,
 }: GenerationCardProps) {
   const { t } = useTranslation()
+  const imageSrc = useAuthenticatedImageSource(item.urls[0] || '')
   return (
     <div className='border-border/60 bg-card/60 group/card flex w-full min-w-0 flex-col overflow-hidden rounded-lg border shadow-sm transition-shadow hover:shadow-md'>
       <div className='bg-muted/25 relative aspect-[4/3] w-full overflow-hidden'>
@@ -728,11 +732,13 @@ function GenerationCard({
             onClick={() => onOpenLightbox(item.urls[0])}
             className='size-full'
           >
-            <img
-              src={item.urls[0]}
-              alt={item.prompt}
-              className='size-full object-contain transition-transform group-hover/card:scale-[1.01]'
-            />
+            {imageSrc && (
+              <img
+                src={imageSrc}
+                alt={item.prompt}
+                className='size-full object-contain transition-transform group-hover/card:scale-[1.01]'
+              />
+            )}
           </button>
         )}
         {item.status === 'succeeded' && item.urls.length > 1 && (

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, KeyRound, Loader2, ShieldCheck } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
@@ -34,6 +34,7 @@ const ADMIN_USERNAME = 'admin'
 
 export function AdminAuthPage({ mode }: AdminAuthPageProps) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const { systemName, logo } = useSystemConfig()
   const { auth } = useAuthStore()
   const [password, setPassword] = useState('')
@@ -128,8 +129,11 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
   const mutation = useMutation({
     mutationFn: (credentials: AdminCredentials) =>
       isSetup ? setupAdmin(credentials) : loginAdmin(credentials),
-    onSuccess: (user) => {
+    onSuccess: async (user) => {
       auth.setUser(user)
+      await queryClient.invalidateQueries({
+        queryKey: ['sunapi-admin-auth-status'],
+      })
       toast.success(copy.success)
       navigate({ to: '/dashboard', replace: true })
     },

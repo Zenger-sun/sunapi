@@ -28,6 +28,12 @@ go test ./...
 go build ./cmd/server
 ```
 
+macOS app and DMG:
+
+```powershell
+./scripts/package-macos.sh
+```
+
 ## Publish
 
 For each release artifact:

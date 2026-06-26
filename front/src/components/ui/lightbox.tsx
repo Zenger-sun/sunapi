@@ -18,6 +18,10 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { XIcon, DownloadIcon, LinkIcon } from 'lucide-react'
 import {
+  fetchAuthenticatedBlob,
+  useAuthenticatedImageSource,
+} from '@/lib/authenticated-media'
+import {
   Dialog,
   DialogContent,
   DialogTitle,
@@ -35,13 +39,13 @@ interface LightboxProps {
 export function Lightbox({ src, alt, filename, onClose }: LightboxProps) {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(true)
+  const imageSrc = useAuthenticatedImageSource(src ?? '')
 
   if (!src) return null
 
   const handleDownload = async () => {
     try {
-      const response = await fetch(src)
-      const blob = await response.blob()
+      const blob = await fetchAuthenticatedBlob(src)
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
@@ -75,13 +79,15 @@ export function Lightbox({ src, alt, filename, onClose }: LightboxProps) {
           {loading && (
             <div className='bg-muted/40 absolute inset-3 animate-pulse rounded-md' />
           )}
-          <img
-            src={src}
-            alt={alt || filename || 'Image'}
-            onLoad={() => setLoading(false)}
-            onError={() => setLoading(false)}
-            className='max-h-[88vh] max-w-full rounded-md object-contain'
-          />
+          {imageSrc && (
+            <img
+              src={imageSrc}
+              alt={alt || filename || 'Image'}
+              onLoad={() => setLoading(false)}
+              onError={() => setLoading(false)}
+              className='max-h-[88vh] max-w-full rounded-md object-contain'
+            />
+          )}
         </div>
         <div className='flex items-center gap-2 border-t px-4 py-2.5'>
           <div className='text-muted-foreground min-w-0 flex-1 truncate text-xs'>

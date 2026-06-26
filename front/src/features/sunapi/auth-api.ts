@@ -1,5 +1,9 @@
 import { api } from '@/lib/api'
 import type { AuthUser } from '@/stores/auth-store'
+import {
+  clearAdminSessionToken,
+  saveAdminSessionToken,
+} from './admin-session-token'
 
 export interface AdminAuthStatus {
   initialized: boolean
@@ -17,6 +21,11 @@ export interface AdminPasswordPayload {
   new_password: string
 }
 
+interface AdminAuthPayload {
+  user: AuthUser
+  token?: string
+}
+
 function unwrapAuthStatus(data: unknown): AdminAuthStatus {
   const payload = data as {
     success?: boolean
@@ -29,8 +38,13 @@ function unwrapAuthStatus(data: unknown): AdminAuthStatus {
   }
 }
 
-function unwrapUser(data: unknown): AuthUser {
-  const payload = data as { data?: AuthUser }
+function unwrapAuthPayload(data: unknown): AuthUser {
+  const payload = data as { data?: AuthUser | AdminAuthPayload }
+  const authPayload = payload.data as AdminAuthPayload | undefined
+  if (authPayload?.user) {
+    saveAdminSessionToken(authPayload.token)
+    return authPayload.user
+  }
   return payload.data as AuthUser
 }
 
@@ -83,18 +97,19 @@ export async function setupAdmin(credentials: AdminCredentials) {
   const res = await api.post('/api/auth/setup', credentials, {
     skipErrorHandler: true,
   })
-  return unwrapUser(res.data)
+  return unwrapAuthPayload(res.data)
 }
 
 export async function loginAdmin(credentials: AdminCredentials) {
   const res = await api.post('/api/auth/login', credentials, {
     skipErrorHandler: true,
   })
-  return unwrapUser(res.data)
+  return unwrapAuthPayload(res.data)
 }
 
 export async function logoutAdmin() {
   const res = await api.post('/api/auth/logout', {})
+  clearAdminSessionToken()
   return res.data
 }
 
@@ -102,5 +117,5 @@ export async function updateAdminPassword(payload: AdminPasswordPayload) {
   const res = await api.post('/api/auth/password', payload, {
     skipErrorHandler: true,
   })
-  return unwrapUser(res.data)
+  return unwrapAuthPayload(res.data)
 }

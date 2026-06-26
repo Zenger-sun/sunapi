@@ -94,11 +94,12 @@ func RegisterAuthRoutes(api *gin.RouterGroup, store *Store) {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		if err := startAdminSession(c, store, user); err != nil {
+		token, err := startAdminSession(c, store, user)
+		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		ok(c, adminUserResponse(user, true))
+		ok(c, adminLoginResponse(user, token))
 	})
 
 	api.POST("/auth/login", func(c *gin.Context) {
@@ -135,16 +136,24 @@ func RegisterAuthRoutes(api *gin.RouterGroup, store *Store) {
 			fail(c, http.StatusUnauthorized, errors.New("invalid username or password"))
 			return
 		}
-		if err := startAdminSession(c, store, user); err != nil {
+		token, err := startAdminSession(c, store, user)
+		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		ok(c, adminUserResponse(user, true))
+		ok(c, adminLoginResponse(user, token))
 	})
 
 	api.POST("/auth/logout", func(c *gin.Context) {
-		if token, err := c.Cookie(adminSessionCookieName); err == nil {
+		deleted := map[string]struct{}{}
+		if token, ok := adminSessionCookie(c); ok {
 			_ = store.DeleteAdminSession(c.Request.Context(), token)
+			deleted[token] = struct{}{}
+		}
+		if token, ok := adminBearerToken(c); ok {
+			if _, exists := deleted[token]; !exists {
+				_ = store.DeleteAdminSession(c.Request.Context(), token)
+			}
 		}
 		clearAdminSessionCookie(c)
 		ok(c, gin.H{})
@@ -220,11 +229,38 @@ func RequireAdmin(store *Store) gin.HandlerFunc {
 }
 
 func adminFromSession(c *gin.Context, store *Store) (AdminUser, bool, error) {
+	if token, ok := adminSessionCookie(c); ok {
+		user, authenticated, err := store.AdminUserBySession(c.Request.Context(), token)
+		if err != nil || authenticated {
+			return user, authenticated, err
+		}
+	}
+	if token, ok := adminBearerToken(c); ok {
+		return store.AdminUserBySession(c.Request.Context(), token)
+	}
+	return AdminUser{}, false, nil
+}
+
+func adminSessionCookie(c *gin.Context) (string, bool) {
 	token, err := c.Cookie(adminSessionCookieName)
 	if err != nil {
-		return AdminUser{}, false, nil
+		return "", false
 	}
-	return store.AdminUserBySession(c.Request.Context(), token)
+	token = strings.TrimSpace(token)
+	return token, token != ""
+}
+
+func adminBearerToken(c *gin.Context) (string, bool) {
+	header := strings.TrimSpace(c.GetHeader("Authorization"))
+	if header == "" {
+		return "", false
+	}
+	prefix := "bearer "
+	if !strings.HasPrefix(strings.ToLower(header), prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(header[len(prefix):])
+	return token, token != ""
 }
 
 func validateAdminCredentials(payload adminCredentialsPayload, setup bool) (string, string, bool) {
@@ -250,17 +286,17 @@ func compareAdminPassword(passwordHash string, password string) error {
 	return bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password))
 }
 
-func startAdminSession(c *gin.Context, store *Store, user AdminUser) error {
+func startAdminSession(c *gin.Context, store *Store, user AdminUser) (string, error) {
 	if err := store.DeleteExpiredAdminSessions(c.Request.Context()); err != nil {
-		return err
+		return "", err
 	}
 	token, err := randomSessionToken(32)
 	if err != nil {
-		return err
+		return "", err
 	}
 	expires := time.Now().Add(adminSessionTTL)
 	if err := store.CreateAdminSession(c.Request.Context(), token, user.ID, expires.Unix()); err != nil {
-		return err
+		return "", err
 	}
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     adminSessionCookieName,
@@ -272,7 +308,7 @@ func startAdminSession(c *gin.Context, store *Store, user AdminUser) error {
 		SameSite: http.SameSiteLaxMode,
 		Secure:   requestIsHTTPS(c),
 	})
-	return nil
+	return token, nil
 }
 
 func clearAdminSessionCookie(c *gin.Context) {
@@ -318,5 +354,12 @@ func adminUserResponse(user AdminUser, authenticated bool) any {
 		"status":       1,
 		"group":        "default",
 		"permissions":  gin.H{"sidebar_settings": true},
+	}
+}
+
+func adminLoginResponse(user AdminUser, token string) any {
+	return gin.H{
+		"user":  adminUserResponse(user, true),
+		"token": token,
 	}
 }
