@@ -103,7 +103,7 @@ func playgroundResolveAttachments(store *Store) gin.HandlerFunc {
 			return
 		}
 		path := strings.TrimSpace(c.Request.URL.Path)
-		if path != "/pg/chat/completions" && path != "/pg/images/edits" {
+		if path != "/pg/chat/completions" && path != "/pg/images/edits" && path != "/pg/videos" {
 			c.Next()
 			return
 		}
@@ -182,6 +182,38 @@ func playgroundResolveAttachments(store *Store) gin.HandlerFunc {
 				}
 				if playgroundResolveAttachmentImageString(c, store, mask, "url") {
 					changed = true
+				}
+			}
+		}
+		if path == "/pg/videos" {
+			if image, ok := payload["image"].(map[string]any); ok {
+				if playgroundResolveAttachmentImageString(c, store, image, "url") {
+					changed = true
+				}
+				if playgroundResolveAttachmentImageString(c, store, image, "image_url") {
+					changed = true
+				}
+			}
+			if inputReference, ok := payload["input_reference"].(map[string]any); ok {
+				if playgroundResolveAttachmentImageString(c, store, inputReference, "image_url") {
+					changed = true
+				}
+				if playgroundResolveAttachmentImageString(c, store, inputReference, "url") {
+					changed = true
+				}
+			}
+			if referenceImages, ok := payload["reference_images"].([]any); ok {
+				for _, rawImage := range referenceImages {
+					image, ok := rawImage.(map[string]any)
+					if !ok {
+						continue
+					}
+					if playgroundResolveAttachmentImageString(c, store, image, "url") {
+						changed = true
+					}
+					if playgroundResolveAttachmentImageString(c, store, image, "image_url") {
+						changed = true
+					}
 				}
 			}
 		}

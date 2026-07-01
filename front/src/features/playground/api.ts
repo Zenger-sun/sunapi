@@ -401,7 +401,9 @@ function buildImageGenerationRequest(payload: {
     group: payload.group,
     prompt: payload.prompt,
     negative_prompt: payload.negative_prompt,
-    ...(payload.resolution !== 'auto' ? { resolution: payload.resolution } : {}),
+    ...(payload.resolution !== 'auto'
+      ? { resolution: payload.resolution }
+      : {}),
     ...(payload.aspect_ratio !== 'auto'
       ? { aspect_ratio: payload.aspect_ratio }
       : {}),
@@ -484,34 +486,64 @@ export async function startImageGenerationTask(
 export type VideoTaskResponse = {
   id?: string
   task_id?: string
+  request_id?: string
   status?: string
+  progress?: number
   url?: string
   preview_url?: string
   result_url?: string
+  content_url?: string
+  video?: { url?: string; duration?: number }
   error?: { message?: string }
 }
 
 function normalizeVideoTaskResponse(payload: unknown): VideoTaskResponse {
-  const raw = payload as Record<string, unknown>
+  const raw = (payload ?? {}) as Record<string, unknown>
   const data = raw?.data as Record<string, unknown> | undefined
   const source = data && typeof data === 'object' ? data : raw
-  const taskId = source.id ?? source.task_id
-  const resultUrl = source.preview_url ?? source.url ?? source.result_url
+  const video = source.video as Record<string, unknown> | undefined
+  const taskId = source.id ?? source.task_id ?? source.request_id
+  const resultUrl =
+    source.preview_url ??
+    source.url ??
+    source.result_url ??
+    source.content_url ??
+    video?.url
   const failReason = source.fail_reason
+  const progress = source.progress
 
   return {
     id: typeof taskId === 'string' ? taskId : undefined,
     task_id: typeof source.task_id === 'string' ? source.task_id : undefined,
+    request_id:
+      typeof source.request_id === 'string' ? source.request_id : undefined,
     status: typeof source.status === 'string' ? source.status : undefined,
+    progress: typeof progress === 'number' ? progress : undefined,
     preview_url: typeof resultUrl === 'string' ? resultUrl : undefined,
     url: typeof resultUrl === 'string' ? resultUrl : undefined,
     result_url:
       typeof source.result_url === 'string' ? source.result_url : undefined,
+    content_url:
+      typeof source.content_url === 'string' ? source.content_url : undefined,
+    video:
+      video && typeof video === 'object'
+        ? {
+            url: typeof video.url === 'string' ? video.url : undefined,
+            duration:
+              typeof video.duration === 'number' ? video.duration : undefined,
+          }
+        : undefined,
     error:
       typeof failReason === 'string' && failReason
         ? { message: failReason }
-        : (source.error as VideoTaskResponse['error']),
+        : typeof source.error === 'string' && source.error
+          ? { message: source.error }
+          : (source.error as VideoTaskResponse['error']),
   }
+}
+
+function videoAttachmentURL(image: MessageAttachment) {
+  return image.file_id ? `playground-attachment://${image.file_id}` : image.url
 }
 
 export async function submitVideoTask(payload: {
@@ -520,8 +552,16 @@ export async function submitVideoTask(payload: {
   prompt: string
   duration_sec: number
   aspect_ratio: VideoGenerationParams['aspectRatio']
+  resolution: VideoGenerationParams['resolution']
   seed: number | null
+  reference_images?: MessageAttachment[]
 }): Promise<VideoTaskResponse> {
+  const referenceImages =
+    payload.reference_images
+      ?.map((image) => ({ url: videoAttachmentURL(image) }))
+      .filter((image) => image.url.trim() !== '') ?? []
+  const inputImage = referenceImages.length === 1 ? referenceImages[0] : null
+
   const res = await api.post(
     API_ENDPOINTS.PLAYGROUND_VIDEOS,
     {
@@ -529,12 +569,14 @@ export async function submitVideoTask(payload: {
       group: payload.group,
       prompt: payload.prompt,
       duration: payload.duration_sec,
+      seconds: String(payload.duration_sec),
+      aspect_ratio: payload.aspect_ratio,
+      resolution: payload.resolution,
       seed: payload.seed ?? undefined,
-      n: 1,
-      response_format: 'url',
-      metadata: {
-        aspect_ratio: payload.aspect_ratio,
-      },
+      ...(inputImage ? { image: inputImage } : {}),
+      ...(referenceImages.length > 1
+        ? { reference_images: referenceImages.slice(0, 7) }
+        : {}),
     },
     {
       skipErrorHandler: true,

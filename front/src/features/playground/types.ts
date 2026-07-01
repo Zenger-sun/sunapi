@@ -242,21 +242,37 @@ export interface ImageGenerationItem {
   updatedAt?: number
 }
 
+export type VideoAspectRatio =
+  | '16:9'
+  | '9:16'
+  | '1:1'
+  | '4:3'
+  | '3:4'
+  | '3:2'
+  | '2:3'
+
+export type VideoResolutionPreset = '480p' | '720p'
+
 export interface VideoGenerationParams {
-  aspectRatio: '16:9' | '9:16' | '1:1'
+  aspectRatio: VideoAspectRatio
+  resolution: VideoResolutionPreset
   durationSec: number
   seed: number | null
 }
 
 export interface VideoGenerationItem {
   id: string
+  taskId?: string
   prompt: string
   params: VideoGenerationParams
   model: string
   group: string
-  status: 'pending' | 'running' | 'succeeded' | 'failed'
+  referenceImages?: MessageAttachment[]
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  progress?: number
   previewUrl?: string
   errorMessage?: string
   durationMs?: number
   createdAt: number
+  updatedAt?: number
 }

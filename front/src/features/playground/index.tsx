@@ -18,11 +18,11 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { BotIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { AuthenticatedLayout } from '@/components/layout'
 import { getUserGroups, getUserModels } from './api'
+import { AgentWorkspace } from './components/agent-workspace'
 import { ChatWorkspace } from './components/chat-workspace'
 import {
   ImageParamsPanel,
@@ -38,6 +38,7 @@ import {
   useVideoDefaultParams,
   VideoNotice,
   VideoParamsPanel,
+  VideoPromptTips,
   VideoWorkspace,
 } from './components/video-workspace'
 import { usePlaygroundState } from './hooks'
@@ -74,6 +75,10 @@ export function Playground() {
 
   const imageModels = useMemo(
     () => models.filter((model) => model.supportsImage),
+    [models]
+  )
+  const videoModels = useMemo(
+    () => models.filter((model) => model.supportsVideo),
     [models]
   )
 
@@ -152,6 +157,15 @@ export function Playground() {
     }
   }, [activeCapability, config.model, imageModels, updateConfig])
 
+  useEffect(() => {
+    if (activeCapability !== 'video') return
+    const fallbackModel = videoModels[0]?.value
+    if (!fallbackModel) return
+    if (!videoModels.some((model) => model.value === config.model)) {
+      updateConfig('model', fallbackModel)
+    }
+  }, [activeCapability, config.model, updateConfig, videoModels])
+
   const handleNewChat = useCallback(() => {
     setActiveCapability('chat')
     clearMessages()
@@ -183,6 +197,7 @@ export function Playground() {
         <>
           <VideoNotice />
           <VideoParamsPanel value={videoParams} onChange={setVideoParams} />
+          <VideoPromptTips />
         </>
       )
     }
@@ -250,33 +265,20 @@ export function Playground() {
               params={videoParams}
               model={config.model}
               group={config.group}
+              models={videoModels}
+              groups={groups}
+              isLoadingModels={isLoadingModels}
+              onModelChange={(value) => updateConfig('model', value)}
+              onGroupChange={(value) => updateConfig('group', value)}
               onGeneratingChange={setIsWorkspaceGenerating}
             />
           )}
 
-          {activeCapability === 'agent' && <AgentWorkspace />}
+          {activeCapability === 'agent' && (
+            <AgentWorkspace models={models} currentModel={config.model} />
+          )}
         </section>
       </div>
     </AuthenticatedLayout>
-  )
-}
-
-function AgentWorkspace() {
-  const { t } = useTranslation()
-
-  return (
-    <div className='flex size-full min-h-0 flex-col items-center justify-center px-4 py-12 text-center'>
-      <div className='border-border/70 bg-muted/20 flex aspect-[4/3] w-full max-w-sm items-center justify-center rounded-2xl border-2 border-dashed'>
-        <div className='text-muted-foreground flex flex-col items-center gap-2 text-sm'>
-          <BotIcon className='size-6' />
-          <span>{t('Agent workspace')}</span>
-        </div>
-      </div>
-      <p className='text-muted-foreground mt-5 max-w-md text-xs leading-relaxed'>
-        {t(
-          'Multi-step agent orchestration is being planned. The placeholder keeps the layout aligned with the live experience.'
-        )}
-      </p>
-    </div>
   )
 }
