@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -46,9 +47,12 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
+  ArchiveIcon,
   BellIcon,
   BotIcon,
   ChartNetworkIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
   ClockIcon,
   FileSpreadsheetIcon,
   FileTextIcon,
@@ -64,6 +68,7 @@ import {
   SparklesIcon,
   StopCircleIcon,
   Table2Icon,
+  Trash2Icon,
   ZapIcon,
   type LucideIcon,
 } from 'lucide-react'
@@ -71,8 +76,21 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import {
+  NativeSelect,
+  NativeSelectOptGroup,
+  NativeSelectOption,
+} from '@/components/ui/native-select'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  AGENT_BLUEPRINT_COMMAND_EVENT,
+  AGENT_BLUEPRINTS_CHANGED_EVENT,
+  AGENT_BLUEPRINT_STORAGE_KEY,
+  getAgentBlueprintStatusLabel,
+  notifyAgentBlueprintsChanged,
+  type AgentBlueprintCommand,
+  type AgentBlueprintStatus,
+} from '../lib/agent-blueprints'
 import type { ModelOption } from '../types'
 
 type AgentNodeKind =
@@ -114,13 +132,20 @@ type ModelChoice = {
   value: string
   description?: string
   supportsImage?: boolean
+  source?: 'system' | 'current' | 'fallback'
 }
 
 type SkillChoice = {
   label: string
   value: string
   description: string
+  source: SkillSource
+  reference?: string
 }
+
+type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
+
+type SkillDraftSource = Exclude<SkillSource, 'built-in'>
 
 type NodeTemplate = {
   kind: AgentNodeKind
@@ -137,6 +162,8 @@ type NodeTemplate = {
 type AgentWorkspaceProps = {
   models: ModelOption[]
   currentModel?: string
+  currentGroup?: string
+  seedPrompt?: string
 }
 
 type SavedAgentBlueprint = {
@@ -146,52 +173,104 @@ type SavedAgentBlueprint = {
   edges: AgentFlowEdge[]
   createdAt: number
   updatedAt: number
+  status?: AgentBlueprintStatus
 }
 
 const DRAG_NODE_TYPE = 'application/sunapi-agent-node'
-const BLUEPRINT_STORAGE_KEY = 'sunapi.playground.agent.blueprints.v1'
+const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
 
-const SKILL_CHOICES: SkillChoice[] = [
+const BASE_SKILL_CHOICES: SkillChoice[] = [
   {
     label: '系统编排 Skill',
     value: 'skill.system-orchestration',
     description: '处理开始、停止、状态归档和执行守护。',
+    source: 'built-in',
   },
   {
     label: '定时守护 Skill',
     value: 'skill.schedule-guard',
     description: '校验定时规则、重试窗口和循环停止条件。',
+    source: 'built-in',
   },
   {
     label: '浏览器取数 Skill',
     value: 'skill.browser-reading',
     description: '优化浏览器页面读取、登录态复用和字段识别。',
+    source: 'built-in',
   },
   {
     label: '网络请求 Skill',
     value: 'skill.network-fetch',
     description: '优化接口请求、分页、重试和 JSON 结构解析。',
+    source: 'built-in',
   },
   {
     label: '数据整理 Skill',
     value: 'skill.data-cleaning',
     description: '优化清洗、去重、指标计算和异常标注。',
+    source: 'built-in',
   },
   {
     label: '图片生成 Skill',
     value: 'skill.image-generation',
     description: '优化封面图、趋势图和数据看板提示词。',
+    source: 'built-in',
   },
   {
     label: '日报写作 Skill',
     value: 'skill.report-writing',
     description: '优化日报结构、表格说明和运营建议。',
+    source: 'built-in',
   },
   {
     label: '通知分发 Skill',
     value: 'skill.notification-routing',
     description: '优化发送渠道、确认点和失败补偿。',
+    source: 'built-in',
   },
+]
+
+const MARKETPLACE_SKILLS: SkillChoice[] = [
+  {
+    label: '电商运营分析 Skill',
+    value: 'skill.marketplace.ecommerce-ops',
+    description: '面向商品指标、竞品跟踪和日报建议的运营 Skill。',
+    source: 'marketplace',
+    reference: 'SunAPI Skill 商城',
+  },
+  {
+    label: '工单总结 Skill',
+    value: 'skill.marketplace.ticket-summary',
+    description: '整理客服工单、归类问题并生成跟进清单。',
+    source: 'marketplace',
+    reference: 'SunAPI Skill 商城',
+  },
+  {
+    label: '财务对账 Skill',
+    value: 'skill.marketplace.reconciliation',
+    description: '抽取账单字段、核对差异并生成归档记录。',
+    source: 'marketplace',
+    reference: 'SunAPI Skill 商城',
+  },
+]
+
+const FREQUENCY_OPTIONS = ['每天', '工作日', '每周', '每月', '每小时']
+const TIMEZONE_OPTIONS = [
+  'Asia/Shanghai',
+  'Asia/Singapore',
+  'Asia/Tokyo',
+  'UTC',
+  'America/Los_Angeles',
+  'America/New_York',
+  'Europe/London',
+  'Europe/Berlin',
+]
+const ARCHIVE_LOCATION_OPTIONS = [
+  '工作区 / 日报归档',
+  '本地执行日志',
+  '团队共享空间',
+  '对象存储 / agent-runs',
+  '不归档',
 ]
 
 const MODEL_FALLBACKS: Record<ModelRole, ModelChoice[]> = {
@@ -403,6 +482,7 @@ const NODE_META: Record<
     settings: {
       结束方式: '本轮完成后停止',
       归档: '保存执行日志',
+      归档位置: '工作区 / 日报归档',
     },
   },
 }
@@ -427,12 +507,22 @@ const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-report-stop', source: 'report', target: 'stop' },
 ]
 
-const nodeTypes = {
-  agentNode: BlueprintNode,
-}
-
-export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
-  const modelChoices = useMemo(() => buildModelChoices(models), [models])
+export function AgentWorkspace({
+  models,
+  currentModel,
+  currentGroup,
+  seedPrompt,
+}: AgentWorkspaceProps) {
+  const [managedSkills, setManagedSkills] =
+    useState<SkillChoice[]>(readSavedSkills)
+  const skillChoices = useMemo(
+    () => mergeSkillChoices(BASE_SKILL_CHOICES, managedSkills),
+    [managedSkills]
+  )
+  const modelChoices = useMemo(
+    () => buildModelChoices(models, currentModel),
+    [currentModel, models]
+  )
   const templates = useMemo(
     () => buildTemplates(models, currentModel),
     [currentModel, models]
@@ -466,6 +556,7 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
   )
   const [search, setSearch] = useState('')
   const addCounterRef = useRef(0)
+  const lastSeedPromptRef = useRef<string | null>(null)
 
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -473,6 +564,7 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
   )
 
   const executionNodes = useMemo(() => orderNodes(nodes, edges), [edges, nodes])
+  const currentBlueprintStatus = useMemo(() => getBlueprintStatus(nodes), [nodes])
 
   const onNodesChange = useCallback((changes: NodeChange<AgentFlowNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current))
@@ -515,6 +607,7 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
       edges,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
+      status: getBlueprintStatus(nodes),
     }
     const next = [
       blueprint,
@@ -526,6 +619,7 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
     setLastSavedAt(now)
     setBlueprints(next)
     writeSavedBlueprints(next)
+    notifyAgentBlueprintsChanged()
   }, [blueprintTitle, blueprints, currentBlueprintId, edges, nodes])
 
   const handleLoadBlueprint = useCallback((blueprint: SavedAgentBlueprint) => {
@@ -537,18 +631,77 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
     setSelectedNodeId(blueprint.nodes[0]?.id ?? '')
   }, [])
 
+  const handleDeleteBlueprint = useCallback(
+    (blueprintId: string) => {
+      const next = blueprints.filter((item) => item.id !== blueprintId)
+      setBlueprints(next)
+      writeSavedBlueprints(next)
+      notifyAgentBlueprintsChanged()
+
+      if (currentBlueprintId !== blueprintId) return
+
+      const fallback = next[0]
+      if (fallback) {
+        handleLoadBlueprint(fallback)
+        return
+      }
+
+      setCurrentBlueprintId(null)
+      setLastSavedAt(null)
+      setBlueprintTitle('新的智能体蓝图')
+      setNodes(createInitialNodes(templates))
+      setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+      setSelectedNodeId('browser')
+    },
+    [blueprints, currentBlueprintId, handleLoadBlueprint, templates]
+  )
+
   const handleRunPreview = useCallback(() => {
     const orderedIds = executionNodes.map((node) => node.id)
-    setNodes((current) =>
-      current.map((node) => {
+    setNodes((current) => {
+      const nextNodes = current.map((node) => {
         const index = orderedIds.indexOf(node.id)
         if (index === -1) return node
         const status: AgentNodeStatus =
           index === 0 ? 'running' : index < 4 ? 'done' : 'waiting'
         return { ...node, data: { ...node.data, status } }
       })
-    )
-  }, [executionNodes])
+      if (currentBlueprintId) {
+        const nextBlueprints = blueprints.map((blueprint) =>
+          blueprint.id === currentBlueprintId
+            ? {
+                ...blueprint,
+                nodes: nextNodes,
+                updatedAt: Date.now(),
+                status: getBlueprintStatus(nextNodes),
+              }
+            : blueprint
+        )
+        setBlueprints(nextBlueprints)
+        writeSavedBlueprints(nextBlueprints)
+        notifyAgentBlueprintsChanged()
+      }
+      return nextNodes
+    })
+  }, [blueprints, currentBlueprintId, executionNodes])
+
+  const handleAddSkill = useCallback((skill: SkillChoice) => {
+    setManagedSkills((current) => {
+      const next = mergeSkillChoices(current, [skill]).filter(
+        (item) => item.source !== 'built-in'
+      )
+      writeSavedSkills(next)
+      return next
+    })
+  }, [])
+
+  const handleDeleteSkill = useCallback((skillValue: string) => {
+    setManagedSkills((current) => {
+      const next = current.filter((skill) => skill.value !== skillValue)
+      writeSavedSkills(next)
+      return next
+    })
+  }, [])
 
   const handleAddNode = useCallback(
     (kind: AgentNodeKind, position?: { x: number; y: number }) => {
@@ -593,22 +746,93 @@ export function AgentWorkspace({ models, currentModel }: AgentWorkspaceProps) {
     [handleUpdateNode, selectedNode]
   )
 
+  useEffect(() => {
+    if (!seedPrompt || seedPrompt === lastSeedPromptRef.current) return
+
+    lastSeedPromptRef.current = seedPrompt
+    const title = buildSeedBlueprintTitle(seedPrompt)
+    setBlueprintTitle(title)
+    setCurrentBlueprintId(null)
+    setLastSavedAt(null)
+    setNodes(() =>
+      createInitialNodes(templates).map((node) =>
+        node.id === 'start'
+          ? {
+              ...node,
+              data: {
+                ...node.data,
+                title: '从对话开启任务',
+                description: seedPrompt,
+              },
+            }
+          : node
+      )
+    )
+    setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+    setSelectedNodeId('start')
+  }, [seedPrompt, templates])
+
+  useEffect(() => {
+    const handleCommand = (event: Event) => {
+      const command = (event as CustomEvent<AgentBlueprintCommand>).detail
+      if (!command) return
+
+      if (command.type === 'new') {
+        handleNewBlueprint()
+        return
+      }
+
+      const blueprint = readSavedBlueprints().find(
+        (item) => item.id === command.id
+      )
+      if (blueprint) {
+        handleLoadBlueprint(blueprint)
+      }
+    }
+
+    const handleChanged = () => {
+      const next = readSavedBlueprints()
+      setBlueprints(next)
+      if (
+        currentBlueprintId &&
+        !next.some((blueprint) => blueprint.id === currentBlueprintId)
+      ) {
+        handleDeleteBlueprint(currentBlueprintId)
+      }
+    }
+
+    window.addEventListener(AGENT_BLUEPRINT_COMMAND_EVENT, handleCommand)
+    window.addEventListener(AGENT_BLUEPRINTS_CHANGED_EVENT, handleChanged)
+    return () => {
+      window.removeEventListener(AGENT_BLUEPRINT_COMMAND_EVENT, handleCommand)
+      window.removeEventListener(AGENT_BLUEPRINTS_CHANGED_EVENT, handleChanged)
+    }
+  }, [
+    currentBlueprintId,
+    handleDeleteBlueprint,
+    handleLoadBlueprint,
+    handleNewBlueprint,
+  ])
+
   return (
     <ReactFlowProvider>
       <BlueprintWorkspace
-        blueprints={blueprints}
         blueprintTitle={blueprintTitle}
-        currentBlueprintId={currentBlueprintId}
+        currentBlueprintStatus={currentBlueprintStatus}
+        currentGroup={currentGroup}
+        currentModel={currentModel}
         edges={edges}
         executionNodes={executionNodes}
         lastSavedAt={lastSavedAt}
         modelChoices={modelChoices}
         nodes={nodes}
+        skillChoices={skillChoices}
+        managedSkills={managedSkills}
+        onAddSkill={handleAddSkill}
         onAddNode={handleAddNode}
         onConnect={onConnect}
+        onDeleteSkill={handleDeleteSkill}
         onEdgesChange={onEdgesChange}
-        onLoadBlueprint={handleLoadBlueprint}
-        onNewBlueprint={handleNewBlueprint}
         onNodesChange={onNodesChange}
         onReset={handleReset}
         onRunPreview={handleRunPreview}
@@ -631,9 +855,12 @@ type BlueprintWorkspaceProps = {
   selectedNode: AgentFlowNode | null
   executionNodes: AgentFlowNode[]
   modelChoices: ModelChoice[]
-  blueprints: SavedAgentBlueprint[]
+  skillChoices: SkillChoice[]
+  managedSkills: SkillChoice[]
   blueprintTitle: string
-  currentBlueprintId: string | null
+  currentBlueprintStatus: AgentBlueprintStatus
+  currentGroup?: string
+  currentModel?: string
   lastSavedAt: number | null
   search: string
   onSearchChange: (value: string) => void
@@ -644,10 +871,10 @@ type BlueprintWorkspaceProps = {
   onAddNode: (kind: AgentNodeKind, position?: { x: number; y: number }) => void
   onTitleChange: (value: string) => void
   onSaveBlueprint: () => void
-  onLoadBlueprint: (blueprint: SavedAgentBlueprint) => void
-  onNewBlueprint: () => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
+  onAddSkill: (skill: SkillChoice) => void
+  onDeleteSkill: (skillValue: string) => void
   onReset: () => void
   onRunPreview: () => void
 }
@@ -658,9 +885,12 @@ function BlueprintWorkspace({
   selectedNode,
   executionNodes,
   modelChoices,
-  blueprints,
+  skillChoices,
+  managedSkills,
   blueprintTitle,
-  currentBlueprintId,
+  currentBlueprintStatus,
+  currentGroup,
+  currentModel,
   lastSavedAt,
   search,
   onSearchChange,
@@ -671,15 +901,24 @@ function BlueprintWorkspace({
   onAddNode,
   onTitleChange,
   onSaveBlueprint,
-  onLoadBlueprint,
-  onNewBlueprint,
   onUpdateNode,
   onUpdateSetting,
+  onAddSkill,
+  onDeleteSkill,
   onReset,
   onRunPreview,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
   const filteredGroups = useMemo(() => filterPaletteGroups(search), [search])
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false)
+  const nodeTypes = useMemo(
+    () => ({
+      agentNode: (props: NodeProps<AgentFlowNode>) => (
+        <BlueprintNode {...props} skillChoices={skillChoices} />
+      ),
+    }),
+    [skillChoices]
+  )
 
   const handleDrop = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
@@ -699,12 +938,8 @@ function BlueprintWorkspace({
     <div className='bg-background flex size-full min-h-0 overflow-hidden'>
       <aside className='border-border/70 bg-muted/25 hidden w-68 shrink-0 flex-col border-r lg:flex'>
         <Palette
-          blueprints={blueprints}
-          currentBlueprintId={currentBlueprintId}
           groups={filteredGroups}
           onAddNode={onAddNode}
-          onLoadBlueprint={onLoadBlueprint}
-          onNewBlueprint={onNewBlueprint}
           onSearchChange={onSearchChange}
           search={search}
         />
@@ -736,6 +971,8 @@ function BlueprintWorkspace({
                 />
                 <div className='text-muted-foreground truncate text-[11px]'>
                   {nodes.length} 个组件 · {edges.length} 条连线
+                  {' · '}
+                  {getAgentBlueprintStatusLabel(currentBlueprintStatus)}
                   {lastSavedAt
                     ? ` · ${formatBlueprintTime(lastSavedAt)} 已保存`
                     : ''}
@@ -775,6 +1012,13 @@ function BlueprintWorkspace({
               </Button>
             </div>
           </div>
+
+          <ExecutionPreviewDock
+            executionNodes={executionNodes}
+            isOpen={isPreviewOpen}
+            skillChoices={skillChoices}
+            onOpenChange={setIsPreviewOpen}
+          />
 
           <ReactFlow<AgentFlowNode, AgentFlowEdge>
             className='agent-blueprint-canvas'
@@ -833,9 +1077,14 @@ function BlueprintWorkspace({
 
       <aside className='border-border/70 bg-background hidden w-82 shrink-0 flex-col border-l xl:flex'>
         <Inspector
-          executionNodes={executionNodes}
+          currentGroup={currentGroup}
+          currentModel={currentModel}
+          managedSkills={managedSkills}
           modelChoices={modelChoices}
+          skillChoices={skillChoices}
           selectedNode={selectedNode}
+          onAddSkill={onAddSkill}
+          onDeleteSkill={onDeleteSkill}
           onUpdateNode={onUpdateNode}
           onUpdateSetting={onUpdateSetting}
         />
@@ -846,21 +1095,13 @@ function BlueprintWorkspace({
 
 function Palette({
   groups,
-  blueprints,
-  currentBlueprintId,
   search,
   onSearchChange,
-  onNewBlueprint,
-  onLoadBlueprint,
   onAddNode,
 }: {
   groups: typeof PALETTE_GROUPS
-  blueprints: SavedAgentBlueprint[]
-  currentBlueprintId: string | null
   search: string
   onSearchChange: (value: string) => void
-  onNewBlueprint: () => void
-  onLoadBlueprint: (blueprint: SavedAgentBlueprint) => void
   onAddNode: (kind: AgentNodeKind) => void
 }) {
   return (
@@ -888,12 +1129,6 @@ function Palette({
         </div>
       </div>
       <div className='min-h-0 flex-1 overflow-y-auto px-2 py-2'>
-        <BlueprintHistory
-          blueprints={blueprints}
-          currentBlueprintId={currentBlueprintId}
-          onLoadBlueprint={onLoadBlueprint}
-          onNewBlueprint={onNewBlueprint}
-        />
         {groups.map((group) => (
           <div key={group.title} className='mb-3'>
             <div className='text-muted-foreground px-1.5 pb-1.5 text-[10px] font-medium tracking-wider uppercase'>
@@ -906,64 +1141,6 @@ function Palette({
             </div>
           </div>
         ))}
-      </div>
-    </div>
-  )
-}
-
-function BlueprintHistory({
-  blueprints,
-  currentBlueprintId,
-  onNewBlueprint,
-  onLoadBlueprint,
-}: {
-  blueprints: SavedAgentBlueprint[]
-  currentBlueprintId: string | null
-  onNewBlueprint: () => void
-  onLoadBlueprint: (blueprint: SavedAgentBlueprint) => void
-}) {
-  return (
-    <div className='mb-3'>
-      <div className='mb-1.5 flex items-center justify-between px-1.5'>
-        <div className='text-muted-foreground text-[10px] font-medium tracking-wider uppercase'>
-          蓝图历史
-        </div>
-        <button
-          type='button'
-          className='text-muted-foreground hover:text-foreground inline-flex size-6 items-center justify-center rounded-[6px]'
-          onClick={onNewBlueprint}
-          title='新建蓝图'
-        >
-          <PlusIcon className='size-3.5' />
-        </button>
-      </div>
-      <div className='grid gap-1.5'>
-        {blueprints.length === 0 ? (
-          <div className='border-border/70 bg-background text-muted-foreground rounded-[8px] border px-2 py-3 text-center text-xs'>
-            保存后会出现在这里
-          </div>
-        ) : (
-          blueprints.slice(0, 5).map((blueprint) => (
-            <button
-              key={blueprint.id}
-              type='button'
-              onClick={() => onLoadBlueprint(blueprint)}
-              className={cn(
-                'border-border/70 bg-background hover:bg-accent/50 flex min-w-0 flex-col items-start rounded-[8px] border px-2 py-2 text-left transition-colors',
-                currentBlueprintId === blueprint.id &&
-                  'border-primary/50 bg-primary/5'
-              )}
-            >
-              <span className='w-full truncate text-xs font-medium'>
-                {blueprint.title}
-              </span>
-              <span className='text-muted-foreground mt-0.5 text-[11px]'>
-                {blueprint.nodes.length} 组件 ·{' '}
-                {formatBlueprintTime(blueprint.updatedAt)}
-              </span>
-            </button>
-          ))
-        )}
       </div>
     </div>
   )
@@ -1053,7 +1230,8 @@ function BlueprintNode({
   data,
   selected,
   isConnectable,
-}: NodeProps<AgentFlowNode>) {
+  skillChoices,
+}: NodeProps<AgentFlowNode> & { skillChoices: SkillChoice[] }) {
   const meta = NODE_META[data.kind]
   const Icon = meta.icon
   const canReceive = data.inputs.length > 0
@@ -1123,7 +1301,7 @@ function BlueprintNode({
             {data.model}
           </span>
         </div>
-        <SkillLinkBadge skill={data.skill} />
+        <SkillLinkBadge skill={data.skill} skillChoices={skillChoices} />
         <div className='grid grid-cols-2 gap-2'>
           <IoList label='输入' values={data.inputs} />
           <IoList label='输出' values={data.outputs} />
@@ -1164,8 +1342,14 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
   )
 }
 
-function SkillLinkBadge({ skill }: { skill: string }) {
-  const skillChoice = getSkillChoice(skill)
+function SkillLinkBadge({
+  skill,
+  skillChoices,
+}: {
+  skill: string
+  skillChoices: SkillChoice[]
+}) {
+  const skillChoice = getSkillChoice(skill, skillChoices)
 
   return (
     <div className='flex items-center gap-2 rounded-[6px] border border-fuchsia-500/20 bg-fuchsia-500/8 px-2 py-1.5'>
@@ -1206,14 +1390,24 @@ function IoList({ label, values }: { label: string; values: string[] }) {
 
 function Inspector({
   selectedNode,
-  executionNodes,
   modelChoices,
+  skillChoices,
+  managedSkills,
+  currentGroup,
+  currentModel,
+  onAddSkill,
+  onDeleteSkill,
   onUpdateNode,
   onUpdateSetting,
 }: {
   selectedNode: AgentFlowNode | null
-  executionNodes: AgentFlowNode[]
   modelChoices: ModelChoice[]
+  skillChoices: SkillChoice[]
+  managedSkills: SkillChoice[]
+  currentGroup?: string
+  currentModel?: string
+  onAddSkill: (skill: SkillChoice) => void
+  onDeleteSkill: (skillValue: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
@@ -1235,12 +1429,20 @@ function Inspector({
         {selectedNode ? (
           <div className='space-y-4 p-3'>
             <NodeConfigPanel
+              currentGroup={currentGroup}
+              currentModel={currentModel}
               modelChoices={modelChoices}
               node={selectedNode}
+              skillChoices={skillChoices}
               onUpdateNode={onUpdateNode}
               onUpdateSetting={onUpdateSetting}
             />
-            <ExecutionPanel executionNodes={executionNodes} />
+            <SkillManagerPanel
+              managedSkills={managedSkills}
+              skillChoices={skillChoices}
+              onAddSkill={onAddSkill}
+              onDeleteSkill={onDeleteSkill}
+            />
           </div>
         ) : (
           <div className='text-muted-foreground p-6 text-center text-sm'>
@@ -1255,11 +1457,17 @@ function Inspector({
 function NodeConfigPanel({
   node,
   modelChoices,
+  skillChoices,
+  currentGroup,
+  currentModel,
   onUpdateNode,
   onUpdateSetting,
 }: {
   node: AgentFlowNode
   modelChoices: ModelChoice[]
+  skillChoices: SkillChoice[]
+  currentGroup?: string
+  currentModel?: string
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
@@ -1270,8 +1478,15 @@ function NodeConfigPanel({
   )
   const choices = modelExists
     ? modelChoices
-    : [{ label: node.data.model, value: node.data.model }, ...modelChoices]
-  const selectedSkill = getSkillChoice(node.data.skill)
+    : [
+        {
+          label: node.data.model,
+          value: node.data.model,
+          source: 'current' as const,
+        },
+        ...modelChoices,
+      ]
+  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
 
   return (
     <section className='border-border/70 rounded-[8px] border p-3'>
@@ -1310,12 +1525,39 @@ function NodeConfigPanel({
             onChange={(event) => onUpdateNode({ model: event.target.value })}
             className='w-full'
           >
-            {choices.map((model) => (
-              <NativeSelectOption key={model.value} value={model.value}>
-                {model.label}
-              </NativeSelectOption>
-            ))}
+            <NativeSelectOptGroup
+              label={`当前对话分组: ${currentGroup || 'default'}`}
+            >
+              {choices
+                .filter((model) => model.source === 'current')
+                .map((model) => (
+                  <NativeSelectOption key={model.value} value={model.value}>
+                    {model.label}
+                  </NativeSelectOption>
+                ))}
+            </NativeSelectOptGroup>
+            <NativeSelectOptGroup label='系统执行器'>
+              {choices
+                .filter((model) => model.source === 'system')
+                .map((model) => (
+                  <NativeSelectOption key={model.value} value={model.value}>
+                    {model.label}
+                  </NativeSelectOption>
+                ))}
+            </NativeSelectOptGroup>
+            <NativeSelectOptGroup label='备用模型'>
+              {choices
+                .filter((model) => model.source === 'fallback')
+                .map((model) => (
+                  <NativeSelectOption key={model.value} value={model.value}>
+                    {model.label}
+                  </NativeSelectOption>
+                ))}
+            </NativeSelectOptGroup>
           </NativeSelect>
+          <div className='text-muted-foreground text-[11px] leading-relaxed'>
+            当前对话模型：{currentModel || '未选择'}
+          </div>
         </LabeledField>
 
         <LabeledField label='Skill 优化'>
@@ -1324,7 +1566,7 @@ function NodeConfigPanel({
             onChange={(event) => onUpdateNode({ skill: event.target.value })}
             className='w-full'
           >
-            {SKILL_CHOICES.map((skill) => (
+            {skillChoices.map((skill) => (
               <NativeSelectOption key={skill.value} value={skill.value}>
                 {skill.label}
               </NativeSelectOption>
@@ -1348,13 +1590,12 @@ function NodeConfigPanel({
         <div className='space-y-2'>
           <div className='text-xs font-medium'>参数</div>
           {Object.entries(node.data.settings).map(([key, value]) => (
-            <LabeledField key={key} label={key}>
-              <Input
-                value={value}
-                onChange={(event) => onUpdateSetting(key, event.target.value)}
-                className='h-8 rounded-[8px] text-sm'
-              />
-            </LabeledField>
+            <SettingControl
+              key={key}
+              label={key}
+              value={value}
+              onChange={(nextValue) => onUpdateSetting(key, nextValue)}
+            />
           ))}
         </div>
 
@@ -1367,54 +1608,333 @@ function NodeConfigPanel({
   )
 }
 
-function ExecutionPanel({
+function ExecutionPreviewDock({
   executionNodes,
+  skillChoices,
+  isOpen,
+  onOpenChange,
 }: {
   executionNodes: AgentFlowNode[]
+  skillChoices: SkillChoice[]
+  isOpen: boolean
+  onOpenChange: (open: boolean) => void
 }) {
+  return (
+    <div className='pointer-events-none absolute right-3 bottom-3 left-3 z-10 flex justify-center'>
+      <section className='border-border/70 bg-background/95 pointer-events-auto w-full max-w-3xl overflow-hidden rounded-[8px] border shadow-sm backdrop-blur'>
+        <button
+          type='button'
+          className='hover:bg-accent/40 flex h-11 w-full items-center gap-2 px-3 text-left transition-colors'
+          onClick={() => onOpenChange(!isOpen)}
+        >
+          <div className='bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
+            <FileSpreadsheetIcon className='size-3.5' />
+          </div>
+          <div className='min-w-0 flex-1'>
+            <div className='truncate text-sm font-semibold'>执行预览</div>
+            <div className='text-muted-foreground truncate text-[11px]'>
+              {executionNodes.length} 个节点 · 闲鱼/鱼小铺日报链路
+            </div>
+          </div>
+          {isOpen ? (
+            <ChevronDownIcon className='text-muted-foreground size-4' />
+          ) : (
+            <ChevronUpIcon className='text-muted-foreground size-4' />
+          )}
+        </button>
+
+        {isOpen && (
+          <div className='border-border/70 max-h-58 overflow-y-auto border-t p-2'>
+            <div className='grid gap-2 md:grid-cols-2'>
+              {executionNodes.map((node, index) => {
+                const meta = NODE_META[node.data.kind]
+                const Icon = meta.icon
+                return (
+                  <div
+                    key={node.id}
+                    className='border-border/70 bg-muted/20 flex items-start gap-2 rounded-[8px] border p-2'
+                  >
+                    <div className='bg-background flex size-7 shrink-0 items-center justify-center rounded-[6px] border text-xs font-medium'>
+                      {index + 1}
+                    </div>
+                    <div className='min-w-0 flex-1'>
+                      <div className='flex min-w-0 items-center gap-1.5'>
+                        <Icon className='text-muted-foreground size-3.5 shrink-0' />
+                        <div className='truncate text-xs font-medium'>
+                          {node.data.title}
+                        </div>
+                      </div>
+                      <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
+                        {node.data.model}
+                      </div>
+                      <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
+                        Skill · {getSkillChoice(node.data.skill, skillChoices).label}
+                      </div>
+                    </div>
+                    <StatusDot status={node.data.status} />
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function SettingControl({
+  label,
+  value,
+  onChange,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+}) {
+  if (label === '执行频率') {
+    return (
+      <LabeledField label={label}>
+        <NativeSelect
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='w-full'
+        >
+          {FREQUENCY_OPTIONS.map((option) => (
+            <NativeSelectOption key={option} value={option}>
+              {option}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </LabeledField>
+    )
+  }
+
+  if (label === '执行时间') {
+    return (
+      <LabeledField label={label}>
+        <Input
+          type='time'
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='h-8 rounded-[8px] text-sm'
+        />
+      </LabeledField>
+    )
+  }
+
+  if (label === '时区') {
+    return (
+      <LabeledField label={label}>
+        <NativeSelect
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='w-full'
+        >
+          {TIMEZONE_OPTIONS.map((option) => (
+            <NativeSelectOption key={option} value={option}>
+              {option}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </LabeledField>
+    )
+  }
+
+  if (label === '归档位置') {
+    return (
+      <LabeledField label={label}>
+        <NativeSelect
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='w-full'
+        >
+          {ARCHIVE_LOCATION_OPTIONS.map((option) => (
+            <NativeSelectOption key={option} value={option}>
+              {option}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </LabeledField>
+    )
+  }
+
+  return (
+    <LabeledField label={label}>
+      <Input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className='h-8 rounded-[8px] text-sm'
+      />
+    </LabeledField>
+  )
+}
+
+function SkillManagerPanel({
+  skillChoices,
+  managedSkills,
+  onAddSkill,
+  onDeleteSkill,
+}: {
+  skillChoices: SkillChoice[]
+  managedSkills: SkillChoice[]
+  onAddSkill: (skill: SkillChoice) => void
+  onDeleteSkill: (skillValue: string) => void
+}) {
+  const [source, setSource] = useState<SkillDraftSource>('github')
+  const [githubUrl, setGithubUrl] = useState('')
+  const [customName, setCustomName] = useState('')
+  const [customDescription, setCustomDescription] = useState('')
+  const [marketplaceValue, setMarketplaceValue] = useState(
+    MARKETPLACE_SKILLS[0]?.value ?? ''
+  )
+
+  const installedValues = useMemo(
+    () => new Set(skillChoices.map((skill) => skill.value)),
+    [skillChoices]
+  )
+
+  const handleAddSkill = () => {
+    if (source === 'marketplace') {
+      const skill = MARKETPLACE_SKILLS.find(
+        (item) => item.value === marketplaceValue
+      )
+      if (skill && !installedValues.has(skill.value)) {
+        onAddSkill(skill)
+      }
+      return
+    }
+
+    if (source === 'github') {
+      const trimmedUrl = githubUrl.trim()
+      if (!trimmedUrl) return
+      onAddSkill({
+        label: `${formatSkillNameFromReference(trimmedUrl)} Skill`,
+        value: `skill.github.${createStableId(trimmedUrl)}`,
+        description: '从 GitHub 地址添加的 Skill。',
+        source: 'github',
+        reference: trimmedUrl,
+      })
+      setGithubUrl('')
+      return
+    }
+
+    const trimmedName = customName.trim()
+    if (!trimmedName) return
+    onAddSkill({
+      label: trimmedName.endsWith('Skill') ? trimmedName : `${trimmedName} Skill`,
+      value: `skill.custom.${createStableId(trimmedName)}`,
+      description: customDescription.trim() || '用户自定义 Skill。',
+      source: 'custom',
+    })
+    setCustomName('')
+    setCustomDescription('')
+  }
+
   return (
     <section className='border-border/70 rounded-[8px] border p-3'>
       <div className='mb-3 flex items-center gap-2'>
         <div className='bg-muted flex size-8 items-center justify-center rounded-[8px]'>
-          <FileSpreadsheetIcon className='size-4' />
+          <ArchiveIcon className='size-4' />
         </div>
-        <div className='min-w-0'>
-          <div className='truncate text-sm font-semibold'>执行预览</div>
+        <div className='min-w-0 flex-1'>
+          <div className='truncate text-sm font-semibold'>Skill 管理</div>
           <div className='text-muted-foreground truncate text-xs'>
-            闲鱼/鱼小铺日报链路
+            内置、GitHub、商城和自定义
           </div>
         </div>
       </div>
-      <div className='space-y-2'>
-        {executionNodes.map((node, index) => {
-          const meta = NODE_META[node.data.kind]
-          const Icon = meta.icon
-          return (
+
+      <div className='space-y-3'>
+        <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-2'>
+          <NativeSelect
+            value={source}
+            onChange={(event) => setSource(event.target.value as SkillDraftSource)}
+            className='w-full'
+          >
+            <NativeSelectOption value='github'>GitHub 地址</NativeSelectOption>
+            <NativeSelectOption value='marketplace'>Skill 商城</NativeSelectOption>
+            <NativeSelectOption value='custom'>自定义 Skill</NativeSelectOption>
+          </NativeSelect>
+          <Button
+            type='button'
+            size='sm'
+            className='h-8 rounded-[6px] px-2'
+            onClick={handleAddSkill}
+          >
+            <PlusIcon className='size-3.5' />
+            添加
+          </Button>
+        </div>
+
+        {source === 'github' && (
+          <Input
+            value={githubUrl}
+            onChange={(event) => setGithubUrl(event.target.value)}
+            placeholder='https://github.com/org/skill'
+            className='h-8 rounded-[8px] text-sm'
+          />
+        )}
+
+        {source === 'marketplace' && (
+          <NativeSelect
+            value={marketplaceValue}
+            onChange={(event) => setMarketplaceValue(event.target.value)}
+            className='w-full'
+          >
+            {MARKETPLACE_SKILLS.map((skill) => (
+              <NativeSelectOption key={skill.value} value={skill.value}>
+                {skill.label}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        )}
+
+        {source === 'custom' && (
+          <div className='space-y-2'>
+            <Input
+              value={customName}
+              onChange={(event) => setCustomName(event.target.value)}
+              placeholder='自定义 Skill 名称'
+              className='h-8 rounded-[8px] text-sm'
+            />
+            <Textarea
+              value={customDescription}
+              onChange={(event) => setCustomDescription(event.target.value)}
+              placeholder='Skill 描述'
+              className='min-h-18 rounded-[8px] text-sm'
+            />
+          </div>
+        )}
+
+        <div className='space-y-1.5'>
+          {skillChoices.map((skill) => (
             <div
-              key={node.id}
-              className='border-border/70 bg-muted/20 flex items-start gap-2 rounded-[8px] border p-2'
+              key={skill.value}
+              className='border-border/70 bg-muted/20 flex items-center gap-2 rounded-[8px] border px-2 py-1.5'
             >
-              <div className='bg-background flex size-7 shrink-0 items-center justify-center rounded-[6px] border text-xs font-medium'>
-                {index + 1}
-              </div>
               <div className='min-w-0 flex-1'>
-                <div className='flex min-w-0 items-center gap-1.5'>
-                  <Icon className='text-muted-foreground size-3.5 shrink-0' />
-                  <div className='truncate text-xs font-medium'>
-                    {node.data.title}
-                  </div>
-                </div>
-                <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
-                  {node.data.model}
-                </div>
-                <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
-                  Skill · {getSkillChoice(node.data.skill).label}
+                <div className='truncate text-xs font-medium'>{skill.label}</div>
+                <div className='text-muted-foreground truncate text-[11px]'>
+                  {formatSkillSource(skill.source)}
+                  {skill.reference ? ` · ${skill.reference}` : ''}
                 </div>
               </div>
-              <StatusDot status={node.data.status} />
+              {managedSkills.some((item) => item.value === skill.value) && (
+                <Button
+                  type='button'
+                  size='icon'
+                  variant='ghost'
+                  className='size-7 rounded-[6px]'
+                  onClick={() => onDeleteSkill(skill.value)}
+                  title='删除 Skill'
+                >
+                  <Trash2Icon className='size-3.5' />
+                </Button>
+              )}
             </div>
-          )
-        })}
+          ))}
+        </div>
       </div>
     </section>
   )
@@ -1458,19 +1978,32 @@ function FieldList({ title, values }: { title: string; values: string[] }) {
   )
 }
 
-function buildModelChoices(models: ModelOption[]) {
+function buildModelChoices(models: ModelOption[], currentModel?: string) {
+  const currentChoices: ModelChoice[] = models.map((model) => ({
+    label:
+      model.value === currentModel
+        ? `${model.label || model.value}（对话当前）`
+        : model.label || model.value,
+    value: model.value,
+    description: model.description,
+    supportsImage: model.supportsImage,
+    source: 'current',
+  }))
   const choices: ModelChoice[] = [
-    ...MODEL_FALLBACKS.system,
-    ...models.map((model) => ({
-      label: model.label || model.value,
-      value: model.value,
-      description: model.description,
-      supportsImage: model.supportsImage,
+    ...currentChoices,
+    ...MODEL_FALLBACKS.system.map((model) => ({
+      ...model,
+      source: 'system' as const,
     })),
-    ...MODEL_FALLBACKS.browser,
-    ...MODEL_FALLBACKS.fast,
-    ...MODEL_FALLBACKS.reasoning,
-    ...MODEL_FALLBACKS.image,
+    ...[
+      ...MODEL_FALLBACKS.browser,
+      ...MODEL_FALLBACKS.fast,
+      ...MODEL_FALLBACKS.reasoning,
+      ...MODEL_FALLBACKS.image,
+    ].map((model) => ({
+      ...model,
+      source: 'fallback' as const,
+    })),
   ]
   const seen = new Set<string>()
   return choices.filter((choice) => {
@@ -1480,22 +2013,72 @@ function buildModelChoices(models: ModelOption[]) {
   })
 }
 
+function mergeSkillChoices(...groups: SkillChoice[][]) {
+  const seen = new Set<string>()
+  return groups.flat().filter((skill) => {
+    if (seen.has(skill.value)) return false
+    seen.add(skill.value)
+    return true
+  })
+}
+
+function readSavedSkills(): SkillChoice[] {
+  if (typeof window === 'undefined') return []
+
+  try {
+    const raw = window.localStorage.getItem(AGENT_SKILLS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(isSkillChoice)
+  } catch {
+    return []
+  }
+}
+
+function writeSavedSkills(skills: SkillChoice[]) {
+  if (typeof window === 'undefined') return
+
+  try {
+    window.localStorage.setItem(AGENT_SKILLS_STORAGE_KEY, JSON.stringify(skills))
+  } catch {
+    /* localStorage may be unavailable or full. */
+  }
+}
+
+function isSkillChoice(value: unknown): value is SkillChoice {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<SkillChoice>
+  return (
+    typeof candidate.label === 'string' &&
+    typeof candidate.value === 'string' &&
+    typeof candidate.description === 'string' &&
+    (candidate.source === 'github' ||
+      candidate.source === 'marketplace' ||
+      candidate.source === 'custom')
+  )
+}
+
 function readSavedBlueprints(): SavedAgentBlueprint[] {
   if (typeof window === 'undefined') return []
 
   try {
-    const raw = window.localStorage.getItem(BLUEPRINT_STORAGE_KEY)
+    const raw = window.localStorage.getItem(AGENT_BLUEPRINT_STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
 
     return parsed
       .filter(isSavedBlueprint)
-      .map((blueprint) => ({
-        ...blueprint,
-        nodes: blueprint.nodes.map((node) => normalizeNode(node)),
-        edges: blueprint.edges.map((edge) => normalizeEdge(edge)),
-      }))
+      .map((blueprint) => {
+        const nodes = blueprint.nodes.map((node) => normalizeNode(node))
+        return {
+          ...blueprint,
+          nodes,
+          edges: blueprint.edges.map((edge) => normalizeEdge(edge)),
+          status: blueprint.status ?? getBlueprintStatus(nodes),
+        }
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt)
   } catch {
     return []
@@ -1507,12 +2090,27 @@ function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
 
   try {
     window.localStorage.setItem(
-      BLUEPRINT_STORAGE_KEY,
+      AGENT_BLUEPRINT_STORAGE_KEY,
       JSON.stringify(blueprints)
     )
   } catch {
     /* localStorage may be unavailable or full. */
   }
+}
+
+function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
+  if (nodes.some((node) => node.data.status === 'running')) return 'running'
+  if (nodes.length > 0 && nodes.every((node) => node.data.status === 'done')) {
+    return 'ended'
+  }
+  return 'pending'
+}
+
+function buildSeedBlueprintTitle(prompt: string) {
+  const normalized = prompt.replace(/\s+/g, ' ').trim()
+  const title = normalized.replace(/^\/agent\s*/i, '')
+  const chars = Array.from(title || '对话智能体任务')
+  return `对话任务：${chars.slice(0, 20).join('')}`
 }
 
 function isSavedBlueprint(value: unknown): value is SavedAgentBlueprint {
@@ -1616,14 +2214,41 @@ function pickDefaultSkill(kind: AgentNodeKind) {
   return skillByKind[kind]
 }
 
-function getSkillChoice(value: string) {
+function getSkillChoice(value: string, skillChoices: SkillChoice[]) {
   return (
-    SKILL_CHOICES.find((skill) => skill.value === value) ?? {
+    skillChoices.find((skill) => skill.value === value) ?? {
       label: value,
       value,
       description: '自定义 Skill',
+      source: 'custom',
     }
   )
+}
+
+function formatSkillSource(source: SkillSource) {
+  const labels: Record<SkillSource, string> = {
+    'built-in': '内置',
+    github: 'GitHub',
+    marketplace: 'Skill 商城',
+    custom: '自定义',
+  }
+  return labels[source]
+}
+
+function formatSkillNameFromReference(reference: string) {
+  const trimmed = reference.trim().replace(/\/+$/, '')
+  const parts = trimmed.split(/[\\/]/).filter(Boolean)
+  return parts.at(-1)?.replace(/[-_]+/g, ' ') || 'GitHub'
+}
+
+function createStableId(value: string) {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 48)
+  return `${slug || 'skill'}-${Date.now().toString(36)}`
 }
 
 function chooseModelByRole(

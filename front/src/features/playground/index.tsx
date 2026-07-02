@@ -71,6 +71,7 @@ export function Playground() {
   const [isWorkspaceGenerating, setIsWorkspaceGenerating] = useState(false)
   const [imageParams, setImageParams] = useState(useImageDefaultParams)
   const [videoParams, setVideoParams] = useState(useVideoDefaultParams)
+  const [agentSeedPrompt, setAgentSeedPrompt] = useState('')
   const stopGenerationRef = useRef<(() => void) | null>(null)
 
   const imageModels = useMemo(
@@ -179,6 +180,12 @@ export function Playground() {
     [loadSession]
   )
 
+  const handleStartAgentTaskFromChat = useCallback((prompt: string) => {
+    setAgentSeedPrompt(`${Date.now()}::${prompt}`)
+    setActiveCapability('agent')
+    toast.success(t('已从对话开启智能体任务草稿'))
+  }, [t])
+
   const hasConversation = messages.length > 0
   const hasDraftSession = activeSessionId === null && hasConversation
 
@@ -243,6 +250,7 @@ export function Playground() {
               onRegisterStop={(stop) => {
                 stopGenerationRef.current = stop
               }}
+              onStartAgentTask={handleStartAgentTaskFromChat}
             />
           )}
 
@@ -275,7 +283,12 @@ export function Playground() {
           )}
 
           {activeCapability === 'agent' && (
-            <AgentWorkspace models={models} currentModel={config.model} />
+            <AgentWorkspace
+              models={models}
+              currentModel={config.model}
+              currentGroup={config.group}
+              seedPrompt={agentSeedPrompt}
+            />
           )}
         </section>
       </div>

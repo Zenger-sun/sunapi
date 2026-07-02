@@ -45,6 +45,7 @@ interface ChatWorkspaceProps {
   updateMessages: ReturnType<typeof usePlaygroundState>['updateMessages']
   onGeneratingChange?: (generating: boolean) => void
   onRegisterStop?: (stop: (() => void) | null) => void
+  onStartAgentTask?: (prompt: string) => void
 }
 
 export function ChatWorkspace({
@@ -58,6 +59,7 @@ export function ChatWorkspace({
   updateMessages,
   onGeneratingChange,
   onRegisterStop,
+  onStartAgentTask,
 }: ChatWorkspaceProps) {
   const [editingMessageKey, setEditingMessageKey] = useState<string | null>(
     null
@@ -100,6 +102,24 @@ export function ChatWorkspace({
         versions: [{ id: 'v1', content: text }],
         attachments,
       }
+      if (isAgentTaskPrompt(text)) {
+        const assistantMessage: MessageType = {
+          key: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          from: 'assistant',
+          versions: [
+            {
+              id: 'v1',
+              content: '已根据这条对话开启智能体任务草稿，可在智能体中继续调整蓝图。',
+            },
+          ],
+          status: 'complete',
+        }
+        updateMessages((prev) => [...prev, userMessage, assistantMessage])
+        onStartAgentTask?.(text)
+        submitLockRef.current = false
+        return
+      }
+
       const assistantMessage: MessageType = {
         key: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         from: 'assistant',
@@ -109,7 +129,7 @@ export function ChatWorkspace({
       updateMessages((prev) => [...prev, userMessage, assistantMessage])
       sendChat([...messages, userMessage, assistantMessage])
     },
-    [isGenerating, messages, sendChat, updateMessages]
+    [isGenerating, messages, onStartAgentTask, sendChat, updateMessages]
   )
 
   const handleRegenerate = useCallback(
@@ -224,6 +244,11 @@ export function ChatWorkspace({
       />
     </div>
   )
+}
+
+function isAgentTaskPrompt(text: string) {
+  return /^\s*\/agent\b/i.test(text) ||
+    /开启智能体|创建智能体|启动智能体|智能体任务|生成蓝图|创建蓝图|蓝图任务/.test(text)
 }
 
 function EmptyState({

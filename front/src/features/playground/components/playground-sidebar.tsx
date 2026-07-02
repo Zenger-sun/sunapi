@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 import { useMemo, useState, useEffect, useRef } from 'react'
 import {
+  BotIcon,
   MessageSquarePlus,
   SearchIcon,
   PinIcon,
@@ -53,6 +54,14 @@ import {
   SidebarRail,
 } from '@/components/ui/sidebar'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  AGENT_BLUEPRINTS_CHANGED_EVENT,
+  deleteStoredAgentBlueprint,
+  dispatchAgentBlueprintCommand,
+  getAgentBlueprintStatusLabel,
+  readAgentBlueprintSummaries,
+  type AgentBlueprintSummary,
+} from '../lib/agent-blueprints'
 import type { PlaygroundSession } from '../types'
 
 export type PlaygroundCapability = 'chat' | 'image' | 'video' | 'agent'
@@ -179,6 +188,9 @@ export function PlaygroundSidebar({
   // offcanvas so collapsing slides the whole panel off-screen instead.
   const collapsible = collapsiblePref === 'icon' ? 'offcanvas' : collapsiblePref
   const [search, setSearch] = useState('')
+  const [agentBlueprints, setAgentBlueprints] = useState<
+    AgentBlueprintSummary[]
+  >(readAgentBlueprintSummaries)
 
   const filteredSessions = useMemo(() => {
     const trimmed = search.trim().toLowerCase()
@@ -194,6 +206,30 @@ export function PlaygroundSidebar({
     () => groupSessions(filteredSessions),
     [filteredSessions]
   )
+
+  const filteredAgentBlueprints = useMemo(() => {
+    const trimmed = search.trim().toLowerCase()
+    if (!trimmed) return agentBlueprints
+    return agentBlueprints.filter((blueprint) =>
+      blueprint.title.toLowerCase().includes(trimmed)
+    )
+  }, [agentBlueprints, search])
+
+  useEffect(() => {
+    const refreshBlueprints = () => {
+      setAgentBlueprints(readAgentBlueprintSummaries())
+    }
+
+    window.addEventListener(AGENT_BLUEPRINTS_CHANGED_EVENT, refreshBlueprints)
+    window.addEventListener('storage', refreshBlueprints)
+    return () => {
+      window.removeEventListener(
+        AGENT_BLUEPRINTS_CHANGED_EVENT,
+        refreshBlueprints
+      )
+      window.removeEventListener('storage', refreshBlueprints)
+    }
+  }, [])
 
   const isMutating = isGenerating || isSavingSession
   const isSessionSelectionDisabled = isGenerating
@@ -213,6 +249,14 @@ export function PlaygroundSidebar({
               <div className='flex flex-col gap-3'>{workspaceContent}</div>
             </SidebarGroupContent>
           </SidebarGroup>
+        )}
+
+        {activeCapability === 'agent' && (
+          <AgentBlueprintHistoryPanel
+            blueprints={filteredAgentBlueprints}
+            search={search}
+            onSearchChange={setSearch}
+          />
         )}
 
         {activeCapability === 'chat' && (
@@ -357,6 +401,168 @@ export function PlaygroundSidebar({
 
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+type AgentBlueprintHistoryPanelProps = {
+  blueprints: AgentBlueprintSummary[]
+  search: string
+  onSearchChange: (value: string) => void
+}
+
+function AgentBlueprintHistoryPanel({
+  blueprints,
+  search,
+  onSearchChange,
+}: AgentBlueprintHistoryPanelProps) {
+  const { t } = useTranslation()
+
+  const handleNewBlueprint = () => {
+    dispatchAgentBlueprintCommand({ type: 'new' })
+  }
+
+  const handleLoadBlueprint = (blueprintId: string) => {
+    dispatchAgentBlueprintCommand({ type: 'load', id: blueprintId })
+  }
+
+  const handleDeleteBlueprint = (blueprintId: string) => {
+    deleteStoredAgentBlueprint(blueprintId)
+  }
+
+  return (
+    <>
+      <SidebarGroup className='px-3 pt-1 pb-2'>
+        <Button
+          type='button'
+          variant='default'
+          className='h-9 w-full justify-center gap-2 text-sm font-medium'
+          onClick={handleNewBlueprint}
+        >
+          <BotIcon className='size-4' />
+          {t('新建蓝图')}
+        </Button>
+
+        <div className='relative mt-2'>
+          <SearchIcon className='text-muted-foreground absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2' />
+          <Input
+            value={search}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder={t('搜索蓝图')}
+            className='h-8 pl-8 text-xs'
+          />
+        </div>
+      </SidebarGroup>
+
+      {blueprints.length === 0 ? (
+        <SidebarGroup className='px-2 pt-1 pb-1'>
+          <SidebarGroupContent>
+            <div className='text-muted-foreground px-2 py-6 text-center text-xs'>
+              {t('暂无智能体蓝图')}
+            </div>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      ) : (
+        <SidebarGroup className='px-2 pt-1 pb-1'>
+          <SidebarGroupLabel className='text-muted-foreground/70 px-2 text-[10px] font-medium tracking-wider uppercase'>
+            {t('蓝图历史')}
+          </SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {blueprints.map((blueprint) => (
+                <AgentBlueprintItem
+                  key={blueprint.id}
+                  blueprint={blueprint}
+                  onLoad={handleLoadBlueprint}
+                  onDelete={handleDeleteBlueprint}
+                />
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      )}
+    </>
+  )
+}
+
+type AgentBlueprintItemProps = {
+  blueprint: AgentBlueprintSummary
+  onLoad: (blueprintId: string) => void
+  onDelete: (blueprintId: string) => void
+}
+
+function AgentBlueprintItem({
+  blueprint,
+  onLoad,
+  onDelete,
+}: AgentBlueprintItemProps) {
+  const { t } = useTranslation()
+  const statusLabel = getAgentBlueprintStatusLabel(blueprint.status)
+
+  return (
+    <SidebarMenuItem>
+      <div className='group/blueprint relative flex w-full min-w-0 items-start gap-1 rounded-md transition-colors'>
+        <button
+          type='button'
+          onClick={() => onLoad(blueprint.id)}
+          className='flex min-h-12 w-full min-w-0 flex-1 items-start gap-1 rounded-md px-2 py-1.5 text-left'
+        >
+          <span className='grid min-w-0 flex-1 gap-1'>
+            <span className='line-clamp-2 text-sm leading-snug font-medium break-all'>
+              {blueprint.title || t('未命名蓝图')}
+            </span>
+            <span className='text-muted-foreground flex min-w-0 items-center gap-1 text-[11px] font-normal'>
+              <span
+                className={cn(
+                  'rounded-full px-1.5 py-0.5 text-[10px] leading-none',
+                  blueprint.status === 'running' &&
+                    'bg-blue-500/10 text-blue-600 dark:text-blue-300',
+                  blueprint.status === 'ended' &&
+                    'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
+                  blueprint.status === 'pending' &&
+                    'bg-muted text-muted-foreground'
+                )}
+              >
+                {statusLabel}
+              </span>
+              <span className='truncate'>
+                {t('{{count}} 个节点', { count: blueprint.nodesCount })}
+              </span>
+              <span className='shrink-0'>|</span>
+              <span className='shrink-0'>
+                {formatBlueprintSidebarTime(blueprint.updatedAt)}
+              </span>
+            </span>
+          </span>
+        </button>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            className='text-muted-foreground hover:text-foreground absolute top-1.5 right-1 inline-flex size-6 items-center justify-center rounded-md opacity-0 transition-opacity group-hover/blueprint:opacity-100 data-[popup-open]:opacity-100'
+            aria-label={t('蓝图操作')}
+          >
+            <MoreHorizontalIcon className='size-3.5' />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side='right' align='start' sideOffset={4}>
+            <DropdownMenuItem
+              onClick={() => onLoad(blueprint.id)}
+              className='gap-2'
+            >
+              <BotIcon className='size-3.5' />
+              {t('载入')}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant='destructive'
+              onClick={() => onDelete(blueprint.id)}
+              className='gap-2'
+            >
+              <Trash2Icon className='size-3.5' />
+              {t('删除')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </SidebarMenuItem>
   )
 }
 
@@ -650,6 +856,15 @@ function SessionItem({
       </div>
     </SidebarMenuItem>
   )
+}
+
+function formatBlueprintSidebarTime(timestamp: number) {
+  const date = new Date(timestamp)
+  const month = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  const hour = `${date.getHours()}`.padStart(2, '0')
+  const minute = `${date.getMinutes()}`.padStart(2, '0')
+  return `${month}-${day} ${hour}:${minute}`
 }
 
 export { Skeleton as PlaygroundSidebarSkeleton }
