@@ -493,38 +493,34 @@ function AgentBlueprintItem({
 }: AgentBlueprintItemProps) {
   const { t } = useTranslation()
   const statusLabel = getAgentBlueprintStatusLabel(blueprint.status)
+  const statusClass = getBlueprintSidebarStatusClass(blueprint.status)
 
   return (
     <SidebarMenuItem>
-      <div className='group/blueprint relative flex w-full min-w-0 items-start gap-1 rounded-md transition-colors'>
+      <div className='group/blueprint hover:bg-muted/45 hover:border-border/70 relative flex w-full min-w-0 items-start gap-1 rounded-md border border-transparent transition-colors'>
         <button
           type='button'
           onClick={() => onLoad(blueprint.id)}
-          className='flex min-h-12 w-full min-w-0 flex-1 items-start gap-1 rounded-md px-2 py-1.5 text-left'
+          className='flex min-h-16 w-full min-w-0 flex-1 items-start gap-1 rounded-md px-2 py-2 pr-8 text-left'
         >
-          <span className='grid min-w-0 flex-1 gap-1'>
+          <span className='grid min-w-0 flex-1 gap-1.5'>
             <span className='line-clamp-2 text-sm leading-snug font-medium break-all'>
               {blueprint.title || t('未命名蓝图')}
             </span>
-            <span className='text-muted-foreground flex min-w-0 items-center gap-1 text-[11px] font-normal'>
+            <span className='flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] font-normal'>
               <span
                 className={cn(
-                  'rounded-full px-1.5 py-0.5 text-[10px] leading-none',
-                  blueprint.status === 'running' &&
-                    'bg-blue-500/10 text-blue-600 dark:text-blue-300',
-                  blueprint.status === 'ended' &&
-                    'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
-                  blueprint.status === 'pending' &&
-                    'bg-muted text-muted-foreground'
+                  'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] leading-none',
+                  statusClass
                 )}
               >
+                <span className='size-1.5 rounded-full bg-current' />
                 {statusLabel}
               </span>
-              <span className='truncate'>
+              <span className='text-muted-foreground shrink-0'>
                 {t('{{count}} 个节点', { count: blueprint.nodesCount })}
               </span>
-              <span className='shrink-0'>|</span>
-              <span className='shrink-0'>
+              <span className='text-muted-foreground/80 shrink-0'>
                 {formatBlueprintSidebarTime(blueprint.updatedAt)}
               </span>
             </span>
@@ -560,6 +556,18 @@ function AgentBlueprintItem({
       </div>
     </SidebarMenuItem>
   )
+}
+
+function getBlueprintSidebarStatusClass(
+  status: AgentBlueprintSummary['status']
+) {
+  if (status === 'running') {
+    return 'bg-blue-500/10 text-blue-600 dark:text-blue-300'
+  }
+  if (status === 'ended') {
+    return 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300'
+  }
+  return 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
 }
 
 type CapabilityTabsProps = {

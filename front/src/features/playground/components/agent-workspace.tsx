@@ -85,7 +85,7 @@ import {
   type AgentBlueprintCommand,
   type AgentBlueprintStatus,
 } from '../lib/agent-blueprints'
-import type { ModelOption } from '../types'
+import type { GroupOption, ModelOption } from '../types'
 
 type AgentNodeKind =
   | 'start'
@@ -106,6 +106,7 @@ type AgentNodeData = {
   kind: AgentNodeKind
   title: string
   description: string
+  group?: string
   model: string
   skill: string
   inputs: string[]
@@ -141,10 +142,13 @@ type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
 
 type SkillDraftSource = Exclude<SkillSource, 'built-in'>
 
+type AgentToolPanel = 'components' | 'skills'
+
 type NodeTemplate = {
   kind: AgentNodeKind
   title: string
   description: string
+  group?: string
   model: string
   skill: string
   inputs: string[]
@@ -155,6 +159,7 @@ type NodeTemplate = {
 
 type AgentWorkspaceProps = {
   models: ModelOption[]
+  groups?: GroupOption[]
   currentModel?: string
   currentGroup?: string
   seedPrompt?: string
@@ -266,6 +271,32 @@ const ARCHIVE_LOCATION_OPTIONS = [
   '对象存储 / agent-runs',
   '不归档',
 ]
+const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
+  触发方式: ['手动', '定时', 'Webhook', '对话触发'],
+  运行模式: ['单次执行', '循环执行', '仅预览', '失败后重试'],
+  登录态: ['使用当前设备浏览器', '使用已保存登录态', '无需登录'],
+  权限: ['只读采集', '读写操作需确认', '禁止写入'],
+  方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  超时: ['10s', '30s', '60s', '120s'],
+  重试: ['0 次', '1 次', '2 次', '3 次'],
+  表格字段: [
+    '商品名称, 曝光, 浏览, 想要, 转化建议',
+    '商品 ID, 标题, 价格, 曝光, 浏览, 想要',
+    '日期, 渠道, 访客, 成交, 转化率',
+    '自定义字段',
+  ],
+  去重规则: ['按商品 ID', '按商品链接', '按标题 + 日期', '不去重'],
+  缺失处理: ['保留空值并标注', '填充 0', '跳过该行', '请求人工确认'],
+  尺寸: ['16:9', '1:1', '4:3', '9:16'],
+  风格: ['清爽数据看板', '运营日报封面', '极简图表', '品牌营销图'],
+  数量: ['1', '2', '3', '4'],
+  格式: ['Markdown + CSV', 'Markdown', 'PDF', 'Markdown + 图片'],
+  语气: ['运营复盘', '简洁客观', '专业分析', '行动建议'],
+  渠道: ['邮件', '企业微信', '钉钉', '飞书', 'Slack', 'Webhook'],
+  确认: ['发送前确认', '自动发送', '失败时确认'],
+  结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
+  归档: ['保存执行日志', '保存日报与日志', '仅保存错误', '不保存'],
+}
 
 const MODEL_FALLBACKS: Record<ModelRole, ModelChoice[]> = {
   system: [
@@ -503,6 +534,7 @@ const INITIAL_EDGES: AgentFlowEdge[] = [
 
 export function AgentWorkspace({
   models,
+  groups = [],
   currentModel,
   currentGroup,
   seedPrompt,
@@ -517,9 +549,13 @@ export function AgentWorkspace({
     () => buildModelChoices(models, currentModel),
     [currentModel, models]
   )
+  const groupChoices = useMemo(
+    () => buildGroupChoices(groups, currentGroup),
+    [currentGroup, groups]
+  )
   const templates = useMemo(
-    () => buildTemplates(models, currentModel),
-    [currentModel, models]
+    () => buildTemplates(models, currentModel, currentGroup),
+    [currentGroup, currentModel, models]
   )
   const initialBlueprints = useMemo(() => readSavedBlueprints(), [])
   const initialBlueprint = initialBlueprints[0] ?? null
@@ -561,7 +597,20 @@ export function AgentWorkspace({
   const currentBlueprintStatus = useMemo(() => getBlueprintStatus(nodes), [nodes])
 
   const onNodesChange = useCallback((changes: NodeChange<AgentFlowNode>[]) => {
+    const removedIds = new Set(
+      changes
+        .filter((change) => change.type === 'remove')
+        .map((change) => change.id)
+    )
     setNodes((current) => applyNodeChanges(changes, current))
+    if (removedIds.size > 0) {
+      setEdges((current) =>
+        current.filter(
+          (edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target)
+        )
+      )
+      setSelectedNodeId((current) => (removedIds.has(current) ? '' : current))
+    }
   }, [])
 
   const onEdgesChange = useCallback((changes: EdgeChange<AgentFlowEdge>[]) => {
@@ -572,6 +621,24 @@ export function AgentWorkspace({
     setEdges((current) =>
       addEdge(decorateEdge({ ...connection, id: `e-${Date.now()}` }), current)
     )
+  }, [])
+
+  const handleDeleteNode = useCallback(
+    (nodeId: string) => {
+      const fallbackNodeId = nodes.find((node) => node.id !== nodeId)?.id ?? ''
+      setNodes((current) => current.filter((node) => node.id !== nodeId))
+      setEdges((current) =>
+        current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId)
+      )
+      setSelectedNodeId((current) =>
+        current === nodeId ? fallbackNodeId : current
+      )
+    },
+    [nodes]
+  )
+
+  const handleDeleteEdge = useCallback((edgeId: string) => {
+    setEdges((current) => current.filter((edge) => edge.id !== edgeId))
   }, [])
 
   const handleReset = useCallback(() => {
@@ -817,6 +884,7 @@ export function AgentWorkspace({
         currentModel={currentModel}
         edges={edges}
         executionNodes={executionNodes}
+        groupChoices={groupChoices}
         lastSavedAt={lastSavedAt}
         modelChoices={modelChoices}
         nodes={nodes}
@@ -825,6 +893,8 @@ export function AgentWorkspace({
         onAddSkill={handleAddSkill}
         onAddNode={handleAddNode}
         onConnect={onConnect}
+        onDeleteEdge={handleDeleteEdge}
+        onDeleteNode={handleDeleteNode}
         onDeleteSkill={handleDeleteSkill}
         onEdgesChange={onEdgesChange}
         onNodesChange={onNodesChange}
@@ -849,6 +919,7 @@ type BlueprintWorkspaceProps = {
   selectedNode: AgentFlowNode | null
   executionNodes: AgentFlowNode[]
   modelChoices: ModelChoice[]
+  groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
   blueprintTitle: string
@@ -863,6 +934,8 @@ type BlueprintWorkspaceProps = {
   onConnect: (connection: Connection) => void
   onSelectNode: (nodeId: string) => void
   onAddNode: (kind: AgentNodeKind, position?: { x: number; y: number }) => void
+  onDeleteNode: (nodeId: string) => void
+  onDeleteEdge: (edgeId: string) => void
   onTitleChange: (value: string) => void
   onSaveBlueprint: () => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
@@ -879,6 +952,7 @@ function BlueprintWorkspace({
   selectedNode,
   executionNodes,
   modelChoices,
+  groupChoices,
   skillChoices,
   managedSkills,
   blueprintTitle,
@@ -893,6 +967,8 @@ function BlueprintWorkspace({
   onConnect,
   onSelectNode,
   onAddNode,
+  onDeleteNode,
+  onDeleteEdge,
   onTitleChange,
   onSaveBlueprint,
   onUpdateNode,
@@ -905,6 +981,8 @@ function BlueprintWorkspace({
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
   const filteredGroups = useMemo(() => filterPaletteGroups(search), [search])
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
+  const [activeToolPanel, setActiveToolPanel] =
+    useState<AgentToolPanel>('components')
   const nodeTypes = useMemo(
     () => ({
       agentNode: (props: NodeProps<AgentFlowNode>) => (
@@ -932,10 +1010,16 @@ function BlueprintWorkspace({
     <div className='bg-background flex size-full min-h-0 overflow-hidden'>
       <aside className='border-border/70 bg-muted/25 hidden w-68 shrink-0 flex-col border-r lg:flex'>
         <Palette
+          activePanel={activeToolPanel}
           groups={filteredGroups}
+          managedSkills={managedSkills}
           onAddNode={onAddNode}
+          onAddSkill={onAddSkill}
+          onDeleteSkill={onDeleteSkill}
+          onPanelChange={setActiveToolPanel}
           onSearchChange={onSearchChange}
           search={search}
+          skillChoices={skillChoices}
         />
       </aside>
 
@@ -1028,14 +1112,20 @@ function BlueprintWorkspace({
                 strokeWidth: 1.8,
               },
             }}
+            deleteKeyCode={['Backspace', 'Delete']}
             edges={edges}
+            edgesFocusable
+            elementsSelectable
             fitView
             fitViewOptions={{ padding: 0.22 }}
             maxZoom={1.25}
             minZoom={0.35}
             nodeTypes={nodeTypes}
+            nodesDraggable
+            nodesFocusable
             nodes={nodes}
             onConnect={onConnect}
+            onEdgeDoubleClick={(_, edge) => onDeleteEdge(edge.id)}
             onEdgesChange={onEdgesChange}
             onNodeClick={(_, node) => onSelectNode(node.id)}
             onNodesChange={onNodesChange}
@@ -1051,11 +1141,11 @@ function BlueprintWorkspace({
               gap={20}
             />
             <Controls
-              className='rounded-[8px] border shadow-none'
-              position='bottom-left'
+              className='!right-3 !bottom-[174px] rounded-[8px] border shadow-none'
+              position='bottom-right'
             />
             <MiniMap
-              className='border-border/70 bg-background/90 overflow-hidden rounded-[8px] border shadow-sm'
+              className='border-border/70 bg-background/90 !right-3 !bottom-3 overflow-hidden rounded-[8px] border shadow-sm'
               maskColor='color-mix(in oklch, var(--background) 68%, transparent)'
               nodeBorderRadius={8}
               nodeColor={(node) =>
@@ -1073,12 +1163,11 @@ function BlueprintWorkspace({
         <Inspector
           currentGroup={currentGroup}
           currentModel={currentModel}
-          managedSkills={managedSkills}
+          groupChoices={groupChoices}
           modelChoices={modelChoices}
           skillChoices={skillChoices}
           selectedNode={selectedNode}
-          onAddSkill={onAddSkill}
-          onDeleteSkill={onDeleteSkill}
+          onDeleteNode={onDeleteNode}
           onUpdateNode={onUpdateNode}
           onUpdateSetting={onUpdateSetting}
         />
@@ -1088,15 +1177,27 @@ function BlueprintWorkspace({
 }
 
 function Palette({
+  activePanel,
   groups,
+  skillChoices,
+  managedSkills,
   search,
   onSearchChange,
   onAddNode,
+  onAddSkill,
+  onDeleteSkill,
+  onPanelChange,
 }: {
+  activePanel: AgentToolPanel
   groups: typeof PALETTE_GROUPS
+  skillChoices: SkillChoice[]
+  managedSkills: SkillChoice[]
   search: string
   onSearchChange: (value: string) => void
   onAddNode: (kind: AgentNodeKind) => void
+  onAddSkill: (skill: SkillChoice) => void
+  onDeleteSkill: (skillValue: string) => void
+  onPanelChange: (panel: AgentToolPanel) => void
 }) {
   return (
     <div className='flex min-h-0 flex-1 flex-col'>
@@ -1106,9 +1207,9 @@ function Palette({
             <BotIcon className='size-4' />
           </div>
           <div className='min-w-0'>
-            <div className='truncate text-sm font-semibold'>组件库</div>
+            <div className='truncate text-sm font-semibold'>工具库</div>
             <div className='text-muted-foreground truncate text-xs'>
-              蓝图任务节点
+              组件与外部 Skill
             </div>
           </div>
         </div>
@@ -1122,21 +1223,96 @@ function Palette({
           />
         </div>
       </div>
+
       <div className='min-h-0 flex-1 overflow-y-auto px-2 py-2'>
-        {groups.map((group) => (
-          <div key={group.title} className='mb-3'>
-            <div className='text-muted-foreground px-1.5 pb-1.5 text-[10px] font-medium tracking-wider uppercase'>
-              {group.title}
-            </div>
-            <div className='grid gap-1.5'>
-              {group.kinds.map((kind) => (
-                <PaletteItem key={kind} kind={kind} onAddNode={onAddNode} />
-              ))}
-            </div>
+        <ToolPanelToggle
+          active={activePanel === 'components'}
+          description='内部创建的蓝图节点'
+          icon={BotIcon}
+          title='组件'
+          onClick={() => onPanelChange('components')}
+        />
+
+        {activePanel === 'components' && (
+          <div className='pt-2'>
+            {groups.map((group) => (
+              <div key={group.title} className='mb-3'>
+                <div className='text-muted-foreground px-1.5 pb-1.5 text-[10px] font-medium tracking-wider uppercase'>
+                  {group.title}
+                </div>
+                <div className='grid gap-1.5'>
+                  {group.kinds.map((kind) => (
+                    <PaletteItem key={kind} kind={kind} onAddNode={onAddNode} />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
+        )}
+      </div>
+
+      <div className='border-border/70 bg-background/95 sticky bottom-0 border-t px-2 py-2 backdrop-blur'>
+        <ToolPanelToggle
+          active={activePanel === 'skills'}
+          description='GitHub、商城与自定义外部工具'
+          icon={ArchiveIcon}
+          title='Skill'
+          onClick={() => onPanelChange('skills')}
+        />
+
+        {activePanel === 'skills' && (
+          <div className='max-h-[54vh] overflow-y-auto pt-2'>
+            <SkillManagerPanel
+              compact
+              managedSkills={managedSkills}
+              skillChoices={skillChoices}
+              onAddSkill={onAddSkill}
+              onDeleteSkill={onDeleteSkill}
+            />
+          </div>
+        )}
       </div>
     </div>
+  )
+}
+
+function ToolPanelToggle({
+  active,
+  description,
+  icon: Icon,
+  title,
+  onClick,
+}: {
+  active: boolean
+  description: string
+  icon: LucideIcon
+  title: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type='button'
+      className={cn(
+        'border-border/70 bg-background hover:bg-accent/50 flex h-12 w-full items-center gap-2 rounded-[8px] border px-2 text-left transition-colors',
+        active && 'border-primary/45 bg-primary/5'
+      )}
+      onClick={onClick}
+    >
+      <span className='bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
+        <Icon className='size-3.5' />
+      </span>
+      <span className='min-w-0 flex-1'>
+        <span className='block truncate text-sm font-medium'>{title}</span>
+        <span className='text-muted-foreground block truncate text-[11px]'>
+          {description}
+        </span>
+      </span>
+      {active ? (
+        <ChevronDownIcon className='text-muted-foreground size-4 shrink-0' />
+      ) : (
+        <ChevronUpIcon className='text-muted-foreground size-4 shrink-0' />
+      )}
+    </button>
   )
 }
 
@@ -1385,23 +1561,21 @@ function IoList({ label, values }: { label: string; values: string[] }) {
 function Inspector({
   selectedNode,
   modelChoices,
+  groupChoices,
   skillChoices,
-  managedSkills,
   currentGroup,
   currentModel,
-  onAddSkill,
-  onDeleteSkill,
+  onDeleteNode,
   onUpdateNode,
   onUpdateSetting,
 }: {
   selectedNode: AgentFlowNode | null
   modelChoices: ModelChoice[]
+  groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
-  managedSkills: SkillChoice[]
   currentGroup?: string
   currentModel?: string
-  onAddSkill: (skill: SkillChoice) => void
-  onDeleteSkill: (skillValue: string) => void
+  onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
@@ -1425,17 +1599,13 @@ function Inspector({
             <NodeConfigPanel
               currentGroup={currentGroup}
               currentModel={currentModel}
+              groupChoices={groupChoices}
               modelChoices={modelChoices}
               node={selectedNode}
               skillChoices={skillChoices}
+              onDeleteNode={onDeleteNode}
               onUpdateNode={onUpdateNode}
               onUpdateSetting={onUpdateSetting}
-            />
-            <SkillManagerPanel
-              managedSkills={managedSkills}
-              skillChoices={skillChoices}
-              onAddSkill={onAddSkill}
-              onDeleteSkill={onDeleteSkill}
             />
           </div>
         ) : (
@@ -1451,17 +1621,21 @@ function Inspector({
 function NodeConfigPanel({
   node,
   modelChoices,
+  groupChoices,
   skillChoices,
   currentGroup,
   currentModel,
+  onDeleteNode,
   onUpdateNode,
   onUpdateSetting,
 }: {
   node: AgentFlowNode
   modelChoices: ModelChoice[]
+  groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   currentGroup?: string
   currentModel?: string
+  onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
@@ -1481,6 +1655,8 @@ function NodeConfigPanel({
         ...modelChoices,
       ]
   const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
+  const selectedGroup =
+    node.data.group || currentGroup || groupChoices[0]?.value || 'default'
 
   return (
     <section className='border-border/70 rounded-[8px] border p-3'>
@@ -1502,6 +1678,16 @@ function NodeConfigPanel({
         <Badge variant='outline' className='rounded-[6px]'>
           {meta.group}
         </Badge>
+        <Button
+          type='button'
+          size='icon'
+          variant='ghost'
+          className='text-muted-foreground hover:text-destructive size-8 rounded-[6px]'
+          onClick={() => onDeleteNode(node.id)}
+          title='删除节点'
+        >
+          <Trash2Icon className='size-3.5' />
+        </Button>
       </div>
 
       <div className='space-y-3'>
@@ -1513,6 +1699,23 @@ function NodeConfigPanel({
           />
         </LabeledField>
 
+        <LabeledField label='模型分组'>
+          <NativeSelect
+            value={selectedGroup}
+            onChange={(event) => onUpdateNode({ group: event.target.value })}
+            className='w-full'
+          >
+            {groupChoices.map((group) => (
+              <NativeSelectOption key={group.value} value={group.value}>
+                {group.label}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+          <div className='text-muted-foreground text-[11px] leading-relaxed'>
+            当前对话分组：{currentGroup || 'default'}
+          </div>
+        </LabeledField>
+
         <LabeledField label='执行模型'>
           <NativeSelect
             value={node.data.model}
@@ -1520,7 +1723,7 @@ function NodeConfigPanel({
             className='w-full'
           >
             <NativeSelectOptGroup
-              label={`当前对话分组: ${currentGroup || 'default'}`}
+              label={`节点分组: ${selectedGroup}`}
             >
               {choices
                 .filter((model) => model.source === 'current')
@@ -1614,8 +1817,8 @@ function ExecutionPreviewDock({
   onOpenChange: (open: boolean) => void
 }) {
   return (
-    <div className='pointer-events-none absolute right-3 bottom-3 left-3 z-10 flex justify-center'>
-      <section className='border-border/70 bg-background/95 pointer-events-auto w-full max-w-3xl overflow-hidden rounded-[8px] border shadow-sm backdrop-blur'>
+    <div className='pointer-events-none absolute bottom-3 left-3 z-10 flex w-[min(36rem,calc(100%-1.5rem))] justify-start'>
+      <section className='border-border/70 bg-background/95 pointer-events-auto w-full overflow-hidden rounded-[8px] border shadow-sm backdrop-blur'>
         <button
           type='button'
           className='hover:bg-accent/40 flex h-11 w-full items-center gap-2 px-3 text-left transition-colors'
@@ -1753,6 +1956,28 @@ function SettingControl({
     )
   }
 
+  const selectOptions = SETTING_SELECT_OPTIONS[label]
+  if (selectOptions) {
+    const options = selectOptions.includes(value)
+      ? selectOptions
+      : [value, ...selectOptions]
+    return (
+      <LabeledField label={label}>
+        <NativeSelect
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='w-full'
+        >
+          {options.map((option) => (
+            <NativeSelectOption key={option} value={option}>
+              {option}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </LabeledField>
+    )
+  }
+
   return (
     <LabeledField label={label}>
       <Input
@@ -1767,11 +1992,13 @@ function SettingControl({
 function SkillManagerPanel({
   skillChoices,
   managedSkills,
+  compact = false,
   onAddSkill,
   onDeleteSkill,
 }: {
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
+  compact?: boolean
   onAddSkill: (skill: SkillChoice) => void
   onDeleteSkill: (skillValue: string) => void
 }) {
@@ -1826,18 +2053,25 @@ function SkillManagerPanel({
   }
 
   return (
-    <section className='border-border/70 rounded-[8px] border p-3'>
-      <div className='mb-3 flex items-center gap-2'>
-        <div className='bg-muted flex size-8 items-center justify-center rounded-[8px]'>
-          <ArchiveIcon className='size-4' />
-        </div>
-        <div className='min-w-0 flex-1'>
-          <div className='truncate text-sm font-semibold'>Skill 管理</div>
-          <div className='text-muted-foreground truncate text-xs'>
-            内置、GitHub、商城和自定义
+    <section
+      className={cn(
+        'rounded-[8px]',
+        compact ? 'border-0 p-0' : 'border-border/70 border p-3'
+      )}
+    >
+      {!compact && (
+        <div className='mb-3 flex items-center gap-2'>
+          <div className='bg-muted flex size-8 items-center justify-center rounded-[8px]'>
+            <ArchiveIcon className='size-4' />
+          </div>
+          <div className='min-w-0 flex-1'>
+            <div className='truncate text-sm font-semibold'>Skill 管理</div>
+            <div className='text-muted-foreground truncate text-xs'>
+              内置、GitHub、商城和自定义
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <div className='space-y-3'>
         <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-2'>
@@ -2007,6 +2241,31 @@ function buildModelChoices(models: ModelOption[], currentModel?: string) {
   })
 }
 
+function buildGroupChoices(groups: GroupOption[], currentGroup?: string) {
+  const choices = groups.map((group) => ({
+    ...group,
+    label: group.label || group.value,
+  }))
+
+  if (currentGroup && !choices.some((group) => group.value === currentGroup)) {
+    choices.unshift({
+      label: currentGroup,
+      value: currentGroup,
+      ratio: 1,
+    })
+  }
+
+  if (choices.length > 0) return choices
+
+  return [
+    {
+      label: 'default',
+      value: 'default',
+      ratio: 1,
+    },
+  ]
+}
+
 function mergeSkillChoices(...groups: SkillChoice[][]) {
   const seen = new Set<string>()
   return groups.flat().filter((skill) => {
@@ -2135,6 +2394,7 @@ function normalizeNode(node: AgentFlowNode): AgentFlowNode {
       kind,
       title: data.title ?? meta.label,
       description: data.description ?? meta.description,
+      group: data.group,
       model:
         data.model ?? MODEL_FALLBACKS[meta.role][0]?.value ?? 'gpt-4.1-mini',
       skill: data.skill ?? pickDefaultSkill(kind),
@@ -2159,13 +2419,18 @@ function formatBlueprintTime(timestamp: number) {
   return `${month}-${day} ${hour}:${minute}`
 }
 
-function buildTemplates(models: ModelOption[], currentModel?: string) {
+function buildTemplates(
+  models: ModelOption[],
+  currentModel?: string,
+  currentGroup?: string
+) {
   return (Object.keys(NODE_META) as AgentNodeKind[]).map((kind) => {
     const meta = NODE_META[kind]
     return {
       kind,
       title: meta.label,
       description: meta.description,
+      group: currentGroup || 'default',
       model: pickDefaultModel(kind, models, currentModel),
       skill: pickDefaultSkill(kind),
       inputs: meta.inputs,
@@ -2411,6 +2676,7 @@ function createNodeFromTemplate(
       kind: template.kind,
       title: template.title,
       description: template.description,
+      group: template.group,
       model: template.model,
       skill: template.skill,
       inputs: [...template.inputs],
@@ -2431,7 +2697,11 @@ function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
     target: edge.target ?? '',
     type: 'smoothstep',
     animated: true,
+    deletable: true,
+    focusable: true,
+    interactionWidth: 18,
     markerEnd: { type: MarkerType.ArrowClosed },
+    selectable: true,
     style: {
       stroke: 'var(--primary)',
       strokeWidth: 1.8,

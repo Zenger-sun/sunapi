@@ -278,6 +278,7 @@ export function Playground() {
 
           {activeCapability === 'agent' && (
             <AgentWorkspace
+              groups={groups}
               models={models}
               currentModel={config.model}
               currentGroup={config.group}
