@@ -8,6 +8,11 @@ SunAPI Open Source Edition is a source distribution containing:
 The frontend includes AGPL-covered work derived from new-api.
 See front/LICENSE for the GNU Affero General Public License text.
 
+The SunAPI Creator Studio Components under front/src/features/playground/ are
+SunAPI-owned source-available proprietary code. They are not licensed under the
+new-api AGPL grant unless a specific file says otherwise. See
+LICENSE-CREATOR-STUDIO.
+
 new-api
 Copyright (c) QuantumNous and contributors.
 Original project: https://github.com/QuantumNous/new-api

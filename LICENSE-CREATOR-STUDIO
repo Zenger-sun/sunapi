@@ -1,0 +1,137 @@
+SunAPI Creator Studio Source-Available Commercial License v1.0
+
+Copyright (c) 2026 SunAPI Project Owner. All rights reserved.
+
+This license applies to the SunAPI Creator Studio Components, including:
+
+- front/src/features/playground/
+- any other file that expressly references this license
+
+This license is source-available and proprietary. It is not an open source
+license and is not intended to be approved by the Open Source Initiative.
+
+1. Definitions
+
+"Licensor" means the copyright owner of the SunAPI Creator Studio Components.
+
+"You" means any individual or legal entity receiving, accessing, copying,
+running, or otherwise using the SunAPI Creator Studio Components.
+
+"Creator Studio Components" means the files and materials listed above,
+including source code, UI code, configuration, documentation, generated design
+materials, and any copies or portions of them.
+
+"Commercial Use" means use for revenue-generating activity or business
+advantage, including sale, resale, paid support bundles, paid hosting, SaaS,
+managed services, internal business operations for a third party, embedding in a
+commercial product, or offering substantially similar functionality to others.
+
+"Written Permission" means a separate written agreement, license grant, or other
+document signed or expressly issued by the Licensor.
+
+2. Limited Permission
+
+Subject to your compliance with this license, the Licensor grants you a limited,
+revocable, non-exclusive, non-transferable, non-sublicensable permission to:
+
+- view the Creator Studio Components;
+- copy the Creator Studio Components only as part of an unmodified copy of the
+  SunAPI source distribution for evaluation or backup purposes;
+- build and run the unmodified Creator Studio Components as part of SunAPI for
+  personal evaluation, internal testing, or non-commercial demonstration.
+
+No other rights are granted.
+
+3. Restrictions
+
+Unless you have prior Written Permission from the Licensor, you must not:
+
+- modify, adapt, translate, transform, or create derivative works of the Creator
+  Studio Components;
+- distribute, publish, sell, rent, lease, sublicense, or otherwise make the
+  Creator Studio Components available to any third party, whether modified or
+  unmodified, except as part of an unmodified SunAPI source distribution
+  received under this license;
+- use the Creator Studio Components for Commercial Use;
+- offer the Creator Studio Components, or substantially similar functionality
+  derived from them, as a hosted service, SaaS product, managed service, desktop
+  application, plugin, template, marketplace item, or bundled commercial product;
+- remove, obscure, or alter copyright notices, license notices, proprietary
+  notices, or attribution notices;
+- claim that the Creator Studio Components are open source or licensed under an
+  OSI-approved open source license;
+- use SunAPI names, logos, trademarks, or product identifiers except as allowed
+  by the project's trademark policy or separate Written Permission.
+
+4. Contributions and Proposed Changes
+
+You may send proposed changes to the Licensor for review. By submitting a patch,
+pull request, issue attachment, design asset, or other contribution relating to
+the Creator Studio Components, you grant the Licensor a perpetual, worldwide,
+irrevocable, royalty-free license to use, reproduce, modify, distribute,
+sublicense, and commercialize that contribution in any form. The Licensor is not
+required to accept, publish, or maintain any contribution.
+
+This section does not give you permission to distribute modified versions of the
+Creator Studio Components to anyone other than the Licensor.
+
+5. Commercial Licensing
+
+To modify, redistribute, sell, host, embed, provide as a service, or otherwise
+use the Creator Studio Components beyond the limited permission in section 2,
+you must obtain prior Written Permission from the Licensor.
+
+Written Permission may impose additional payment, attribution, confidentiality,
+support, audit, branding, or distribution terms. If a separate written agreement
+conflicts with this license, the separate written agreement controls for the
+licensed party and only for the scope it expressly covers.
+
+6. Third-Party and Separately Licensed Code
+
+This license does not change the license of third-party dependencies,
+separately licensed files, or files outside the Creator Studio Components. If a
+file includes a different explicit license notice, that notice controls for that
+file.
+
+Nothing in this license grants rights to code derived from projects that are
+licensed under the GNU Affero General Public License, MIT License, or any other
+third-party license. Those materials remain governed by their own license terms.
+
+7. Reservation of Rights
+
+All rights not expressly granted in this license are reserved by the Licensor.
+The Creator Studio Components are protected by copyright and other applicable
+laws. Unauthorized use may constitute copyright infringement, breach of license,
+or violation of other rights.
+
+8. Termination
+
+Your permissions under this license terminate automatically if you violate any
+term. Upon termination, you must stop using the Creator Studio Components and
+delete all copies in your possession or control, except copies you are legally
+required to retain for compliance records.
+
+Termination does not limit any other remedies available to the Licensor.
+
+9. No Warranty
+
+The Creator Studio Components are provided "as is" and "as available", without
+warranty of any kind, whether express, implied, statutory, or otherwise,
+including warranties of merchantability, fitness for a particular purpose,
+title, and non-infringement.
+
+10. Limitation of Liability
+
+To the maximum extent permitted by applicable law, the Licensor will not be
+liable for any indirect, incidental, special, consequential, exemplary, or
+punitive damages, or for lost profits, lost revenue, lost data, business
+interruption, or procurement of substitute goods or services, arising from or
+related to the Creator Studio Components or this license.
+
+11. Governing Terms
+
+This license is the complete statement of permission for the Creator Studio
+Components unless replaced or supplemented by Written Permission from the
+Licensor. If any provision is unenforceable, the remaining provisions remain in
+effect.
+

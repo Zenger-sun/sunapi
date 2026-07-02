@@ -24,6 +24,10 @@ The release keeps frontend UI code, charts, icons, motion code, and public
 assets that live under `front/`. It does not import experimental assets from
 `front-new/`.
 
+The SunAPI Creator Studio Components under `front/src/features/playground/`
+are included in the source distribution as source-available proprietary code,
+not as OSI-approved open source code.
+
 ## AGPLv3 Obligations
 
 The frontend includes files derived from QuantumNous/new-api and marked with
@@ -39,6 +43,22 @@ GNU AGPLv3 notices. For AGPL-covered code:
 - Mark local modifications clearly.
 - Do not use technical protection measures to prevent users from exercising
   rights granted by the AGPL.
+
+## Creator Studio Proprietary Terms
+
+`front/src/features/playground/` is licensed under the SunAPI Creator Studio
+Source-Available Commercial License v1.0. Preserve:
+
+- `LICENSE-CREATOR-STUDIO`
+- `front/src/features/playground/LICENSE.md`
+- file headers that reference the Creator Studio license
+
+For these Creator Studio files, modification, redistribution, hosting, sale,
+resale, sublicensing, and commercial use require prior written permission from
+the SunAPI project owner unless a separate written agreement says otherwise.
+
+Do not describe the Creator Studio Components as open source. They are
+source-available proprietary code shipped alongside open source components.
 
 ## MIT Obligations
 
@@ -57,6 +77,7 @@ Before publishing a release:
 - [ ] Verify `front/dist`, `front/node_modules`, backend binaries, and caches are
       not committed into this open source tree.
 - [ ] Verify `NOTICE` is included in archives, Docker images, and installers.
+- [ ] Verify Creator Studio files still carry their proprietary license notices.
 - [ ] Verify the UI exposes source and attribution links where AGPL code is used.
 - [ ] Generate checksums for release archives and binaries.
 - [ ] Sign release artifacts when possible.

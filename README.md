@@ -22,6 +22,12 @@ covered by different licenses:
 - `front/` includes code derived from the new-api frontend and is distributed
   under the GNU Affero General Public License v3.0 or later where those file
   headers apply. See `front/LICENSE`.
+- `front/src/features/playground/` contains the SunAPI Creator Studio
+  Components and is licensed under the SunAPI Creator Studio Source-Available
+  Commercial License v1.0. See `LICENSE-CREATOR-STUDIO`. This part is
+  source-available proprietary code; modification, redistribution, hosting,
+  sale, resale, sublicensing, and commercial use require prior written
+  permission from the SunAPI project owner.
 - Files with explicit license headers keep those headers and terms.
 - The root `LICENSE` file is a license map, not a single-license override.
 
