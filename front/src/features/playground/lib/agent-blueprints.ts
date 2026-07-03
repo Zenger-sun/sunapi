@@ -11,7 +11,7 @@ hosting, sale, resale, sublicensing, or commercial use requires prior written
 permission from the SunAPI project owner.
 */
 
-export type AgentBlueprintStatus = 'pending' | 'running' | 'ended'
+export type AgentBlueprintStatus = 'pending' | 'running' | 'paused' | 'ended'
 
 export type AgentBlueprintCommand =
   | { type: 'new' }
@@ -120,6 +120,7 @@ export function getAgentBlueprintStatusLabel(status: AgentBlueprintStatus) {
   const labels: Record<AgentBlueprintStatus, string> = {
     pending: '待执行',
     running: '执行中',
+    paused: '已暂停',
     ended: '已结束',
   }
   return labels[status]
@@ -153,7 +154,12 @@ function normalizeBlueprintStatus(
   status: unknown,
   nodes: unknown[]
 ): AgentBlueprintStatus {
-  if (status === 'pending' || status === 'running' || status === 'ended') {
+  if (
+    status === 'pending' ||
+    status === 'running' ||
+    status === 'paused' ||
+    status === 'ended'
+  ) {
     return status
   }
 

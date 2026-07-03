@@ -16,6 +16,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type DragEvent,
   type ReactNode,
 } from 'react'
@@ -24,7 +25,10 @@ import {
   applyEdgeChanges,
   applyNodeChanges,
   Background,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
+  getSmoothStepPath,
   Handle,
   MarkerType,
   MiniMap,
@@ -35,6 +39,7 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type EdgeProps,
   type Node,
   type NodeChange,
   type NodeProps,
@@ -45,13 +50,18 @@ import {
   BellIcon,
   BotIcon,
   ChartNetworkIcon,
+  CheckCircle2Icon,
   ChevronDownIcon,
   ChevronUpIcon,
   ClockIcon,
+  CpuIcon,
+  ExternalLinkIcon,
   FileSpreadsheetIcon,
   FileTextIcon,
+  FilterIcon,
   GlobeIcon,
   ImageIcon,
+  MonitorIcon,
   NetworkIcon,
   PlayIcon,
   PlusIcon,
@@ -63,6 +73,7 @@ import {
   StopCircleIcon,
   Table2Icon,
   Trash2Icon,
+  XIcon,
   ZapIcon,
   type LucideIcon,
 } from 'lucide-react'
@@ -75,6 +86,7 @@ import {
   NativeSelectOptGroup,
   NativeSelectOption,
 } from '@/components/ui/native-select'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
   AGENT_BLUEPRINT_COMMAND_EVENT,
@@ -95,10 +107,12 @@ type AgentNodeKind =
   | 'transform'
   | 'image'
   | 'report'
+  | 'webpage'
   | 'notify'
   | 'stop'
 
 type AgentNodeStatus = 'ready' | 'waiting' | 'running' | 'done'
+type AgentNodeLogStatus = 'pending' | 'running' | 'completed' | 'stopped'
 
 type ModelRole = 'system' | 'browser' | 'fast' | 'reasoning' | 'image'
 
@@ -114,6 +128,21 @@ type AgentNodeData = {
   settings: Record<string, string>
   status: AgentNodeStatus
 }
+
+type AgentNodeExecutionLog = {
+  nodeId: string
+  status: AgentNodeLogStatus
+  startedAt?: number
+  endedAt?: number
+  durationMs?: number
+  message: string
+  inputSummary: string[]
+  outputSummary: string[]
+  steps: string[]
+  error?: string
+}
+
+type AgentExecutionLogMap = Record<string, AgentNodeExecutionLog>
 
 type AgentFlowNode = Node<AgentNodeData, 'agentNode'>
 type AgentFlowEdge = Edge
@@ -173,10 +202,19 @@ type SavedAgentBlueprint = {
   createdAt: number
   updatedAt: number
   status?: AgentBlueprintStatus
+  executionLog?: AgentExecutionLogMap
 }
 
 const DRAG_NODE_TYPE = 'application/sunapi-agent-node'
 const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
+
+const NO_SKILL_VALUE = ''
+const NO_SKILL_CHOICE: SkillChoice = {
+  label: '不使用 Skill',
+  value: NO_SKILL_VALUE,
+  description: '该节点仅按基础提示词执行，不叠加任何 Skill 优化。',
+  source: 'built-in',
+}
 
 const BASE_SKILL_CHOICES: SkillChoice[] = [
   {
@@ -229,6 +267,53 @@ const BASE_SKILL_CHOICES: SkillChoice[] = [
   },
 ]
 
+// 内置 Skill 的展示元数据：图标、颜色、可用状态
+const BUILTIN_SKILL_META: Record<
+  string,
+  { icon: LucideIcon; accent: string; badge: string }
+> = {
+  'skill.system-orchestration': {
+    icon: CpuIcon,
+    accent: 'bg-slate-500/12 text-slate-600 dark:text-slate-400',
+    badge: '可用',
+  },
+  'skill.schedule-guard': {
+    icon: ClockIcon,
+    accent: 'bg-sky-500/12 text-sky-600 dark:text-sky-400',
+    badge: '可用',
+  },
+  'skill.browser-reading': {
+    icon: GlobeIcon,
+    accent: 'bg-blue-500/12 text-blue-600 dark:text-blue-400',
+    badge: '可用',
+  },
+  'skill.network-fetch': {
+    icon: NetworkIcon,
+    accent: 'bg-cyan-500/12 text-cyan-600 dark:text-cyan-400',
+    badge: '可用',
+  },
+  'skill.data-cleaning': {
+    icon: FilterIcon,
+    accent: 'bg-violet-500/12 text-violet-600 dark:text-violet-400',
+    badge: '可用',
+  },
+  'skill.image-generation': {
+    icon: ImageIcon,
+    accent: 'bg-fuchsia-500/12 text-fuchsia-600 dark:text-fuchsia-400',
+    badge: '可用',
+  },
+  'skill.report-writing': {
+    icon: FileTextIcon,
+    accent: 'bg-amber-500/12 text-amber-600 dark:text-amber-400',
+    badge: '可用',
+  },
+  'skill.notification-routing': {
+    icon: BellIcon,
+    accent: 'bg-rose-500/12 text-rose-600 dark:text-rose-400',
+    badge: '可用',
+  },
+}
+
 const MARKETPLACE_SKILLS: SkillChoice[] = [
   {
     label: '电商运营分析 Skill',
@@ -279,7 +364,27 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   超时: ['10s', '30s', '60s', '120s'],
   重试: ['0 次', '1 次', '2 次', '3 次'],
+  数据类型: [
+    '自动识别',
+    '商品运营数据',
+    '交易/订单数据',
+    '用户行为数据',
+    '日志/事件数据',
+    '财务/对账数据',
+    '通用表格/CSV',
+    'JSON 对象/数组',
+    '纯文本',
+  ],
+  输出格式: [
+    '自动整理',
+    '标准表格',
+    'Markdown 表格',
+    'CSV',
+    'JSON 数组',
+    '关键值摘要',
+  ],
   表格字段: [
+    '自动按数据类型推断',
     '商品名称, 曝光, 浏览, 想要, 转化建议',
     '商品 ID, 标题, 价格, 曝光, 浏览, 想要',
     '日期, 渠道, 访客, 成交, 转化率',
@@ -296,6 +401,8 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   确认: ['发送前确认', '自动发送', '失败时确认'],
   结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
   归档: ['保存执行日志', '保存日报与日志', '仅保存错误', '不保存'],
+  日报模板: ['默认模板', '简洁版', '详细分析版', '自定义模板'],
+  输出模式: ['输出网页 + 数据', '仅输出数据'],
 }
 
 const MODEL_FALLBACKS: Record<ModelRole, ModelChoice[]> = {
@@ -427,10 +534,12 @@ const NODE_META: Record<
     role: 'fast',
     icon: NetworkIcon,
     accent: 'bg-cyan-500/12 text-cyan-700 dark:text-cyan-300',
-    description: '调用接口或网页请求，获取结构化原始数据。',
-    inputs: ['网址', '请求参数', '任务描述'],
+    description: '发起裸 HTTP 请求，获取接口或页面的结构化原始数据，不使用浏览器登录态。',
+    inputs: ['任务描述'],
     outputs: ['JSON 数据', '请求日志'],
     settings: {
+      请求URL: 'https://api.example.com/data',
+      请求参数: '',
       方法: 'GET',
       超时: '30s',
       重试: '2 次',
@@ -442,11 +551,15 @@ const NODE_META: Record<
     role: 'reasoning',
     icon: Table2Icon,
     accent: 'bg-violet-500/12 text-violet-700 dark:text-violet-300',
-    description: '清洗、归并、排序数据，并按模板输出表格。',
-    inputs: ['原始数据', '模板', '任务描述'],
+    description: '清洗、归并、排序数据；有模板时按模板输出，没有模板时按数据类型自动整理。',
+    inputs: ['原始数据', '字段/格式模板', '任务描述'],
     outputs: ['标准表格', '关键结论'],
     settings: {
-      表格字段: '商品名, 曝光, 浏览, 想要, 转化建议',
+      数据类型: '自动识别',
+      输出格式: '自动整理',
+      表格字段: '自动按数据类型推断',
+      整理模板: '未上传模板',
+      模板内容: '',
       去重规则: '按商品 ID',
       缺失处理: '保留空值并标注',
     },
@@ -472,13 +585,12 @@ const NODE_META: Record<
     role: 'reasoning',
     icon: FileTextIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
-    description: '把表格、结论和图片整理成日报文档。',
+    description: '把表格、结论和图片整理成日报文档；格式、语气、标题等要求写在任务描述里。',
     inputs: ['标准表格', '关键结论', '图片 URL'],
-    outputs: ['Markdown 日报', 'CSV 表格'],
+    outputs: ['Markdown 日报', 'CSV 表格', '归档路径'],
     settings: {
-      标题: '闲鱼每日经营日报',
-      格式: 'Markdown + CSV',
-      语气: '运营复盘',
+      模板目录: '/templates/reports',
+      输出目录: '/output/reports',
     },
   },
   notify: {
@@ -495,18 +607,35 @@ const NODE_META: Record<
       确认: '发送前确认',
     },
   },
+  webpage: {
+    label: '输出网页',
+    group: '输出',
+    role: 'reasoning',
+    icon: MonitorIcon,
+    accent: 'bg-teal-500/12 text-teal-700 dark:text-teal-300',
+    description: '将日报数据渲染成可交互的网页，支持自定义模板，后续只更新数据无需重新生成网页。',
+    inputs: ['Markdown 日报', 'CSV 表格'],
+    outputs: ['网页 URL', '数据文件'],
+    settings: {
+      输出目录: '/output/web-reports',
+      网页模板: '默认模板',
+      模板目录: '/templates/web',
+      输出模式: '输出网页 + 数据',
+    },
+  },
   stop: {
     label: '停止',
     group: '触发',
     role: 'system',
     icon: StopCircleIcon,
     accent: 'bg-slate-500/12 text-slate-700 dark:text-slate-300',
-    description: '结束循环或归档本轮执行记录。',
+    description: '可选控制节点，用于循环任务、中断流程或单独归档执行记录。',
     inputs: ['执行结果'],
     outputs: ['归档状态'],
     settings: {
       结束方式: '本轮完成后停止',
       归档: '保存执行日志',
+      输出目录: '/output/agent-runs',
       归档位置: '工作区 / 日报归档',
     },
   },
@@ -519,7 +648,7 @@ const PALETTE_GROUPS: Array<{
   { title: '触发', kinds: ['start', 'schedule', 'stop'] },
   { title: '采集', kinds: ['browser', 'request'] },
   { title: '智能处理', kinds: ['transform', 'image'] },
-  { title: '输出', kinds: ['report', 'notify'] },
+  { title: '输出', kinds: ['report', 'webpage', 'notify'] },
 ]
 
 const INITIAL_EDGES: AgentFlowEdge[] = [
@@ -529,7 +658,6 @@ const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-transform-image', source: 'transform', target: 'image' },
   { id: 'e-transform-report', source: 'transform', target: 'report' },
   { id: 'e-image-report', source: 'image', target: 'report' },
-  { id: 'e-report-stop', source: 'report', target: 'stop' },
 ]
 
 export function AgentWorkspace({
@@ -581,6 +709,9 @@ export function AgentWorkspace({
     () =>
       initialBlueprint?.edges ?? INITIAL_EDGES.map((edge) => decorateEdge(edge))
   )
+  const [executionLog, setExecutionLog] = useState<AgentExecutionLogMap>(
+    () => initialBlueprint?.executionLog ?? {}
+  )
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     initialBlueprint?.nodes[0]?.id ?? 'browser'
   )
@@ -609,6 +740,13 @@ export function AgentWorkspace({
           (edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target)
         )
       )
+      setExecutionLog((current) => {
+        const next = { ...current }
+        removedIds.forEach((id) => {
+          delete next[id]
+        })
+        return next
+      })
       setSelectedNodeId((current) => (removedIds.has(current) ? '' : current))
     }
   }, [])
@@ -630,6 +768,12 @@ export function AgentWorkspace({
       setEdges((current) =>
         current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId)
       )
+      setExecutionLog((current) => {
+        if (!current[nodeId]) return current
+        const next = { ...current }
+        delete next[nodeId]
+        return next
+      })
       setSelectedNodeId((current) =>
         current === nodeId ? fallbackNodeId : current
       )
@@ -644,6 +788,7 @@ export function AgentWorkspace({
   const handleReset = useCallback(() => {
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+    setExecutionLog({})
     setSelectedNodeId('browser')
   }, [templates])
 
@@ -653,6 +798,7 @@ export function AgentWorkspace({
     setLastSavedAt(null)
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+    setExecutionLog({})
     setSelectedNodeId('browser')
   }, [templates])
 
@@ -669,6 +815,7 @@ export function AgentWorkspace({
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       status: getBlueprintStatus(nodes),
+      executionLog,
     }
     const next = [
       blueprint,
@@ -681,7 +828,7 @@ export function AgentWorkspace({
     setBlueprints(next)
     writeSavedBlueprints(next)
     notifyAgentBlueprintsChanged()
-  }, [blueprintTitle, blueprints, currentBlueprintId, edges, nodes])
+  }, [blueprintTitle, blueprints, currentBlueprintId, edges, executionLog, nodes])
 
   const handleLoadBlueprint = useCallback((blueprint: SavedAgentBlueprint) => {
     setCurrentBlueprintId(blueprint.id)
@@ -689,6 +836,7 @@ export function AgentWorkspace({
     setLastSavedAt(blueprint.updatedAt)
     setNodes(blueprint.nodes)
     setEdges(blueprint.edges)
+    setExecutionLog(blueprint.executionLog ?? {})
     setSelectedNodeId(blueprint.nodes[0]?.id ?? '')
   }, [])
 
@@ -712,19 +860,27 @@ export function AgentWorkspace({
       setBlueprintTitle('新的智能体蓝图')
       setNodes(createInitialNodes(templates))
       setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+      setExecutionLog({})
       setSelectedNodeId('browser')
     },
     [blueprints, currentBlueprintId, handleLoadBlueprint, templates]
   )
 
   const handleRunPreview = useCallback(() => {
-    const orderedIds = executionNodes.map((node) => node.id)
+    const statusById = new Map<string, AgentNodeStatus>()
+    executionNodes.forEach((node) => {
+      statusById.set(node.id, 'done')
+    })
+    const nextExecutionLog = buildPreviewExecutionLog(
+      executionNodes,
+      statusById,
+      skillChoices
+    )
+    setExecutionLog(nextExecutionLog)
     setNodes((current) => {
       const nextNodes = current.map((node) => {
-        const index = orderedIds.indexOf(node.id)
-        if (index === -1) return node
-        const status: AgentNodeStatus =
-          index === 0 ? 'running' : index < 4 ? 'done' : 'waiting'
+        const status = statusById.get(node.id)
+        if (!status) return node
         return { ...node, data: { ...node.data, status } }
       })
       if (currentBlueprintId) {
@@ -735,6 +891,7 @@ export function AgentWorkspace({
                 nodes: nextNodes,
                 updatedAt: Date.now(),
                 status: getBlueprintStatus(nextNodes),
+                executionLog: nextExecutionLog,
               }
             : blueprint
         )
@@ -744,7 +901,37 @@ export function AgentWorkspace({
       }
       return nextNodes
     })
-  }, [blueprints, currentBlueprintId, executionNodes])
+  }, [blueprints, currentBlueprintId, executionNodes, skillChoices])
+
+  const handleStopPreview = useCallback(() => {
+    const stoppedAt = Date.now()
+    const nextExecutionLog = stopRunningExecutionLogs(executionLog, stoppedAt)
+    setExecutionLog(nextExecutionLog)
+    setNodes((current) => {
+      const nextNodes = current.map((node) =>
+        node.data.status === 'running'
+          ? { ...node, data: { ...node.data, status: 'waiting' as AgentNodeStatus } }
+          : node
+      )
+      if (currentBlueprintId) {
+        const nextBlueprints = blueprints.map((blueprint) =>
+          blueprint.id === currentBlueprintId
+            ? {
+                ...blueprint,
+                nodes: nextNodes,
+                updatedAt: Date.now(),
+                status: 'paused' as const,
+                executionLog: nextExecutionLog,
+              }
+            : blueprint
+        )
+        setBlueprints(nextBlueprints)
+        writeSavedBlueprints(nextBlueprints)
+        notifyAgentBlueprintsChanged()
+      }
+      return nextNodes
+    })
+  }, [blueprints, currentBlueprintId, executionLog])
 
   const handleAddSkill = useCallback((skill: SkillChoice) => {
     setManagedSkills((current) => {
@@ -807,6 +994,14 @@ export function AgentWorkspace({
     [handleUpdateNode, selectedNode]
   )
 
+  const handleSetNodeSkill = useCallback((nodeId: string, skill: string) => {
+    setNodes((current) =>
+      current.map((node) =>
+        node.id === nodeId ? { ...node, data: { ...node.data, skill } } : node
+      )
+    )
+  }, [])
+
   useEffect(() => {
     if (!seedPrompt || seedPrompt === lastSeedPromptRef.current) return
 
@@ -815,6 +1010,7 @@ export function AgentWorkspace({
     setBlueprintTitle(title)
     setCurrentBlueprintId(null)
     setLastSavedAt(null)
+    setExecutionLog({})
     setNodes(() =>
       createInitialNodes(templates).map((node) =>
         node.id === 'start'
@@ -883,6 +1079,7 @@ export function AgentWorkspace({
         currentGroup={currentGroup}
         currentModel={currentModel}
         edges={edges}
+        executionLog={executionLog}
         executionNodes={executionNodes}
         groupChoices={groupChoices}
         lastSavedAt={lastSavedAt}
@@ -900,9 +1097,11 @@ export function AgentWorkspace({
         onNodesChange={onNodesChange}
         onReset={handleReset}
         onRunPreview={handleRunPreview}
+        onStopPreview={handleStopPreview}
         onSaveBlueprint={handleSaveBlueprint}
         onSearchChange={setSearch}
         onSelectNode={setSelectedNodeId}
+        onSetNodeSkill={handleSetNodeSkill}
         onTitleChange={setBlueprintTitle}
         onUpdateNode={handleUpdateNode}
         onUpdateSetting={handleUpdateSetting}
@@ -918,6 +1117,7 @@ type BlueprintWorkspaceProps = {
   edges: AgentFlowEdge[]
   selectedNode: AgentFlowNode | null
   executionNodes: AgentFlowNode[]
+  executionLog: AgentExecutionLogMap
   modelChoices: ModelChoice[]
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
@@ -942,8 +1142,10 @@ type BlueprintWorkspaceProps = {
   onUpdateSetting: (key: string, value: string) => void
   onAddSkill: (skill: SkillChoice) => void
   onDeleteSkill: (skillValue: string) => void
+  onSetNodeSkill: (nodeId: string, skill: string) => void
   onReset: () => void
   onRunPreview: () => void
+  onStopPreview: () => void
 }
 
 function BlueprintWorkspace({
@@ -951,6 +1153,7 @@ function BlueprintWorkspace({
   edges,
   selectedNode,
   executionNodes,
+  executionLog,
   modelChoices,
   groupChoices,
   skillChoices,
@@ -975,8 +1178,10 @@ function BlueprintWorkspace({
   onUpdateSetting,
   onAddSkill,
   onDeleteSkill,
+  onSetNodeSkill,
   onReset,
   onRunPreview,
+  onStopPreview,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
   const filteredGroups = useMemo(() => filterPaletteGroups(search), [search])
@@ -986,10 +1191,22 @@ function BlueprintWorkspace({
   const nodeTypes = useMemo(
     () => ({
       agentNode: (props: NodeProps<AgentFlowNode>) => (
-        <BlueprintNode {...props} skillChoices={skillChoices} />
+        <BlueprintNode
+          {...props}
+          skillChoices={skillChoices}
+          onSetSkill={onSetNodeSkill}
+        />
       ),
     }),
-    [skillChoices]
+    [onSetNodeSkill, skillChoices]
+  )
+  const edgeTypes = useMemo(
+    () => ({
+      deletable: (props: EdgeProps<AgentFlowEdge>) => (
+        <DeletableEdge {...props} onDeleteEdge={onDeleteEdge} />
+      ),
+    }),
+    [onDeleteEdge]
   )
 
   const handleDrop = useCallback(
@@ -1079,24 +1296,30 @@ function BlueprintWorkspace({
                 <SaveIcon className='size-3.5' />
                 保存
               </Button>
-              <Button
-                type='button'
-                size='sm'
-                className='h-8 gap-1.5 rounded-[6px] px-2'
-                onClick={onRunPreview}
-              >
-                <ZapIcon className='size-3.5' />
-                试运行
-              </Button>
+              {currentBlueprintStatus === 'running' ? (
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='destructive'
+                  className='h-8 gap-1.5 rounded-[6px] px-2'
+                  onClick={onStopPreview}
+                >
+                  <StopCircleIcon className='size-3.5' />
+                  停止
+                </Button>
+              ) : (
+                <Button
+                  type='button'
+                  size='sm'
+                  className='h-8 gap-1.5 rounded-[6px] px-2'
+                  onClick={onRunPreview}
+                >
+                  <ZapIcon className='size-3.5' />
+                  {currentBlueprintStatus === 'paused' ? '继续' : '试运行'}
+                </Button>
+              )}
             </div>
           </div>
-
-          <ExecutionPreviewDock
-            executionNodes={executionNodes}
-            isOpen={isPreviewOpen}
-            skillChoices={skillChoices}
-            onOpenChange={setIsPreviewOpen}
-          />
 
           <ReactFlow<AgentFlowNode, AgentFlowEdge>
             className='agent-blueprint-canvas'
@@ -1114,6 +1337,7 @@ function BlueprintWorkspace({
             }}
             deleteKeyCode={['Backspace', 'Delete']}
             edges={edges}
+            edgeTypes={edgeTypes}
             edgesFocusable
             elementsSelectable
             fitView
@@ -1141,8 +1365,8 @@ function BlueprintWorkspace({
               gap={20}
             />
             <Controls
-              className='!right-3 !bottom-[174px] rounded-[8px] border shadow-none'
-              position='bottom-right'
+              className='!left-3 !bottom-3 rounded-[8px] border shadow-none'
+              position='bottom-left'
             />
             <MiniMap
               className='border-border/70 bg-background/90 !right-3 !bottom-3 overflow-hidden rounded-[8px] border shadow-sm'
@@ -1157,6 +1381,16 @@ function BlueprintWorkspace({
             />
           </ReactFlow>
         </main>
+
+        <ExecutionPreviewDock
+          executionLog={executionLog}
+          executionNodes={executionNodes}
+          isOpen={isPreviewOpen}
+          selectedNode={selectedNode}
+          skillChoices={skillChoices}
+          onSelectNode={onSelectNode}
+          onOpenChange={setIsPreviewOpen}
+        />
       </div>
 
       <aside className='border-border/70 bg-background hidden w-82 shrink-0 flex-col border-l xl:flex'>
@@ -1177,7 +1411,6 @@ function BlueprintWorkspace({
 }
 
 function Palette({
-  activePanel,
   groups,
   skillChoices,
   managedSkills,
@@ -1186,7 +1419,6 @@ function Palette({
   onAddNode,
   onAddSkill,
   onDeleteSkill,
-  onPanelChange,
 }: {
   activePanel: AgentToolPanel
   groups: typeof PALETTE_GROUPS
@@ -1201,46 +1433,61 @@ function Palette({
 }) {
   return (
     <div className='flex min-h-0 flex-1 flex-col'>
-      <div className='border-border/70 border-b px-3 py-3'>
-        <div className='flex items-center gap-2'>
-          <div className='bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-[8px]'>
-            <BotIcon className='size-4' />
+      <Tabs defaultValue='components' className='flex min-h-0 flex-1 flex-col'>
+        {/* 顶部：标题 + Tab 导航 */}
+        <div className='border-border/70 shrink-0 border-b px-3 pt-3'>
+          <div className='mb-2.5 flex items-center gap-2'>
+            <div className='bg-primary text-primary-foreground flex size-7 shrink-0 items-center justify-center rounded-[7px]'>
+              <BotIcon className='size-3.5' />
+            </div>
+            <span className='text-sm font-semibold'>工具库</span>
           </div>
-          <div className='min-w-0'>
-            <div className='truncate text-sm font-semibold'>工具库</div>
-            <div className='text-muted-foreground truncate text-xs'>
-              组件与外部 Skill
+
+          <TabsList className='h-7 w-full rounded-none border-0 bg-transparent p-0 gap-0'>
+            <TabsTrigger
+              value='components'
+              className='h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+            >
+              组件
+            </TabsTrigger>
+            <TabsTrigger
+              value='skills'
+              className='h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+            >
+              Skill
+              <span className='bg-muted text-muted-foreground ml-1 rounded-full px-1.5 py-0 text-[10px] leading-[14px]'>
+                {skillChoices.length}
+              </span>
+            </TabsTrigger>
+          </TabsList>
+        </div>
+
+        {/* ── 组件 Tab ── */}
+        <TabsContent
+          value='components'
+          className='m-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden'
+        >
+          {/* 搜索框 */}
+          <div className='shrink-0 px-2 py-2'>
+            <div className='relative'>
+              <SearchIcon className='text-muted-foreground absolute top-1/2 left-2.5 size-3 -translate-y-1/2' />
+              <Input
+                value={search}
+                onChange={(e) => onSearchChange(e.target.value)}
+                placeholder='搜索组件…'
+                className='h-7 rounded-[7px] pl-7 text-xs'
+              />
             </div>
           </div>
-        </div>
-        <div className='relative mt-3'>
-          <SearchIcon className='text-muted-foreground absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2' />
-          <Input
-            value={search}
-            onChange={(event) => onSearchChange(event.target.value)}
-            placeholder='搜索组件'
-            className='h-8 rounded-[8px] pl-8 text-xs'
-          />
-        </div>
-      </div>
 
-      <div className='min-h-0 flex-1 overflow-y-auto px-2 py-2'>
-        <ToolPanelToggle
-          active={activePanel === 'components'}
-          description='内部创建的蓝图节点'
-          icon={BotIcon}
-          title='组件'
-          onClick={() => onPanelChange('components')}
-        />
-
-        {activePanel === 'components' && (
-          <div className='pt-2'>
+          {/* 组件列表（可滚动） */}
+          <div className='min-h-0 flex-1 overflow-y-auto px-2 pb-3'>
             {groups.map((group) => (
-              <div key={group.title} className='mb-3'>
-                <div className='text-muted-foreground px-1.5 pb-1.5 text-[10px] font-medium tracking-wider uppercase'>
+              <div key={group.title} className='mb-1'>
+                <div className='text-muted-foreground px-1 pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-widest'>
                   {group.title}
                 </div>
-                <div className='grid gap-1.5'>
+                <div className='grid gap-0.5'>
                   {group.kinds.map((kind) => (
                     <PaletteItem key={kind} kind={kind} onAddNode={onAddNode} />
                   ))}
@@ -1248,30 +1495,23 @@ function Palette({
               </div>
             ))}
           </div>
-        )}
-      </div>
+        </TabsContent>
 
-      <div className='border-border/70 bg-background/95 sticky bottom-0 border-t px-2 py-2 backdrop-blur'>
-        <ToolPanelToggle
-          active={activePanel === 'skills'}
-          description='GitHub、商城与自定义外部工具'
-          icon={ArchiveIcon}
-          title='Skill'
-          onClick={() => onPanelChange('skills')}
-        />
-
-        {activePanel === 'skills' && (
-          <div className='max-h-[54vh] overflow-y-auto pt-2'>
+        {/* ── Skill Tab ── */}
+        <TabsContent
+          value='skills'
+          className='m-0 min-h-0 flex-1 overflow-y-auto data-[state=inactive]:hidden'
+        >
+          <div className='px-2 py-2'>
             <SkillManagerPanel
-              compact
               managedSkills={managedSkills}
               skillChoices={skillChoices}
               onAddSkill={onAddSkill}
               onDeleteSkill={onDeleteSkill}
             />
           </div>
-        )}
-      </div>
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }
@@ -1279,9 +1519,9 @@ function Palette({
 function ToolPanelToggle({
   active,
   description,
-  icon: Icon,
-  title,
-  onClick,
+  icon: _Icon,
+  title: _title,
+  onClick: _onClick,
 }: {
   active: boolean
   description: string
@@ -1289,31 +1529,8 @@ function ToolPanelToggle({
   title: string
   onClick: () => void
 }) {
-  return (
-    <button
-      type='button'
-      className={cn(
-        'border-border/70 bg-background hover:bg-accent/50 flex h-12 w-full items-center gap-2 rounded-[8px] border px-2 text-left transition-colors',
-        active && 'border-primary/45 bg-primary/5'
-      )}
-      onClick={onClick}
-    >
-      <span className='bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
-        <Icon className='size-3.5' />
-      </span>
-      <span className='min-w-0 flex-1'>
-        <span className='block truncate text-sm font-medium'>{title}</span>
-        <span className='text-muted-foreground block truncate text-[11px]'>
-          {description}
-        </span>
-      </span>
-      {active ? (
-        <ChevronDownIcon className='text-muted-foreground size-4 shrink-0' />
-      ) : (
-        <ChevronUpIcon className='text-muted-foreground size-4 shrink-0' />
-      )}
-    </button>
-  )
+  // Kept for API compatibility but no longer rendered in the new Palette design
+  return null
 }
 
 function CompactPalette({
@@ -1359,12 +1576,11 @@ function PaletteItem({
 }) {
   const meta = NODE_META[kind]
   const Icon = meta.icon
-  const defaultModel = pickDefaultModel(kind, [], undefined)
 
   return (
     <button
       type='button'
-      className='border-border/70 bg-background hover:bg-accent/50 flex min-h-18 w-full items-start gap-2 rounded-[8px] border p-2 text-left transition-colors'
+      className='hover:bg-accent/60 group flex w-full items-center gap-2.5 rounded-[7px] px-2 py-2 text-left transition-colors'
       draggable
       onClick={() => onAddNode(kind)}
       onDragStart={(event) => {
@@ -1374,34 +1590,96 @@ function PaletteItem({
     >
       <span
         className={cn(
-          'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-[6px]',
+          'flex size-7 shrink-0 items-center justify-center rounded-[6px]',
           meta.accent
         )}
       >
         <Icon className='size-3.5' />
       </span>
       <span className='min-w-0 flex-1'>
-        <span className='flex items-center justify-between gap-2'>
-          <span className='truncate text-sm font-medium'>{meta.label}</span>
-          <PlusIcon className='text-muted-foreground size-3.5 shrink-0' />
-        </span>
-        <span className='text-muted-foreground mt-0.5 line-clamp-2 text-xs leading-snug'>
+        <span className='block truncate text-xs font-medium'>{meta.label}</span>
+        <span className='text-muted-foreground line-clamp-2 block whitespace-normal break-words text-[10px] leading-snug'>
           {meta.description}
         </span>
-        <span className='text-muted-foreground mt-1 block truncate text-[11px]'>
-          默认: {defaultModel}
-        </span>
       </span>
+      <PlusIcon className='text-muted-foreground size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
     </button>
   )
 }
 
+function DeletableEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  markerEnd,
+  style,
+  selected,
+  onDeleteEdge,
+}: EdgeProps<AgentFlowEdge> & { onDeleteEdge: (edgeId: string) => void }) {
+  const [isHovered, setIsHovered] = useState(false)
+  const [edgePath, labelX, labelY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    targetX,
+    targetY,
+    sourcePosition,
+    targetPosition,
+  })
+  const showButton = isHovered || selected
+
+  return (
+    <>
+      <BaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={style} />
+      {/* Wider invisible path to make hovering the thin edge easier */}
+      <path
+        d={edgePath}
+        fill='none'
+        stroke='transparent'
+        strokeWidth={20}
+        onMouseEnter={() => setIsHovered(true)}
+        onMouseLeave={() => setIsHovered(false)}
+      />
+      <EdgeLabelRenderer>
+        <button
+          type='button'
+          className={cn(
+            'border-border/70 bg-background text-muted-foreground hover:border-destructive hover:text-destructive absolute flex size-5 items-center justify-center rounded-full border shadow-sm transition-opacity',
+            showButton ? 'opacity-100' : 'pointer-events-none opacity-0'
+          )}
+          style={{
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            pointerEvents: showButton ? 'all' : 'none',
+          }}
+          onMouseEnter={() => setIsHovered(true)}
+          onMouseLeave={() => setIsHovered(false)}
+          onClick={(event) => {
+            event.stopPropagation()
+            onDeleteEdge(id)
+          }}
+          title='删除连线'
+        >
+          <XIcon className='size-3' />
+        </button>
+      </EdgeLabelRenderer>
+    </>
+  )
+}
+
 function BlueprintNode({
+  id,
   data,
   selected,
   isConnectable,
   skillChoices,
-}: NodeProps<AgentFlowNode> & { skillChoices: SkillChoice[] }) {
+  onSetSkill,
+}: NodeProps<AgentFlowNode> & {
+  skillChoices: SkillChoice[]
+  onSetSkill: (nodeId: string, skill: string) => void
+}) {
   const meta = NODE_META[data.kind]
   const Icon = meta.icon
   const canReceive = data.inputs.length > 0
@@ -1471,7 +1749,11 @@ function BlueprintNode({
             {data.model}
           </span>
         </div>
-        <SkillLinkBadge skill={data.skill} skillChoices={skillChoices} />
+        <SkillLinkBadge
+          skill={data.skill}
+          skillChoices={skillChoices}
+          onSelectSkill={(value) => onSetSkill(id, value)}
+        />
         <div className='grid grid-cols-2 gap-2'>
           <IoList label='输入' values={data.inputs} />
           <IoList label='输出' values={data.outputs} />
@@ -1515,22 +1797,62 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
 function SkillLinkBadge({
   skill,
   skillChoices,
+  onSelectSkill,
 }: {
   skill: string
   skillChoices: SkillChoice[]
+  onSelectSkill: (value: string) => void
 }) {
+  const hasSkill = Boolean(skill)
   const skillChoice = getSkillChoice(skill, skillChoices)
 
   return (
-    <div className='flex items-center gap-2 rounded-[6px] border border-fuchsia-500/20 bg-fuchsia-500/8 px-2 py-1.5'>
-      <span className='flex items-center gap-1.5 text-[11px] font-medium text-fuchsia-700 dark:text-fuchsia-300'>
-        <span className='size-2 rounded-full bg-fuchsia-500' />
+    <div
+      className={cn(
+        'flex items-center gap-1.5 rounded-[6px] border px-2 py-1.5',
+        hasSkill
+          ? 'border-fuchsia-500/20 bg-fuchsia-500/8'
+          : 'border-border/60 border-dashed'
+      )}
+    >
+      <span
+        className={cn(
+          'flex shrink-0 items-center gap-1.5 text-[11px] font-medium',
+          hasSkill
+            ? 'text-fuchsia-700 dark:text-fuchsia-300'
+            : 'text-muted-foreground'
+        )}
+      >
+        <span
+          className={cn(
+            'size-2 rounded-full',
+            hasSkill ? 'bg-fuchsia-500' : 'bg-muted-foreground/40'
+          )}
+        />
         Skill
       </span>
-      <span className='h-px min-w-5 flex-1 bg-fuchsia-500/40' />
-      <span className='min-w-0 truncate text-xs font-medium'>
-        {skillChoice.label}
-      </span>
+      {!hasSkill && <PlusIcon className='text-muted-foreground size-3 shrink-0' />}
+      <select
+        value={skill}
+        onClick={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+        onChange={(event) => {
+          event.stopPropagation()
+          onSelectSkill(event.target.value)
+        }}
+        className={cn(
+          'min-w-0 flex-1 cursor-pointer truncate bg-transparent text-xs font-medium outline-none',
+          !hasSkill && 'text-muted-foreground'
+        )}
+        title={hasSkill ? skillChoice.description : '点击添加 Skill'}
+      >
+        <option value={NO_SKILL_CHOICE.value}>{NO_SKILL_CHOICE.label}</option>
+        {skillChoices.map((choice) => (
+          <option key={choice.value} value={choice.value}>
+            {choice.label}
+          </option>
+        ))}
+      </select>
     </div>
   )
 }
@@ -1581,15 +1903,13 @@ function Inspector({
 }) {
   return (
     <div className='flex min-h-0 flex-1 flex-col'>
-      <div className='border-border/70 flex items-center gap-2 border-b px-3 py-3'>
-        <div className='bg-muted flex size-8 items-center justify-center rounded-[8px]'>
-          <Settings2Icon className='size-4' />
-        </div>
-        <div className='min-w-0'>
-          <div className='truncate text-sm font-semibold'>节点配置</div>
-          <div className='text-muted-foreground truncate text-xs'>
-            组件描述、模型和输入输出
+      {/* 顶部标题栏 */}
+      <div className='border-border/70 shrink-0 border-b px-3 pt-3'>
+        <div className='mb-3 flex items-center gap-2'>
+          <div className='bg-muted flex size-7 shrink-0 items-center justify-center rounded-[7px]'>
+            <Settings2Icon className='size-3.5' />
           </div>
+          <span className='text-sm font-semibold'>节点配置</span>
         </div>
       </div>
 
@@ -1618,6 +1938,417 @@ function Inspector({
   )
 }
 
+function ExecutionLogPanel({
+  executionNodes,
+  executionLog,
+}: {
+  executionNodes: AgentFlowNode[]
+  executionLog: AgentExecutionLogMap
+}) {
+  if (executionNodes.length === 0) {
+    return (
+      <div className='text-muted-foreground flex flex-col items-center justify-center gap-2 p-8 text-center text-xs'>
+        <FileSpreadsheetIcon className='size-8 opacity-30' />
+        <p>暂无执行记录</p>
+        <p className='opacity-60'>点击「试运行」后此处会显示每个节点的执行状态</p>
+      </div>
+    )
+  }
+
+  const hasDetailedLogs = Object.keys(executionLog).length > 0
+
+  return (
+    <div className='flex flex-col gap-2 p-3'>
+      {!hasDetailedLogs && (
+        <div className='text-muted-foreground border-border/70 rounded-[8px] border border-dashed px-3 py-2 text-xs'>
+          还没有生成详细日志。点击「试运行」后会记录每个节点的输入、输出、步骤和耗时。
+        </div>
+      )}
+      {executionNodes.map((node, index) => {
+        const meta = NODE_META[node.data.kind]
+        const Icon = meta.icon
+        const status = node.data.status
+        const log = executionLog[node.id]
+        const logStatus = log?.status ?? statusToLogStatus(status)
+
+        return (
+          <div
+            key={node.id}
+            className={cn(
+              'rounded-[8px] border p-2.5',
+              status === 'running' && 'border-blue-500/30 bg-blue-500/5',
+              status === 'done' && 'border-emerald-500/30 bg-emerald-500/5',
+              status === 'waiting' && 'border-border/50 bg-muted/10',
+              status === 'ready' && 'border-border/50 bg-muted/10'
+            )}
+          >
+            <div className='flex items-center gap-2'>
+              <div className='bg-background flex size-5 shrink-0 items-center justify-center rounded border text-[10px] font-semibold'>
+                {index + 1}
+              </div>
+              <div
+                className={cn(
+                  'flex size-6 shrink-0 items-center justify-center rounded-[6px]',
+                  meta.accent
+                )}
+              >
+                <Icon className='size-3' />
+              </div>
+              <div className='min-w-0 flex-1'>
+                <div className='truncate text-[11px] font-medium'>{node.data.title}</div>
+                <div className='text-muted-foreground truncate text-[10px]'>{node.data.model}</div>
+              </div>
+              <StatusDot status={status} />
+            </div>
+
+            <div className='mt-2 space-y-2 pl-[52px]'>
+              <div className='flex flex-wrap items-center gap-1.5 text-[10px]'>
+                <span
+                  className={cn(
+                    'rounded-full px-1.5 py-0.5 font-medium',
+                    logStatus === 'running' && 'bg-blue-500/12 text-blue-700',
+                    logStatus === 'completed' &&
+                      'bg-emerald-500/12 text-emerald-700',
+                    logStatus === 'pending' &&
+                      'bg-amber-500/12 text-amber-700',
+                    logStatus === 'stopped' &&
+                      'bg-slate-500/12 text-slate-700'
+                  )}
+                >
+                  {formatLogStatus(logStatus)}
+                </span>
+                <span className='text-muted-foreground'>
+                  开始 {log?.startedAt ? formatLogTime(log.startedAt) : '未开始'}
+                </span>
+                <span className='text-muted-foreground'>
+                  耗时 {formatDuration(log?.durationMs)}
+                </span>
+              </div>
+
+              <p className='text-muted-foreground text-[10px] leading-relaxed'>
+                {log?.message ?? '节点尚未开始执行，等待上游节点完成后进入队列。'}
+              </p>
+
+              {log && (
+                <>
+                  <LogSummaryList title='输入' values={log.inputSummary} />
+                  <LogSummaryList title='输出' values={log.outputSummary} />
+                  <div>
+                    <div className='text-muted-foreground mb-1 text-[10px] font-medium'>
+                      步骤
+                    </div>
+                    <ol className='space-y-1'>
+                      {log.steps.map((step, stepIndex) => (
+                        <li
+                          key={`${node.id}-step-${stepIndex}`}
+                          className='text-muted-foreground flex gap-1.5 text-[10px] leading-relaxed'
+                        >
+                          <span className='bg-muted text-foreground mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full text-[9px]'>
+                            {stepIndex + 1}
+                          </span>
+                          <span>{step}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+
+                  {log.error && (
+                    <div className='text-destructive border-destructive/30 rounded-[6px] border px-2 py-1.5 text-[10px]'>
+                      {log.error}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function LogSummaryList({
+  title,
+  values,
+}: {
+  title: string
+  values: string[]
+}) {
+  return (
+    <div>
+      <div className='text-muted-foreground mb-1 text-[10px] font-medium'>
+        {title}
+      </div>
+      <div className='space-y-1'>
+        {values.length === 0 ? (
+          <div className='text-muted-foreground text-[10px]'>无</div>
+        ) : (
+          values.map((value, index) => (
+            <div
+              key={`${title}-${index}-${value}`}
+              className='bg-background/70 text-muted-foreground rounded-[6px] px-2 py-1 text-[10px] leading-relaxed'
+            >
+              {value}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+function formatLogStatus(status: AgentNodeLogStatus) {
+  const labels: Record<AgentNodeLogStatus, string> = {
+    pending: '等待',
+    running: '执行中',
+    completed: '完成',
+    stopped: '已停止',
+  }
+  return labels[status]
+}
+
+function statusToLogStatus(status: AgentNodeStatus): AgentNodeLogStatus {
+  if (status === 'running') return 'running'
+  if (status === 'done') return 'completed'
+  return 'pending'
+}
+
+function formatLogTime(timestamp: number) {
+  const date = new Date(timestamp)
+  const hour = `${date.getHours()}`.padStart(2, '0')
+  const minute = `${date.getMinutes()}`.padStart(2, '0')
+  const second = `${date.getSeconds()}`.padStart(2, '0')
+  return `${hour}:${minute}:${second}`
+}
+
+function formatDuration(durationMs?: number) {
+  if (!durationMs || durationMs <= 0) return '-'
+  if (durationMs < 1000) return `${durationMs}ms`
+  return `${(durationMs / 1000).toFixed(1)}s`
+}
+
+function stopRunningExecutionLogs(
+  current: AgentExecutionLogMap,
+  stoppedAt: number
+): AgentExecutionLogMap {
+  const next: AgentExecutionLogMap = {}
+  for (const [nodeId, log] of Object.entries(current)) {
+    if (log.status !== 'running') {
+      next[nodeId] = log
+      continue
+    }
+    const durationMs = log.startedAt ? stoppedAt - log.startedAt : 0
+    next[nodeId] = {
+      ...log,
+      status: 'stopped',
+      endedAt: stoppedAt,
+      durationMs,
+      message: '试运行已手动停止，节点保留最后一次执行上下文。',
+      steps: [...log.steps, '收到停止指令并写入节点日志。'],
+    }
+  }
+  return next
+}
+
+function buildPreviewExecutionLog(
+  executionNodes: AgentFlowNode[],
+  statusById: Map<string, AgentNodeStatus>,
+  skillChoices: SkillChoice[]
+): AgentExecutionLogMap {
+  const now = Date.now()
+  let completedIndex = 0
+  const completedCount = executionNodes.filter(
+    (node) => statusById.get(node.id) === 'done'
+  ).length
+
+  return executionNodes.reduce<AgentExecutionLogMap>((acc, node, index) => {
+    const status = statusById.get(node.id) ?? node.data.status
+    const logStatus = statusToLogStatus(status)
+    const estimateMs = estimateNodeDuration(node, index)
+    let startedAt: number | undefined
+    let endedAt: number | undefined
+    let durationMs: number | undefined
+
+    if (logStatus === 'completed') {
+      startedAt = now - (completedCount - completedIndex + 1) * 1400
+      endedAt = startedAt + estimateMs
+      durationMs = estimateMs
+      completedIndex += 1
+    } else if (logStatus === 'running') {
+      startedAt = now - 900
+      durationMs = now - startedAt
+    }
+
+    acc[node.id] = {
+      nodeId: node.id,
+      status: logStatus,
+      startedAt,
+      endedAt,
+      durationMs,
+      message: buildNodeLogMessage(node, logStatus),
+      inputSummary: buildNodeInputSummary(node),
+      outputSummary: buildNodeOutputSummary(node, logStatus),
+      steps: buildNodeLogSteps(node, logStatus, skillChoices),
+    }
+    return acc
+  }, {})
+}
+
+function estimateNodeDuration(node: AgentFlowNode, index: number) {
+  const baseByKind: Record<AgentNodeKind, number> = {
+    start: 220,
+    schedule: 260,
+    browser: 1800,
+    request: 1200,
+    transform: 980,
+    image: 2600,
+    report: 1600,
+    webpage: 1400,
+    notify: 720,
+    stop: 240,
+  }
+  return baseByKind[node.data.kind] + index * 90
+}
+
+function buildNodeInputSummary(node: AgentFlowNode) {
+  const summaries = node.data.inputs.map((input) => {
+    const settingValue = node.data.settings[input]
+    if (settingValue) return `${input}: ${settingValue}`
+    return `${input}: 来自上游节点或当前运行上下文`
+  })
+
+  if (summaries.length > 0) return summaries
+
+  const triggerSetting =
+    node.data.settings['触发方式'] ?? node.data.settings['执行频率']
+  return [triggerSetting ? `触发条件: ${triggerSetting}` : '无显式输入']
+}
+
+function buildNodeOutputSummary(
+  node: AgentFlowNode,
+  status: AgentNodeLogStatus
+) {
+  if (node.data.outputs.length === 0) return ['无显式输出']
+
+  if (node.data.kind === 'report') {
+    return buildReportOutputSummary(node, status)
+  }
+
+  const suffix: Record<AgentNodeLogStatus, string> = {
+    pending: '等待生成',
+    running: '生成中',
+    completed: '已生成预览样本',
+    stopped: '已停止，保留部分上下文',
+  }
+
+  return node.data.outputs.map((output) => `${output}: ${suffix[status]}`)
+}
+
+function buildReportOutputSummary(
+  node: AgentFlowNode,
+  status: AgentNodeLogStatus
+) {
+  const templateDir = node.data.settings['模板目录'] || '/templates/reports'
+  const outputDir = node.data.settings['输出目录'] || '/output/reports'
+
+  if (status === 'completed') {
+    return [
+      'Markdown 日报: 已生成',
+      'CSV 表格: 已生成',
+      `模板目录: ${templateDir}`,
+      `输出目录: ${outputDir}`,
+    ]
+  }
+  if (status === 'running') {
+    return ['Markdown 日报: 生成中', 'CSV 表格: 生成中', `输出目录: ${outputDir}`]
+  }
+  if (status === 'stopped') {
+    return ['Markdown 日报: 已停止', 'CSV 表格: 已停止', '输出: 保留部分上下文']
+  }
+  return ['Markdown 日报: 等待生成', 'CSV 表格: 等待生成', `输出目录: ${outputDir}`]
+}
+
+function buildNodeLogSteps(
+  node: AgentFlowNode,
+  status: AgentNodeLogStatus,
+  skillChoices: SkillChoice[]
+) {
+  const skill = getSkillChoice(node.data.skill, skillChoices)
+  const steps = [
+    '读取节点配置、输入字段和上游依赖。',
+    node.data.skill
+      ? `加载 Skill: ${skill.label}`
+      : '未启用 Skill，使用节点基础提示执行。',
+  ]
+
+  if (NODE_META[node.data.kind].role === 'system') {
+    steps.push('执行本地编排逻辑。')
+  } else {
+    steps.push(`准备模型调用: ${node.data.model}`)
+  }
+
+  if (node.data.kind === 'transform') {
+    const templateName = node.data.settings['整理模板']
+    const dataType = node.data.settings['数据类型'] || '自动识别'
+    steps.push(
+      templateName && templateName !== '未上传模板'
+        ? `应用整理模板: ${templateName}`
+        : `未上传模板，按数据类型「${dataType}」自动推断字段与格式。`
+    )
+  }
+
+  if (node.data.kind === 'report') {
+    const templateDir = node.data.settings['模板目录'] || '/templates/reports'
+    const outputDir = node.data.settings['输出目录'] || '/output/reports'
+    steps.push(`读取模板目录: ${templateDir}`)
+    steps.push(`将日报产物写入输出目录: ${outputDir}`)
+  }
+
+  if (node.data.kind === 'stop') {
+    const archiveMode = node.data.settings['归档'] || '保存执行日志'
+    const archiveLocation = node.data.settings['归档位置'] || '工作区 / 日报归档'
+    steps.push(`结束节点归档策略: ${archiveMode}，位置 ${archiveLocation}。`)
+  }
+
+  if (status === 'completed') {
+    steps.push(
+      node.data.kind === 'stop'
+        ? '执行日志归档完成，流程结束。'
+        : '校验输出字段并写入下游上下文。'
+    )
+  } else if (status === 'running') {
+    steps.push('节点正在执行，等待模型或工具返回结果。')
+  } else if (status === 'stopped') {
+    steps.push('执行被停止，已写入停止状态。')
+  } else {
+    steps.push('等待上游节点完成后进入执行队列。')
+  }
+
+  return steps
+}
+
+function buildNodeLogMessage(
+  node: AgentFlowNode,
+  status: AgentNodeLogStatus
+) {
+  if (status === 'completed') {
+    if (node.data.kind === 'report') {
+      return `${node.data.title} 已生成日报产物，并写入输出目录。`
+    }
+    if (node.data.kind === 'stop') {
+      return `${node.data.title} 已完成归档与结束动作，流程已结束。`
+    }
+    return `${node.data.title} 已完成，输出已进入后续节点上下文。`
+  }
+  if (status === 'running') {
+    return `${node.data.title} 正在执行，实时结果会在完成后写入输出摘要。`
+  }
+  if (status === 'stopped') {
+    return `${node.data.title} 已停止，保留已收集到的执行上下文。`
+  }
+  return `${node.data.title} 正在等待上游节点完成。`
+}
+
 function NodeConfigPanel({
   node,
   modelChoices,
@@ -1641,22 +2372,6 @@ function NodeConfigPanel({
 }) {
   const meta = NODE_META[node.data.kind]
   const Icon = meta.icon
-  const modelExists = modelChoices.some(
-    (model) => model.value === node.data.model
-  )
-  const choices = modelExists
-    ? modelChoices
-    : [
-        {
-          label: node.data.model,
-          value: node.data.model,
-          source: 'current' as const,
-        },
-        ...modelChoices,
-      ]
-  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
-  const selectedGroup =
-    node.data.group || currentGroup || groupChoices[0]?.value || 'default'
 
   return (
     <section className='border-border/70 rounded-[8px] border p-3'>
@@ -1691,16 +2406,86 @@ function NodeConfigPanel({
       </div>
 
       <div className='space-y-3'>
-        <LabeledField label='组件名称'>
+        <NodeCommonConfig
+          currentGroup={currentGroup}
+          currentModel={currentModel}
+          groupChoices={groupChoices}
+          modelChoices={modelChoices}
+          node={node}
+          skillChoices={skillChoices}
+          onUpdateNode={onUpdateNode}
+        />
+
+        <div className='space-y-2'>
+          <div className='text-xs font-medium'>参数</div>
+          {Object.entries(node.data.settings).map(([key, value]) => (
+            <SettingControl
+              key={key}
+              label={key}
+              value={value}
+              onChange={(nextValue) => onUpdateSetting(key, nextValue)}
+              onChangeSetting={onUpdateSetting}
+            />
+          ))}
+        </div>
+
+        <div className='grid grid-cols-2 gap-2'>
+          <FieldList title='输入' values={node.data.inputs} />
+          <FieldList title='输出' values={node.data.outputs} />
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function NodeCommonConfig({
+  node,
+  modelChoices,
+  groupChoices,
+  skillChoices,
+  currentGroup,
+  currentModel,
+  onUpdateNode,
+}: {
+  node: AgentFlowNode
+  modelChoices: ModelChoice[]
+  groupChoices: GroupOption[]
+  skillChoices: SkillChoice[]
+  currentGroup?: string
+  currentModel?: string
+  onUpdateNode: (patch: Partial<AgentNodeData>) => void
+}) {
+  const modelExists = modelChoices.some(
+    (model) => model.value === node.data.model
+  )
+  const choices = modelExists
+    ? modelChoices
+    : [
+        {
+          label: node.data.model,
+          value: node.data.model,
+          source: 'current' as const,
+        },
+        ...modelChoices,
+      ]
+  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
+  const selectedGroup =
+    node.data.group || currentGroup || groupChoices[0]?.value || 'default'
+
+  return (
+    <div className='border-border/70 bg-muted/15 rounded-[8px] border p-2.5'>
+      <div className='grid grid-cols-2 gap-2'>
+        <CompactField label='名称'>
           <Input
             value={node.data.title}
             onChange={(event) => onUpdateNode({ title: event.target.value })}
-            className='h-8 rounded-[8px] text-sm'
+            className='h-7 rounded-[7px] px-2 text-xs'
           />
-        </LabeledField>
+        </CompactField>
 
-        <LabeledField label='模型分组'>
+        <CompactField label='模型组'>
           <NativeSelect
+            size='sm'
             value={selectedGroup}
             onChange={(event) => onUpdateNode({ group: event.target.value })}
             className='w-full'
@@ -1711,20 +2496,16 @@ function NodeConfigPanel({
               </NativeSelectOption>
             ))}
           </NativeSelect>
-          <div className='text-muted-foreground text-[11px] leading-relaxed'>
-            当前对话分组：{currentGroup || 'default'}
-          </div>
-        </LabeledField>
+        </CompactField>
 
-        <LabeledField label='执行模型'>
+        <CompactField label='模型'>
           <NativeSelect
+            size='sm'
             value={node.data.model}
             onChange={(event) => onUpdateNode({ model: event.target.value })}
             className='w-full'
           >
-            <NativeSelectOptGroup
-              label={`节点分组: ${selectedGroup}`}
-            >
+            <NativeSelectOptGroup label={`节点分组: ${selectedGroup}`}>
               {choices
                 .filter((model) => model.source === 'current')
                 .map((model) => (
@@ -1752,143 +2533,368 @@ function NodeConfigPanel({
                 ))}
             </NativeSelectOptGroup>
           </NativeSelect>
-          <div className='text-muted-foreground text-[11px] leading-relaxed'>
-            当前对话模型：{currentModel || '未选择'}
-          </div>
-        </LabeledField>
+        </CompactField>
 
-        <LabeledField label='Skill 优化'>
+        <CompactField label='Skill'>
           <NativeSelect
+            size='sm'
             value={node.data.skill}
+            title={selectedSkill.description}
             onChange={(event) => onUpdateNode({ skill: event.target.value })}
             className='w-full'
           >
+            <NativeSelectOption value={NO_SKILL_CHOICE.value}>
+              {NO_SKILL_CHOICE.label}
+            </NativeSelectOption>
             {skillChoices.map((skill) => (
               <NativeSelectOption key={skill.value} value={skill.value}>
                 {skill.label}
               </NativeSelectOption>
             ))}
           </NativeSelect>
-          <div className='text-muted-foreground text-[11px] leading-relaxed'>
-            {selectedSkill.description}
-          </div>
-        </LabeledField>
-
-        <LabeledField label='任务描述'>
-          <Textarea
-            value={node.data.description}
-            onChange={(event) =>
-              onUpdateNode({ description: event.target.value })
-            }
-            className='min-h-24 rounded-[8px] text-sm'
-          />
-        </LabeledField>
-
-        <div className='space-y-2'>
-          <div className='text-xs font-medium'>参数</div>
-          {Object.entries(node.data.settings).map(([key, value]) => (
-            <SettingControl
-              key={key}
-              label={key}
-              value={value}
-              onChange={(nextValue) => onUpdateSetting(key, nextValue)}
-            />
-          ))}
-        </div>
-
-        <div className='grid grid-cols-2 gap-2'>
-          <FieldList title='输入' values={node.data.inputs} />
-          <FieldList title='输出' values={node.data.outputs} />
-        </div>
+        </CompactField>
       </div>
-    </section>
+
+      <div className='mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground'>
+        <span className='bg-background/80 max-w-full truncate rounded-[5px] px-1.5 py-0.5'>
+          对话组 {currentGroup || 'default'}
+        </span>
+        <span className='bg-background/80 max-w-full truncate rounded-[5px] px-1.5 py-0.5'>
+          对话模型 {currentModel || '未选择'}
+        </span>
+        <span
+          className='min-w-0 flex-1 truncate px-0.5'
+          title={selectedSkill.description}
+        >
+          {selectedSkill.description}
+        </span>
+      </div>
+
+      <CompactField label='任务描述' className='mt-2'>
+        <Textarea
+          value={node.data.description}
+          onChange={(event) =>
+            onUpdateNode({ description: event.target.value })
+          }
+          className='min-h-16 rounded-[7px] px-2 py-1.5 text-xs leading-relaxed'
+        />
+      </CompactField>
+    </div>
+  )
+}
+
+function CompactField({
+  label,
+  children,
+  className,
+}: {
+  label: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <label className={cn('grid min-w-0 gap-1', className)}>
+      <span className='text-muted-foreground text-[11px]'>{label}</span>
+      {children}
+    </label>
   )
 }
 
 function ExecutionPreviewDock({
+  executionLog,
   executionNodes,
   skillChoices,
   isOpen,
+  selectedNode,
+  onSelectNode,
   onOpenChange,
 }: {
+  executionLog: AgentExecutionLogMap
   executionNodes: AgentFlowNode[]
   skillChoices: SkillChoice[]
   isOpen: boolean
+  selectedNode: AgentFlowNode | null
+  onSelectNode: (nodeId: string) => void
   onOpenChange: (open: boolean) => void
 }) {
-  return (
-    <div className='pointer-events-none absolute bottom-3 left-3 z-10 flex w-[min(36rem,calc(100%-1.5rem))] justify-start'>
-      <section className='border-border/70 bg-background/95 pointer-events-auto w-full overflow-hidden rounded-[8px] border shadow-sm backdrop-blur'>
-        <button
-          type='button'
-          className='hover:bg-accent/40 flex h-11 w-full items-center gap-2 px-3 text-left transition-colors'
-          onClick={() => onOpenChange(!isOpen)}
-        >
-          <div className='bg-muted flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
-            <FileSpreadsheetIcon className='size-3.5' />
-          </div>
-          <div className='min-w-0 flex-1'>
-            <div className='truncate text-sm font-semibold'>执行预览</div>
-            <div className='text-muted-foreground truncate text-[11px]'>
-              {executionNodes.length} 个节点 · 闲鱼/鱼小铺日报链路
-            </div>
-          </div>
-          {isOpen ? (
-            <ChevronDownIcon className='text-muted-foreground size-4' />
-          ) : (
-            <ChevronUpIcon className='text-muted-foreground size-4' />
-          )}
-        </button>
+  const logNode = selectedNode ?? executionNodes[0] ?? null
 
-        {isOpen && (
-          <div className='border-border/70 max-h-58 overflow-y-auto border-t p-2'>
-            <div className='grid gap-2 md:grid-cols-2'>
-              {executionNodes.map((node, index) => {
-                const meta = NODE_META[node.data.kind]
-                const Icon = meta.icon
-                return (
-                  <div
-                    key={node.id}
-                    className='border-border/70 bg-muted/20 flex items-start gap-2 rounded-[8px] border p-2'
-                  >
-                    <div className='bg-background flex size-7 shrink-0 items-center justify-center rounded-[6px] border text-xs font-medium'>
-                      {index + 1}
-                    </div>
-                    <div className='min-w-0 flex-1'>
-                      <div className='flex min-w-0 items-center gap-1.5'>
-                        <Icon className='text-muted-foreground size-3.5 shrink-0' />
-                        <div className='truncate text-xs font-medium'>
-                          {node.data.title}
-                        </div>
-                      </div>
-                      <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
-                        {node.data.model}
-                      </div>
-                      <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
-                        Skill · {getSkillChoice(node.data.skill, skillChoices).label}
-                      </div>
-                    </div>
-                    <StatusDot status={node.data.status} />
-                  </div>
-                )
-              })}
-            </div>
-          </div>
+  return (
+    <section className='border-border/70 bg-background shrink-0 border-t'>
+      <button
+        type='button'
+        className='hover:bg-accent/40 flex h-10 w-full items-center gap-2 px-3 text-left transition-colors'
+        onClick={() => onOpenChange(!isOpen)}
+      >
+        {isOpen ? (
+          <ChevronDownIcon className='text-muted-foreground size-3.5 shrink-0' />
+        ) : (
+          <ChevronUpIcon className='text-muted-foreground size-3.5 shrink-0' />
         )}
-      </section>
-    </div>
+        <FileSpreadsheetIcon className='text-muted-foreground size-3.5 shrink-0' />
+        <span className='text-xs font-semibold'>执行预览</span>
+        <span className='text-muted-foreground truncate text-[11px]'>
+          {executionNodes.length} 个节点 · 闲鱼/鱼小铺日报链路
+        </span>
+      </button>
+
+      {isOpen && (
+        <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-hidden border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
+          {executionNodes.length === 0 ? (
+            <div className='text-muted-foreground py-4 text-center text-xs xl:col-span-2'>
+              画布上还没有可执行的节点，从左侧拖入组件开始搭建。
+            </div>
+          ) : (
+            <>
+              <div className='min-h-0 overflow-y-auto pr-1'>
+                <div className='grid gap-2 sm:grid-cols-2 2xl:grid-cols-3'>
+                  {executionNodes.map((node, index) => {
+                    const meta = NODE_META[node.data.kind]
+                    const Icon = meta.icon
+                    const selected = logNode?.id === node.id
+                    return (
+                      <button
+                        key={node.id}
+                        type='button'
+                        className={cn(
+                          'border-border/70 bg-muted/20 hover:bg-accent/40 flex min-h-16 items-start gap-2 rounded-[8px] border p-2 text-left transition-colors',
+                          selected && 'border-primary/50 bg-primary/5 ring-primary/20 ring-2'
+                        )}
+                        onClick={() => onSelectNode(node.id)}
+                      >
+                        <div className='bg-background flex size-7 shrink-0 items-center justify-center rounded-[6px] border text-xs font-medium'>
+                          {index + 1}
+                        </div>
+                        <div className='min-w-0 flex-1'>
+                          <div className='flex min-w-0 items-center gap-1.5'>
+                            <Icon className='text-muted-foreground size-3.5 shrink-0' />
+                            <div className='truncate text-xs font-medium'>
+                              {node.data.title}
+                            </div>
+                          </div>
+                          <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
+                            {node.data.model}
+                          </div>
+                          <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
+                            Skill · {getSkillChoice(node.data.skill, skillChoices).label}
+                          </div>
+                        </div>
+                        <StatusDot status={node.data.status} />
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div className='border-border/70 bg-muted/10 min-h-0 overflow-hidden rounded-[8px] border'>
+                <div className='border-border/70 flex h-9 items-center gap-2 border-b px-3'>
+                  <FileSpreadsheetIcon className='text-muted-foreground size-3.5' />
+                  <span className='text-xs font-semibold'>本节点日志</span>
+                  {logNode && (
+                    <span className='text-muted-foreground min-w-0 truncate text-[11px]'>
+                      {logNode.data.title}
+                    </span>
+                  )}
+                </div>
+                <div className='max-h-[calc(18rem-2.25rem)] overflow-y-auto'>
+                  {logNode ? (
+                    <ExecutionLogPanel
+                      executionLog={executionLog}
+                      executionNodes={[logNode]}
+                    />
+                  ) : (
+                    <div className='text-muted-foreground p-4 text-center text-xs'>
+                      选中一个节点后查看日志。
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </section>
   )
 }
+
+const DEFAULT_TEMPLATE_DIR_REPORT = '/templates/reports'
+const DEFAULT_TEMPLATE_DIR_WEB = '/templates/web'
+const DEFAULT_TRANSFORM_TEMPLATE_PLACEHOLDER =
+  '字段: 商品名称, 曝光, 浏览, 想要, 转化建议\n格式: Markdown 表格 + JSON 数组\n排序: 按曝光降序\n说明: 缺失字段保留空值并标注来源'
 
 function SettingControl({
   label,
   value,
   onChange,
+  onChangeSetting,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
+  onChangeSetting?: (key: string, value: string) => void
 }) {
+  // 请求 URL —— 文本输入，带描述提示
+  if (label === '请求URL') {
+    return (
+      <LabeledField label='请求 URL'>
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder='https://api.example.com/data'
+          className='h-8 rounded-[8px] text-sm'
+        />
+      </LabeledField>
+    )
+  }
+
+  // 请求参数 —— 多行文本，提示 key=value 格式
+  if (label === '请求参数') {
+    return (
+      <LabeledField label='请求参数'>
+        <textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={'key1=value1\nkey2=value2\n或 JSON: {"key":"value"}'}
+          className='border-input bg-background placeholder:text-muted-foreground focus-visible:ring-ring flex min-h-[64px] w-full resize-none rounded-[8px] border px-3 py-1.5 text-sm shadow-sm focus-visible:ring-1 focus-visible:outline-none'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          支持 key=value 或 JSON 格式，仅用于 POST/PUT 请求体或 URL 查询参数。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  // 输出目录 —— 文本输入
+  if (label === '输出目录') {
+    return (
+      <LabeledField label='输出目录'>
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder='/output/reports'
+          className='h-8 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          生成的文件会写入此目录；标题、格式、语气、归档规则等要求请写在任务描述中。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  // 模板目录 —— 文本输入 + 显示内置目录
+  if (label === '模板目录') {
+    return (
+      <LabeledField label='模板目录'>
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={DEFAULT_TEMPLATE_DIR_REPORT}
+          className='h-8 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          上传的模板文件存放在此目录中，支持 <code className='bg-muted rounded px-1 text-[10px]'>.md</code> / <code className='bg-muted rounded px-1 text-[10px]'>.html</code> 格式。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  // 网页模板 —— 文本输入 + 提示
+  if (label === '网页模板') {
+    return (
+      <LabeledField label='网页模板'>
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder='默认模板'
+          className='h-8 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          将 HTML 模板上传至 <code className='bg-muted rounded px-1 text-[10px]'>{DEFAULT_TEMPLATE_DIR_WEB}</code> 后在此填写模板文件名。
+          数据文件输出至网页同级 <code className='bg-muted rounded px-1 text-[10px]'>/data/</code> 目录。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (label === '整理模板') {
+    const hasTemplate = value.trim() !== '' && value !== '未上传模板'
+
+    const handleTemplateUpload = (event: ChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget
+      const file = input.files?.[0]
+      if (!file) return
+
+      const reader = new FileReader()
+      reader.onload = () => {
+        const content = typeof reader.result === 'string' ? reader.result : ''
+        onChange(file.name)
+        onChangeSetting?.('模板内容', content.slice(0, 12000))
+        input.value = ''
+      }
+      reader.readAsText(file)
+    }
+
+    return (
+      <LabeledField label='整理模板'>
+        <div className='border-border/70 bg-muted/20 flex items-center gap-2 rounded-[8px] border px-2 py-2'>
+          <FileTextIcon className='text-muted-foreground size-4 shrink-0' />
+          <div className='min-w-0 flex-1'>
+            <div className='truncate text-xs font-medium'>
+              {hasTemplate ? value : '未上传模板'}
+            </div>
+            <div className='text-muted-foreground truncate text-[11px]'>
+              {hasTemplate
+                ? '将优先按上传模板整理字段和输出格式'
+                : '未上传时按数据类型自动推断字段和格式'}
+            </div>
+          </div>
+          {hasTemplate && (
+            <Button
+              type='button'
+              size='sm'
+              variant='ghost'
+              className='h-7 rounded-[6px] px-2 text-xs'
+              onClick={() => {
+                onChange('未上传模板')
+                onChangeSetting?.('模板内容', '')
+              }}
+            >
+              清除
+            </Button>
+          )}
+          <label className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[6px] px-2.5 text-xs font-medium'>
+            上传
+            <input
+              type='file'
+              accept='.csv,.json,.md,.txt,text/csv,application/json,text/markdown,text/plain'
+              className='sr-only'
+              onChange={handleTemplateUpload}
+            />
+          </label>
+        </div>
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          支持 CSV、JSON、Markdown、TXT 模板。模板可写字段顺序、输出格式、排序规则和字段说明。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (label === '模板内容') {
+    return (
+      <LabeledField label='字段 / 格式模板'>
+        <Textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={DEFAULT_TRANSFORM_TEMPLATE_PLACEHOLDER}
+          className='min-h-28 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          留空时会根据“数据类型”和上游数据结构自动整理；填写或上传模板后优先按模板输出。
+        </div>
+      </LabeledField>
+    )
+  }
+
   if (label === '执行频率') {
     return (
       <LabeledField label={label}>
@@ -1992,7 +2998,7 @@ function SettingControl({
 function SkillManagerPanel({
   skillChoices,
   managedSkills,
-  compact = false,
+  compact: _compact,
   onAddSkill,
   onDeleteSkill,
 }: {
@@ -2002,49 +3008,40 @@ function SkillManagerPanel({
   onAddSkill: (skill: SkillChoice) => void
   onDeleteSkill: (skillValue: string) => void
 }) {
-  const [source, setSource] = useState<SkillDraftSource>('github')
+  const [activeTab, setActiveTab] = useState<SkillDraftSource>('github')
   const [githubUrl, setGithubUrl] = useState('')
   const [customName, setCustomName] = useState('')
   const [customDescription, setCustomDescription] = useState('')
-  const [marketplaceValue, setMarketplaceValue] = useState(
-    MARKETPLACE_SKILLS[0]?.value ?? ''
-  )
 
   const installedValues = useMemo(
-    () => new Set(skillChoices.map((skill) => skill.value)),
+    () => new Set(skillChoices.map((s) => s.value)),
     [skillChoices]
   )
 
-  const handleAddSkill = () => {
-    if (source === 'marketplace') {
-      const skill = MARKETPLACE_SKILLS.find(
-        (item) => item.value === marketplaceValue
-      )
-      if (skill && !installedValues.has(skill.value)) {
-        onAddSkill(skill)
-      }
-      return
-    }
-
-    if (source === 'github') {
-      const trimmedUrl = githubUrl.trim()
-      if (!trimmedUrl) return
+  const handleAdd = () => {
+    if (activeTab === 'github') {
+      const url = githubUrl.trim()
+      if (!url) return
       onAddSkill({
-        label: `${formatSkillNameFromReference(trimmedUrl)} Skill`,
-        value: `skill.github.${createStableId(trimmedUrl)}`,
+        label: `${formatSkillNameFromReference(url)} Skill`,
+        value: `skill.github.${createStableId(url)}`,
         description: '从 GitHub 地址添加的 Skill。',
         source: 'github',
-        reference: trimmedUrl,
+        reference: url,
       })
       setGithubUrl('')
       return
     }
-
-    const trimmedName = customName.trim()
-    if (!trimmedName) return
+    if (activeTab === 'marketplace') {
+      const skill = MARKETPLACE_SKILLS.find((s) => !installedValues.has(s.value))
+      if (skill) onAddSkill(skill)
+      return
+    }
+    const name = customName.trim()
+    if (!name) return
     onAddSkill({
-      label: trimmedName.endsWith('Skill') ? trimmedName : `${trimmedName} Skill`,
-      value: `skill.custom.${createStableId(trimmedName)}`,
+      label: name.endsWith('Skill') ? name : `${name} Skill`,
+      value: `skill.custom.${createStableId(name)}`,
       description: customDescription.trim() || '用户自定义 Skill。',
       source: 'custom',
     })
@@ -2052,119 +3049,213 @@ function SkillManagerPanel({
     setCustomDescription('')
   }
 
+  const builtinSkills = skillChoices.filter((s) => s.source === 'built-in')
+  const userSkills = skillChoices.filter((s) => s.source !== 'built-in')
+
   return (
-    <section
-      className={cn(
-        'rounded-[8px]',
-        compact ? 'border-0 p-0' : 'border-border/70 border p-3'
-      )}
-    >
-      {!compact && (
-        <div className='mb-3 flex items-center gap-2'>
-          <div className='bg-muted flex size-8 items-center justify-center rounded-[8px]'>
-            <ArchiveIcon className='size-4' />
-          </div>
-          <div className='min-w-0 flex-1'>
-            <div className='truncate text-sm font-semibold'>Skill 管理</div>
-            <div className='text-muted-foreground truncate text-xs'>
-              内置、GitHub、商城和自定义
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className='space-y-3'>
-        <div className='grid grid-cols-[minmax(0,1fr)_auto] gap-2'>
-          <NativeSelect
-            value={source}
-            onChange={(event) => setSource(event.target.value as SkillDraftSource)}
-            className='w-full'
-          >
-            <NativeSelectOption value='github'>GitHub 地址</NativeSelectOption>
-            <NativeSelectOption value='marketplace'>Skill 商城</NativeSelectOption>
-            <NativeSelectOption value='custom'>自定义 Skill</NativeSelectOption>
-          </NativeSelect>
-          <Button
-            type='button'
-            size='sm'
-            className='h-8 rounded-[6px] px-2'
-            onClick={handleAddSkill}
-          >
-            <PlusIcon className='size-3.5' />
-            添加
-          </Button>
+    <div className='flex flex-col gap-3'>
+      {/* ── 添加来源 Tab ── */}
+      <div className='border-border/60 rounded-[10px] border p-3'>
+        <div className='text-muted-foreground mb-2 text-[10px] font-semibold uppercase tracking-wider'>
+          添加 Skill
         </div>
 
-        {source === 'github' && (
-          <Input
-            value={githubUrl}
-            onChange={(event) => setGithubUrl(event.target.value)}
-            placeholder='https://github.com/org/skill'
-            className='h-8 rounded-[8px] text-sm'
-          />
+        {/* 来源切换按钮组 */}
+        <div className='bg-muted/50 mb-3 flex rounded-[7px] p-0.5'>
+          {(
+            [
+              { value: 'github', label: 'GitHub' },
+              { value: 'marketplace', label: '商城' },
+              { value: 'custom', label: '自定义' },
+            ] as const
+          ).map((opt) => (
+            <button
+              key={opt.value}
+              type='button'
+              onClick={() => setActiveTab(opt.value)}
+              className={cn(
+                'flex-1 rounded-[6px] py-1 text-[11px] font-medium transition-colors',
+                activeTab === opt.value
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
+        {/* GitHub 输入 */}
+        {activeTab === 'github' && (
+          <div className='flex gap-1.5'>
+            <Input
+              value={githubUrl}
+              onChange={(e) => setGithubUrl(e.target.value)}
+              placeholder='https://github.com/org/skill'
+              className='h-7 flex-1 rounded-[6px] text-xs'
+              onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+            />
+            <Button
+              type='button'
+              size='sm'
+              className='h-7 rounded-[6px] px-2.5 text-xs'
+              onClick={handleAdd}
+              disabled={!githubUrl.trim()}
+            >
+              添加
+            </Button>
+          </div>
         )}
 
-        {source === 'marketplace' && (
-          <NativeSelect
-            value={marketplaceValue}
-            onChange={(event) => setMarketplaceValue(event.target.value)}
-            className='w-full'
-          >
-            {MARKETPLACE_SKILLS.map((skill) => (
-              <NativeSelectOption key={skill.value} value={skill.value}>
-                {skill.label}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
+        {/* 商城选择 */}
+        {activeTab === 'marketplace' && (
+          <div className='flex flex-col gap-1.5'>
+            {MARKETPLACE_SKILLS.map((skill) => {
+              const installed = installedValues.has(skill.value)
+              return (
+                <div
+                  key={skill.value}
+                  className='border-border/50 flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-2'
+                >
+                  <div className='min-w-0 flex-1'>
+                    <div className='truncate text-[11px] font-medium'>{skill.label}</div>
+                    <div className='text-muted-foreground truncate text-[10px]'>
+                      {skill.description}
+                    </div>
+                  </div>
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant={installed ? 'ghost' : 'outline'}
+                    className='h-6 shrink-0 rounded-[5px] px-2 text-[10px]'
+                    disabled={installed}
+                    onClick={() => !installed && onAddSkill(skill)}
+                  >
+                    {installed ? '已添加' : '+ 添加'}
+                  </Button>
+                </div>
+              )
+            })}
+          </div>
         )}
 
-        {source === 'custom' && (
-          <div className='space-y-2'>
+        {/* 自定义 */}
+        {activeTab === 'custom' && (
+          <div className='flex flex-col gap-1.5'>
             <Input
               value={customName}
-              onChange={(event) => setCustomName(event.target.value)}
-              placeholder='自定义 Skill 名称'
-              className='h-8 rounded-[8px] text-sm'
+              onChange={(e) => setCustomName(e.target.value)}
+              placeholder='Skill 名称'
+              className='h-7 rounded-[6px] text-xs'
             />
             <Textarea
               value={customDescription}
-              onChange={(event) => setCustomDescription(event.target.value)}
-              placeholder='Skill 描述'
-              className='min-h-18 rounded-[8px] text-sm'
+              onChange={(e) => setCustomDescription(e.target.value)}
+              placeholder='描述（可选）'
+              className='min-h-[52px] resize-none rounded-[6px] text-xs'
             />
+            <Button
+              type='button'
+              size='sm'
+              className='h-7 rounded-[6px] text-xs'
+              onClick={handleAdd}
+              disabled={!customName.trim()}
+            >
+              创建 Skill
+            </Button>
           </div>
         )}
-
-        <div className='space-y-1.5'>
-          {skillChoices.map((skill) => (
-            <div
-              key={skill.value}
-              className='border-border/70 bg-muted/20 flex items-center gap-2 rounded-[8px] border px-2 py-1.5'
-            >
-              <div className='min-w-0 flex-1'>
-                <div className='truncate text-xs font-medium'>{skill.label}</div>
-                <div className='text-muted-foreground truncate text-[11px]'>
-                  {formatSkillSource(skill.source)}
-                  {skill.reference ? ` · ${skill.reference}` : ''}
-                </div>
-              </div>
-              {managedSkills.some((item) => item.value === skill.value) && (
-                <Button
-                  type='button'
-                  size='icon'
-                  variant='ghost'
-                  className='size-7 rounded-[6px]'
-                  onClick={() => onDeleteSkill(skill.value)}
-                  title='删除 Skill'
-                >
-                  <Trash2Icon className='size-3.5' />
-                </Button>
-              )}
-            </div>
-          ))}
-        </div>
       </div>
-    </section>
+
+      {/* ── 已安装 Skill 列表 ── */}
+      {userSkills.length > 0 && (
+        <div>
+          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wider'>
+            已安装 ({userSkills.length})
+          </div>
+          <div className='flex flex-col gap-1'>
+            {userSkills.map((skill) => (
+              <div
+                key={skill.value}
+                className='bg-muted/30 hover:bg-muted/50 group flex items-center gap-2 rounded-[7px] px-2.5 py-2 transition-colors'
+              >
+                <div className='min-w-0 flex-1'>
+                  <div className='truncate text-[11px] font-medium'>{skill.label}</div>
+                  <div className='text-muted-foreground flex items-center gap-1 truncate text-[10px]'>
+                    <span
+                      className={cn(
+                        'rounded px-1 py-0 text-[9px] font-medium',
+                        skill.source === 'github' && 'bg-purple-500/10 text-purple-600',
+                        skill.source === 'marketplace' && 'bg-blue-500/10 text-blue-600',
+                        skill.source === 'custom' && 'bg-amber-500/10 text-amber-600'
+                      )}
+                    >
+                      {formatSkillSource(skill.source)}
+                    </span>
+                    {skill.reference && (
+                      <span className='truncate opacity-60'>{skill.reference}</span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  type='button'
+                  className='text-muted-foreground hover:text-destructive shrink-0 rounded-[5px] p-1 opacity-0 transition-opacity group-hover:opacity-100'
+                  onClick={() => onDeleteSkill(skill.value)}
+                  title='删除'
+                >
+                  <Trash2Icon className='size-3' />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 内置 Skill ── */}
+      {builtinSkills.length > 0 && (
+        <div>
+          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wider'>
+            内置 ({builtinSkills.length})
+          </div>
+          <div className='flex flex-col gap-1'>
+            {builtinSkills.map((skill) => {
+              const meta = BUILTIN_SKILL_META[skill.value]
+              const Icon = meta?.icon ?? ZapIcon
+              const accent = meta?.accent ?? 'bg-muted/60 text-muted-foreground'
+              return (
+                <div
+                  key={skill.value}
+                  className='hover:bg-accent/50 group flex items-center gap-2.5 rounded-[8px] px-2 py-2 transition-colors'
+                >
+                  <div
+                    className={cn(
+                      'flex size-7 shrink-0 items-center justify-center rounded-[7px]',
+                      accent
+                    )}
+                  >
+                    <Icon className='size-3.5' />
+                  </div>
+                  <div className='min-w-0 flex-1'>
+                    <div className='flex items-center gap-1.5'>
+                      <span className='truncate text-[11px] font-semibold'>
+                        {skill.label}
+                      </span>
+                      <span className='inline-flex shrink-0 items-center gap-0.5 rounded-full bg-emerald-500/12 px-1.5 py-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400'>
+                        <CheckCircle2Icon className='size-2.5' />
+                        可用
+                      </span>
+                    </div>
+                    <div className='text-muted-foreground truncate text-[10px] leading-snug'>
+                      {skill.description}
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -2330,6 +3421,7 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
           nodes,
           edges: blueprint.edges.map((edge) => normalizeEdge(edge)),
           status: blueprint.status ?? getBlueprintStatus(nodes),
+          executionLog: normalizeExecutionLog(blueprint.executionLog),
         }
       })
       .sort((a, b) => b.updatedAt - a.updatedAt)
@@ -2356,6 +3448,7 @@ function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
   if (nodes.length > 0 && nodes.every((node) => node.data.status === 'done')) {
     return 'ended'
   }
+  // paused is set externally via handleStopPreview
   return 'pending'
 }
 
@@ -2379,11 +3472,66 @@ function isSavedBlueprint(value: unknown): value is SavedAgentBlueprint {
   )
 }
 
+function normalizeExecutionLog(value: unknown): AgentExecutionLogMap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+
+  const out: AgentExecutionLogMap = {}
+  for (const [nodeId, rawLog] of Object.entries(
+    value as Record<string, unknown>
+  )) {
+    if (!rawLog || typeof rawLog !== 'object' || Array.isArray(rawLog)) {
+      continue
+    }
+
+    const candidate = rawLog as Partial<AgentNodeExecutionLog>
+    if (!isAgentNodeLogStatus(candidate.status)) continue
+
+    out[nodeId] = {
+      nodeId,
+      status: candidate.status,
+      startedAt: numberOrUndefined(candidate.startedAt),
+      endedAt: numberOrUndefined(candidate.endedAt),
+      durationMs: numberOrUndefined(candidate.durationMs),
+      message:
+        typeof candidate.message === 'string' ? candidate.message : '',
+      inputSummary: stringArray(candidate.inputSummary),
+      outputSummary: stringArray(candidate.outputSummary),
+      steps: stringArray(candidate.steps),
+      error: typeof candidate.error === 'string' ? candidate.error : undefined,
+    }
+  }
+  return out
+}
+
+function isAgentNodeLogStatus(
+  status: unknown
+): status is AgentNodeLogStatus {
+  return (
+    status === 'pending' ||
+    status === 'running' ||
+    status === 'completed' ||
+    status === 'stopped'
+  )
+}
+
+function numberOrUndefined(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : []
+}
+
 function normalizeNode(node: AgentFlowNode): AgentFlowNode {
   const data = node.data ?? ({} as Partial<AgentNodeData>)
   const kind =
     data.kind && NODE_META[data.kind] ? data.kind : ('start' as AgentNodeKind)
   const meta = NODE_META[kind]
+  const outputs = Array.isArray(data.outputs) ? data.outputs : meta.outputs
 
   return {
     ...node,
@@ -2399,11 +3547,35 @@ function normalizeNode(node: AgentFlowNode): AgentFlowNode {
         data.model ?? MODEL_FALLBACKS[meta.role][0]?.value ?? 'gpt-4.1-mini',
       skill: data.skill ?? pickDefaultSkill(kind),
       inputs: Array.isArray(data.inputs) ? data.inputs : meta.inputs,
-      outputs: Array.isArray(data.outputs) ? data.outputs : meta.outputs,
-      settings: data.settings ?? meta.settings,
+      outputs: kind === 'report' ? mergeStringList(outputs, meta.outputs) : outputs,
+      settings: normalizeNodeSettings(kind, data.settings, meta.settings),
       status: data.status ?? 'ready',
     },
   }
+}
+
+function normalizeNodeSettings(
+  kind: AgentNodeKind,
+  settings: Record<string, string> | undefined,
+  defaults: Record<string, string>
+) {
+  if (kind !== 'report') {
+    return { ...defaults, ...(settings ?? {}) }
+  }
+
+  return {
+    模板目录: settings?.['模板目录'] ?? defaults['模板目录'] ?? '/templates/reports',
+    输出目录: settings?.['输出目录'] ?? defaults['输出目录'] ?? '/output/reports',
+  }
+}
+
+function mergeStringList(current: string[], defaults: string[]) {
+  const seen = new Set<string>()
+  return [...current, ...defaults].filter((value) => {
+    if (seen.has(value)) return false
+    seen.add(value)
+    return true
+  })
 }
 
 function normalizeEdge(edge: AgentFlowEdge): AgentFlowEdge {
@@ -2457,23 +3629,12 @@ function pickDefaultModel(
   return MODEL_FALLBACKS[meta.role][0]?.value ?? currentModel ?? 'gpt-4.1-mini'
 }
 
-function pickDefaultSkill(kind: AgentNodeKind) {
-  const skillByKind: Record<AgentNodeKind, string> = {
-    start: 'skill.system-orchestration',
-    schedule: 'skill.schedule-guard',
-    browser: 'skill.browser-reading',
-    request: 'skill.network-fetch',
-    transform: 'skill.data-cleaning',
-    image: 'skill.image-generation',
-    report: 'skill.report-writing',
-    notify: 'skill.notification-routing',
-    stop: 'skill.system-orchestration',
-  }
-
-  return skillByKind[kind]
+function pickDefaultSkill(_kind: AgentNodeKind) {
+  return NO_SKILL_VALUE
 }
 
 function getSkillChoice(value: string, skillChoices: SkillChoice[]) {
+  if (!value) return NO_SKILL_CHOICE
   return (
     skillChoices.find((skill) => skill.value === value) ?? {
       label: value,
@@ -2632,15 +3793,6 @@ function createInitialNodes(templates: NodeTemplate[]) {
           '按模板输出 Markdown 日报和 CSV 表格，包含商品排名、关键变化和运营建议。',
       },
     },
-    {
-      kind: 'stop',
-      id: 'stop',
-      position: { x: 1050, y: -20 },
-      patch: {
-        title: '归档并停止',
-        description: '保存本轮执行日志和日报产物，结束当前运行。',
-      },
-    },
   ]
 
   return overrides
@@ -2695,7 +3847,7 @@ function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
       `e-${edge.source ?? 'source'}-${edge.target ?? 'target'}-${Date.now()}`,
     source: edge.source ?? '',
     target: edge.target ?? '',
-    type: 'smoothstep',
+    type: 'deletable',
     animated: true,
     deletable: true,
     focusable: true,

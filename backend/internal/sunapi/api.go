@@ -314,6 +314,7 @@ func RegisterRoutes(engine *gin.Engine, store *Store, writer *ConfigWriter) {
 	})
 
 	registerPlaygroundSessionRoutes(api, store)
+	registerAgentRoutes(engine, store) // 智能体自动化任务 API
 
 	api.GET("/channels", func(c *gin.Context) {
 		items, err := store.ListChannels(c.Request.Context(), false)

@@ -459,11 +459,16 @@ function AgentBlueprintHistoryPanel({
         </SidebarGroup>
       ) : (
         <SidebarGroup className='px-2 pt-1 pb-1'>
-          <SidebarGroupLabel className='text-muted-foreground/70 px-2 text-[10px] font-medium tracking-wider uppercase'>
-            {t('蓝图历史')}
-          </SidebarGroupLabel>
+          <div className='mb-1 flex items-center justify-between px-2'>
+            <SidebarGroupLabel className='text-muted-foreground/70 h-auto px-0 text-[10px] font-medium tracking-wider uppercase'>
+              {t('蓝图历史')}
+            </SidebarGroupLabel>
+            <span className='text-muted-foreground/60 text-[10px] tabular-nums'>
+              {blueprints.length}
+            </span>
+          </div>
           <SidebarGroupContent>
-            <SidebarMenu>
+            <SidebarMenu className='gap-2'>
               {blueprints.map((blueprint) => (
                 <AgentBlueprintItem
                   key={blueprint.id}
@@ -497,39 +502,40 @@ function AgentBlueprintItem({
 
   return (
     <SidebarMenuItem>
-      <div className='group/blueprint hover:bg-muted/45 hover:border-border/70 relative flex w-full min-w-0 items-start gap-1 rounded-md border border-transparent transition-colors'>
+      <div className='group/blueprint border-border/65 bg-background/70 hover:bg-muted/35 relative flex w-full min-w-0 items-start gap-1 rounded-[10px] border shadow-sm transition-colors'>
         <button
           type='button'
           onClick={() => onLoad(blueprint.id)}
-          className='flex min-h-16 w-full min-w-0 flex-1 items-start gap-1 rounded-md px-2 py-2 pr-8 text-left'
+          className='block min-h-[76px] w-full min-w-0 rounded-[10px] px-3 py-2.5 text-left'
         >
-          <span className='grid min-w-0 flex-1 gap-1.5'>
-            <span className='line-clamp-2 text-sm leading-snug font-medium break-all'>
+          <span className='flex min-w-0 items-center gap-1.5 pr-7'>
+            <span className='min-w-0 flex-1 truncate text-sm leading-snug font-medium'>
               {blueprint.title || t('未命名蓝图')}
             </span>
-            <span className='flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[11px] font-normal'>
-              <span
-                className={cn(
-                  'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] leading-none',
-                  statusClass
-                )}
-              >
-                <span className='size-1.5 rounded-full bg-current' />
-                {statusLabel}
-              </span>
-              <span className='text-muted-foreground shrink-0'>
-                {t('{{count}} 个节点', { count: blueprint.nodesCount })}
-              </span>
-              <span className='text-muted-foreground/80 shrink-0'>
-                {formatBlueprintSidebarTime(blueprint.updatedAt)}
-              </span>
+          </span>
+
+          <span className='mt-2 grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-2 text-[11px] font-normal'>
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] leading-none',
+                statusClass
+              )}
+            >
+              <span className='size-1.5 rounded-full bg-current' />
+              {statusLabel}
+            </span>
+            <span className='inline-flex items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] leading-none text-blue-600 dark:bg-blue-500/20 dark:text-blue-300 tabular-nums'>
+              {t('{{count}}节点', { count: blueprint.nodesCount })}
+            </span>
+            <span className='text-muted-foreground/80 justify-self-end text-right leading-none tabular-nums'>
+              {formatBlueprintSidebarTime(blueprint.updatedAt)}
             </span>
           </span>
         </button>
 
         <DropdownMenu>
           <DropdownMenuTrigger
-            className='text-muted-foreground hover:text-foreground absolute top-1.5 right-1 inline-flex size-6 items-center justify-center rounded-md opacity-0 transition-opacity group-hover/blueprint:opacity-100 data-[popup-open]:opacity-100'
+            className='text-muted-foreground hover:text-foreground hover:bg-muted absolute top-2 right-2 inline-flex size-6 items-center justify-center rounded-md opacity-70 transition-opacity group-hover/blueprint:opacity-100 data-[popup-open]:opacity-100'
             aria-label={t('蓝图操作')}
           >
             <MoreHorizontalIcon className='size-3.5' />
