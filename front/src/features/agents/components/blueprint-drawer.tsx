@@ -7,10 +7,20 @@ published by the Free Software Foundation, either version 3 of the
 License, or (at your option) any later version.
 */
 import { useState } from 'react'
-import { ChevronDown, Settings2 } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import {
+  Bot,
+  Check,
+  ChevronDown,
+  Clock,
+  Settings2,
+  Sparkles,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Collapsible,
   CollapsibleContent,
@@ -25,16 +35,19 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Textarea } from '@/components/ui/textarea'
-import { cn } from '@/lib/utils'
 import {
+  skillsQueryOptions,
   useCreateBlueprintMutation,
   useUpdateBlueprintMutation,
 } from '../api'
+import { getSkillCapabilities } from '../lib/skill-utils'
 import {
   FrequencyType,
+  SkillSourceType,
   TriggerType,
   type Blueprint,
   type BlueprintFormData,
+  type Skill,
 } from '../types'
 import { ArchiveConfigEditor } from './archive-config-editor'
 import { ExecutionPreviewBar } from './execution-preview-bar'
@@ -47,7 +60,7 @@ import { TriggerConfigEditor } from './trigger-config-editor'
 
 type BlueprintDrawerProps = {
   agentId: string
-  blueprint?: Blueprint  // 编辑模式传入，创建模式不传
+  blueprint?: Blueprint // 编辑模式传入，创建模式不传
   open: boolean
   onOpenChange: (open: boolean) => void
 }
@@ -83,6 +96,13 @@ function toFormData(bp: Blueprint): BlueprintFormData {
   }
 }
 
+function toggleSkillId(selected: string[], skillId: string, checked: boolean) {
+  if (checked) {
+    return selected.includes(skillId) ? selected : [...selected, skillId]
+  }
+  return selected.filter((id) => id !== skillId)
+}
+
 // ============================================================================
 // 分区折叠组件
 // ============================================================================
@@ -104,39 +124,127 @@ function Section({
 
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
-      <CollapsibleTrigger asChild>
-        <button
-          type='button'
-          className='hover:bg-muted/40 border-border/50 flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left transition-colors'
-        >
-          <div className='flex items-center gap-2.5'>
-            {icon && (
-              <span className='bg-muted text-muted-foreground flex h-7 w-7 items-center justify-center rounded-md text-sm'>
-                {icon}
-              </span>
+      <CollapsibleTrigger className='hover:bg-muted/40 border-border/50 flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left transition-colors'>
+        <div className='flex items-center gap-2.5'>
+          {icon && (
+            <span className='bg-muted text-muted-foreground flex h-7 w-7 items-center justify-center rounded-md text-sm'>
+              {icon}
+            </span>
+          )}
+          <div>
+            <div className='text-[13px] font-semibold'>{title}</div>
+            {subtitle && (
+              <div className='text-muted-foreground text-[11px]'>
+                {subtitle}
+              </div>
             )}
-            <div>
-              <div className='text-[13px] font-semibold'>{title}</div>
-              {subtitle && (
-                <div className='text-muted-foreground text-[11px]'>
-                  {subtitle}
-                </div>
-              )}
-            </div>
           </div>
-          <ChevronDown
-            className={cn(
-              'text-muted-foreground h-4 w-4 shrink-0 transition-transform',
-              open && 'rotate-180'
-            )}
-            aria-hidden='true'
-          />
-        </button>
+        </div>
+        <ChevronDown
+          className={cn(
+            'text-muted-foreground h-4 w-4 shrink-0 transition-transform',
+            open && 'rotate-180'
+          )}
+          aria-hidden='true'
+        />
       </CollapsibleTrigger>
-      <CollapsibleContent className='mt-3 px-1'>
-        {children}
-      </CollapsibleContent>
+      <CollapsibleContent className='mt-3 px-1'>{children}</CollapsibleContent>
     </Collapsible>
+  )
+}
+
+function SkillSelector({
+  skills,
+  value,
+  onChange,
+}: {
+  skills: Skill[]
+  value: string[]
+  onChange: (value: string[]) => void
+}) {
+  const { t } = useTranslation()
+  const available = skills.filter((skill) => skill.enabled)
+  const builtin = available.filter(
+    (skill) => skill.source === SkillSourceType.BUILTIN
+  )
+  const custom = available.filter(
+    (skill) => skill.source !== SkillSourceType.BUILTIN
+  )
+  const groups = [
+    { key: 'builtin', title: t('Built-in'), items: builtin },
+    { key: 'custom', title: t('Installed'), items: custom },
+  ].filter((group) => group.items.length > 0)
+
+  if (available.length === 0) {
+    return (
+      <div className='text-muted-foreground rounded-lg border border-dashed px-3 py-4 text-center text-xs'>
+        {t('No available skills')}
+      </div>
+    )
+  }
+
+  return (
+    <div className='flex flex-col gap-3'>
+      {groups.map((group) => (
+        <div key={group.key} className='flex flex-col gap-2'>
+          <div className='text-muted-foreground text-[11px] font-medium tracking-wide uppercase'>
+            {group.title}
+          </div>
+          <div className='grid gap-2'>
+            {group.items.map((skill) => {
+              const checked = value.includes(skill.id)
+              const capabilities = getSkillCapabilities(skill)
+              return (
+                <label
+                  key={skill.id}
+                  className={cn(
+                    'border-border/70 hover:bg-muted/30 flex cursor-pointer items-start gap-2.5 rounded-lg border p-3 transition-colors',
+                    checked && 'border-primary/50 bg-primary/5'
+                  )}
+                >
+                  <Checkbox
+                    checked={checked}
+                    onCheckedChange={(next) =>
+                      onChange(toggleSkillId(value, skill.id, !!next))
+                    }
+                    className='mt-0.5'
+                    aria-label={skill.name}
+                  />
+                  <div className='min-w-0 flex-1'>
+                    <div className='flex items-center gap-1.5'>
+                      <span className='truncate text-xs font-medium'>
+                        {skill.name}
+                      </span>
+                      {checked && (
+                        <Check
+                          className='text-primary h-3 w-3 shrink-0'
+                          aria-hidden='true'
+                        />
+                      )}
+                    </div>
+                    <p className='text-muted-foreground mt-0.5 line-clamp-2 text-[11px] leading-relaxed'>
+                      {skill.description}
+                    </p>
+                    {capabilities.length > 0 && (
+                      <div className='mt-1.5 flex flex-wrap gap-1'>
+                        {capabilities.slice(0, 3).map((capability) => (
+                          <span
+                            key={capability}
+                            className='bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]'
+                          >
+                            {capability}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -159,6 +267,7 @@ export function BlueprintDrawer({
 
   const createMutation = useCreateBlueprintMutation(agentId)
   const updateMutation = useUpdateBlueprintMutation(agentId)
+  const { data: skills = [] } = useQuery(skillsQueryOptions)
 
   const isPending = createMutation.isPending || updateMutation.isPending
 
@@ -222,7 +331,7 @@ export function BlueprintDrawer({
                 />
               </div>
               <div className='flex flex-col gap-1.5'>
-                <Label className='text-xs text-muted-foreground'>
+                <Label className='text-muted-foreground text-xs'>
                   {t('Description')}
                 </Label>
                 <Textarea
@@ -235,7 +344,11 @@ export function BlueprintDrawer({
             </div>
 
             {/* 触发器 */}
-            <Section icon='⏰' title={t('Trigger')} subtitle={t('When to run this blueprint')}>
+            <Section
+              icon={<Clock className='h-3.5 w-3.5' />}
+              title={t('Trigger')}
+              subtitle={t('When to run this blueprint')}
+            >
               <TriggerConfigEditor
                 value={form.trigger}
                 onChange={(trigger) => updateForm({ trigger })}
@@ -243,12 +356,31 @@ export function BlueprintDrawer({
             </Section>
 
             {/* 模型选择 */}
-            <Section icon='🤖' title={t('Model')} subtitle={t('AI model to use')}>
+            <Section
+              icon={<Bot className='h-3.5 w-3.5' />}
+              title={t('Model')}
+              subtitle={t('AI model to use')}
+            >
               <ModelSelector
                 groupId={form.model_group}
                 modelName={form.model_name}
                 onGroupChange={(g) => updateForm({ model_group: g })}
                 onModelChange={(m) => updateForm({ model_name: m })}
+              />
+            </Section>
+
+            <Section
+              icon={<Sparkles className='h-3.5 w-3.5' />}
+              title='Skill'
+              subtitle={t('Execution constraints and capabilities')}
+              defaultOpen={false}
+            >
+              <SkillSelector
+                skills={skills}
+                value={form.skills}
+                onChange={(selectedSkills) =>
+                  updateForm({ skills: selectedSkills })
+                }
               />
             </Section>
 
@@ -268,7 +400,10 @@ export function BlueprintDrawer({
         </div>
 
         {/* 执行预览底部栏 */}
-        <ExecutionPreviewBar blueprint={{ ...form, agent_id: agentId }} />
+        <ExecutionPreviewBar
+          blueprint={{ ...form, agent_id: agentId }}
+          skills={skills}
+        />
 
         {/* 底部操作栏 */}
         <div className='border-border/60 flex shrink-0 items-center justify-end gap-2 border-t px-5 py-3'>

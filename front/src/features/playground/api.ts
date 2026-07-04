@@ -16,6 +16,12 @@ import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
   ModelOption,
+  AgentBrowserCaptureRequest,
+  AgentBrowserCaptureResult,
+  AgentFileUpload,
+  AgentFileUploadPurpose,
+  AgentReportOutputFile,
+  AgentReportWriteResult,
   GroupOption,
   ImageGenerationItem,
   ImageGenerationParams,
@@ -250,6 +256,77 @@ export async function uploadPlaygroundAttachment(
   }
 
   return data.data as PlaygroundAttachment
+}
+
+export async function uploadAgentFile(
+  file: File,
+  purpose: AgentFileUploadPurpose = 'report-template'
+): Promise<AgentFileUpload> {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('purpose', purpose)
+
+  const res = await api.post(API_ENDPOINTS.AGENT_FILES, formData, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to upload file')
+  }
+
+  return data.data as AgentFileUpload
+}
+
+export async function listAgentFiles(
+  purpose: AgentFileUploadPurpose = 'report-template'
+): Promise<AgentFileUpload[]> {
+  const res = await api.get(API_ENDPOINTS.AGENT_FILES, {
+    params: { purpose },
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list files')
+  }
+
+  return data.data as AgentFileUpload[]
+}
+
+export async function writeAgentReport(payload: {
+  title: string
+  output_directory: string
+  files: AgentReportOutputFile[]
+}): Promise<AgentReportWriteResult> {
+  const res = await api.post(API_ENDPOINTS.AGENT_REPORTS, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to write report')
+  }
+
+  return data.data as AgentReportWriteResult
+}
+
+export async function captureAgentBrowserPage(
+  payload: AgentBrowserCaptureRequest
+): Promise<AgentBrowserCaptureResult> {
+  const res = await api.post(API_ENDPOINTS.AGENT_BROWSER_CAPTURE, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to capture browser page')
+  }
+
+  return data.data as AgentBrowserCaptureResult
 }
 
 export async function getImageGenerationHistory(): Promise<

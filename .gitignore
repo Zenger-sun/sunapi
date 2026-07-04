@@ -1,6 +1,8 @@
 front/node_modules/
 front/dist/
 front/.tanstack/
+.cache/
+.gocache/
 backend/.cache/
 backend/.tmp/
 backend/static/

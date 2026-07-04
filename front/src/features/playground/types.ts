@@ -156,6 +156,61 @@ export interface PlaygroundAttachment {
   created_time: number
 }
 
+export type AgentFileUploadPurpose = 'report-template' | 'web-template'
+
+export interface AgentFileUpload {
+  filename: string
+  original_name?: string
+  directory: string
+  path: string
+  media_type: string
+  size: number
+  hash?: string
+  content_preview?: string
+  output_directory?: string
+  reused?: boolean
+  replaced?: boolean
+  created_time: number
+}
+
+export interface AgentReportOutputFile {
+  label: string
+  extension: string
+  content: string
+  template_path?: string
+  template_original_name?: string
+}
+
+export interface AgentReportWrittenFile {
+  label: string
+  path: string
+  extension: string
+  size: number
+}
+
+export interface AgentReportWriteResult {
+  output_directory: string
+  files: AgentReportWrittenFile[]
+  markdown_path?: string
+  csv_path?: string
+  created_time: number
+}
+
+export interface AgentBrowserCaptureRequest {
+  url: string
+  login_state?: string
+  wait_seconds?: number
+}
+
+export interface AgentBrowserCaptureResult {
+  url: string
+  final_url: string
+  title: string
+  text: string
+  captured_at: number
+  elapsed_ms: number
+}
+
 // Configuration types
 export interface PlaygroundConfig {
   model: string

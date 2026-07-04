@@ -33,11 +33,11 @@ export enum AgentStatus {
 // ============================================================================
 
 export enum BlueprintStatus {
-  PENDING = 'pending',      // 待执行
-  RUNNING = 'running',      // 执行中
-  COMPLETED = 'completed',  // 已结束
-  FAILED = 'failed',        // 执行失败
-  PAUSED = 'paused',        // 已暂停
+  PENDING = 'pending', // 待执行
+  RUNNING = 'running', // 执行中
+  COMPLETED = 'completed', // 已结束
+  FAILED = 'failed', // 执行失败
+  PAUSED = 'paused', // 已暂停
 }
 
 // ============================================================================
@@ -45,9 +45,9 @@ export enum BlueprintStatus {
 // ============================================================================
 
 export enum TriggerType {
-  SCHEDULED = 'scheduled',  // 定时触发
-  MANUAL = 'manual',        // 手动触发
-  WEBHOOK = 'webhook',      // Webhook触发
+  SCHEDULED = 'scheduled', // 定时触发
+  MANUAL = 'manual', // 手动触发
+  WEBHOOK = 'webhook', // Webhook触发
 }
 
 // ============================================================================
@@ -55,12 +55,12 @@ export enum TriggerType {
 // ============================================================================
 
 export enum FrequencyType {
-  ONCE = 'once',           // 一次性
-  HOURLY = 'hourly',       // 每小时
-  DAILY = 'daily',         // 每天
-  WEEKLY = 'weekly',       // 每周
-  MONTHLY = 'monthly',     // 每月
-  CUSTOM = 'custom',       // 自定义
+  ONCE = 'once', // 一次性
+  HOURLY = 'hourly', // 每小时
+  DAILY = 'daily', // 每天
+  WEEKLY = 'weekly', // 每周
+  MONTHLY = 'monthly', // 每月
+  CUSTOM = 'custom', // 自定义
 }
 
 // ============================================================================
@@ -68,13 +68,13 @@ export enum FrequencyType {
 // ============================================================================
 
 export enum ArchiveType {
-  PLATFORM = 'platform',   // 平台内置存储
-  NOTION = 'notion',       // Notion
-  FEISHU = 'feishu',       // 飞书
-  GITHUB = 'github',       // GitHub
-  WECHAT = 'wechat',       // 企业微信
-  WEBHOOK = 'webhook',     // 自定义Webhook
-  LOCAL = 'local',         // 本地文件系统
+  PLATFORM = 'platform', // 平台内置存储
+  NOTION = 'notion', // Notion
+  FEISHU = 'feishu', // 飞书
+  GITHUB = 'github', // GitHub
+  WECHAT = 'wechat', // 企业微信
+  WEBHOOK = 'webhook', // 自定义Webhook
+  LOCAL = 'local', // 本地文件系统
 }
 
 // ============================================================================
@@ -82,10 +82,10 @@ export enum ArchiveType {
 // ============================================================================
 
 export enum SkillSourceType {
-  BUILTIN = 'builtin',     // 系统内置
+  BUILTIN = 'builtin', // 系统内置
   MARKETPLACE = 'marketplace', // 商城安装
-  GITHUB = 'github',       // GitHub导入
-  CUSTOM = 'custom',       // 自定义创建
+  GITHUB = 'github', // GitHub导入
+  CUSTOM = 'custom', // 自定义创建
 }
 
 // ============================================================================
@@ -100,13 +100,18 @@ export const skillSchema = z.object({
   source: z.nativeEnum(SkillSourceType),
   source_url: z.string().optional(),
   enabled: z.boolean(),
-  config: z.record(z.any()).optional(),
+  config: z.record(z.string(), z.any()).optional(),
   permissions: z.array(z.string()).optional(),
   created_time: z.number(),
   updated_time: z.number(),
 })
 
 export type Skill = z.infer<typeof skillSchema>
+
+export type SkillConfig = {
+  capabilities?: string[]
+  instructions?: string[]
+}
 
 // ============================================================================
 // 触发器配置 Schema
@@ -133,7 +138,7 @@ export const archiveConfigSchema = z.object({
   path: z.string().optional(),
   namingRule: z.string().optional(),
   retentionPolicy: z.string().optional(),
-  externalConfig: z.record(z.any()).optional(), // Notion/飞书等外部配置
+  externalConfig: z.record(z.string(), z.any()).optional(), // Notion/飞书等外部配置
   triggerOn: z.enum(['always', 'success', 'manual']).default('success'),
 })
 
@@ -153,7 +158,7 @@ export const blueprintSchema = z.object({
   model_group: z.string(),
   model_name: z.string(),
   skills: z.array(z.string()),
-  input_variables: z.record(z.any()).optional(),
+  input_variables: z.record(z.string(), z.any()).optional(),
   archive_config: archiveConfigSchema.optional(),
   created_time: z.number(),
   updated_time: z.number(),

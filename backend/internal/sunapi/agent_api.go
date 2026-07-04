@@ -41,6 +41,12 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	// ── 归档文件下载 ────────────────────────────────────────────────────
 	api.GET("/agents/archives/files/*path", handleServeArchiveFile(store))
 
+	// ── 创作台文件 ──────────────────────────────────────────────────────
+	api.GET("/agents/files", handleListAgentFiles(store))
+	api.POST("/agents/files", handleUploadAgentFile(store))
+	api.POST("/agents/reports", handleWriteAgentReport(store))
+	api.POST("/agents/browser-capture", handleCaptureAgentBrowserPage(store))
+
 	// ── Skill CRUD ────────────────────────────────────────────────────────
 	api.GET("/agent-skills", handleListSkills(store))
 	api.POST("/agent-skills", handleCreateSkill(store))
@@ -297,6 +303,7 @@ func handleListSkills(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
+		skills = mergeBuiltinAgentSkills(userID, skills)
 		ok(c, skills)
 	}
 }
@@ -305,6 +312,10 @@ func handleCreateSkill(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var f SkillFormData
 		if !bindJSON(c, &f) {
+			return
+		}
+		if strings.TrimSpace(f.SourceType) == "builtin" {
+			fail(c, http.StatusBadRequest, errConflict("built-in skills are managed by system"))
 			return
 		}
 		userID := playgroundUserID(c)
@@ -327,6 +338,10 @@ func handleToggleSkill(store *Store) gin.HandlerFunc {
 		if !bindJSON(c, &body) {
 			return
 		}
+		if isBuiltinAgentSkillID(id) {
+			ok(c, gin.H{"enabled": true, "builtin": true})
+			return
+		}
 		if err := store.ToggleSkill(c.Request.Context(), id, userID, body.Enabled); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -339,6 +354,10 @@ func handleDeleteSkill(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := strings.TrimSpace(c.Param("id"))
 		userID := playgroundUserID(c)
+		if isBuiltinAgentSkillID(id) {
+			fail(c, http.StatusBadRequest, errConflict("built-in skills cannot be removed"))
+			return
+		}
 		if err := store.DeleteSkill(c.Request.Context(), id, userID); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return

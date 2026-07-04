@@ -509,12 +509,15 @@ function AgentBlueprintItem({
           className='block min-h-[76px] w-full min-w-0 rounded-[10px] px-3 py-2.5 text-left'
         >
           <span className='flex min-w-0 items-center gap-1.5 pr-7'>
-            <span className='min-w-0 flex-1 truncate text-sm leading-snug font-medium'>
+            <span className='min-w-0 truncate text-sm leading-snug font-medium'>
               {blueprint.title || t('未命名蓝图')}
+            </span>
+            <span className='inline-flex shrink-0 items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] leading-none text-blue-600 tabular-nums dark:bg-blue-500/20 dark:text-blue-300'>
+              {t('{{count}}节点', { count: blueprint.nodesCount })}
             </span>
           </span>
 
-          <span className='mt-2 grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-2 text-[11px] font-normal'>
+          <span className='mt-2 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-2 text-[11px] font-normal'>
             <span
               className={cn(
                 'inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] leading-none',
@@ -523,9 +526,6 @@ function AgentBlueprintItem({
             >
               <span className='size-1.5 rounded-full bg-current' />
               {statusLabel}
-            </span>
-            <span className='inline-flex items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] leading-none text-blue-600 dark:bg-blue-500/20 dark:text-blue-300 tabular-nums'>
-              {t('{{count}}节点', { count: blueprint.nodesCount })}
             </span>
             <span className='text-muted-foreground/80 justify-self-end text-right leading-none tabular-nums'>
               {formatBlueprintSidebarTime(blueprint.updatedAt)}

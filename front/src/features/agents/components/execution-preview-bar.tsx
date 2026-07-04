@@ -7,20 +7,16 @@ published by the Free Software Foundation, either version 3 of the
 License, or (at your option) any later version.
 */
 import { useState } from 'react'
-import {
-  ArrowRight,
-  ChevronUp,
-  Clock,
-  FlaskConical,
-  Zap,
-} from 'lucide-react'
+import { ArrowRight, ChevronUp, Clock, FlaskConical, Zap } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { type Blueprint } from '../types'
+import { getSkillCapabilities } from '../lib/skill-utils'
+import { type Blueprint, type Skill } from '../types'
 
 type ExecutionPreviewBarProps = {
   blueprint?: Partial<Blueprint>
+  skills?: Skill[]
   className?: string
 }
 
@@ -31,7 +27,10 @@ type FlowStep = {
   type: 'trigger' | 'input' | 'skill' | 'model' | 'output'
 }
 
-function buildFlowSteps(blueprint?: Partial<Blueprint>): FlowStep[] {
+function buildFlowSteps(
+  blueprint?: Partial<Blueprint>,
+  skills: Skill[] = []
+): FlowStep[] {
   if (!blueprint) return []
 
   const steps: FlowStep[] = []
@@ -64,11 +63,16 @@ function buildFlowSteps(blueprint?: Partial<Blueprint>): FlowStep[] {
   // Skill 步骤
   if (blueprint.skills && blueprint.skills.length > 0) {
     blueprint.skills.forEach((skillId, idx) => {
+      const skill = skills.find((item) => item.id === skillId)
+      const capabilities = getSkillCapabilities(skill)
       steps.push({
         id: `skill-${idx}`,
         type: 'skill',
-        label: `Skill: ${skillId}`,
-        detail: undefined,
+        label: skill?.name ?? `Skill: ${skillId}`,
+        detail:
+          capabilities.length > 0
+            ? capabilities.slice(0, 3).join('、')
+            : undefined,
       })
     })
   }
@@ -109,12 +113,13 @@ const STEP_COLORS: Record<FlowStep['type'], string> = {
 
 export function ExecutionPreviewBar({
   blueprint,
+  skills = [],
   className,
 }: ExecutionPreviewBarProps) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
 
-  const steps = buildFlowSteps(blueprint)
+  const steps = buildFlowSteps(blueprint, skills)
   const stepCount = steps.length
   const skillCount = steps.filter((s) => s.type === 'skill').length
   const hasModel = steps.some((s) => s.type === 'model')
@@ -129,9 +134,7 @@ export function ExecutionPreviewBar({
       {/* 折叠内容 */}
       {expanded && (
         <div className='border-border/40 border-b px-4 py-4'>
-          <h4 className='mb-3 text-sm font-semibold'>
-            {t('Execution Flow')}
-          </h4>
+          <h4 className='mb-3 text-sm font-semibold'>{t('Execution Flow')}</h4>
 
           {steps.length === 0 ? (
             <p className='text-muted-foreground text-xs'>
@@ -179,17 +182,19 @@ export function ExecutionPreviewBar({
               </span>
               {hasModel && <span>预估费用: ¥0.08 / 次</span>}
               {skillCount > 0 && <span>调用 Skill: {skillCount} 个</span>}
-              <span>输入变量: {blueprint?.input_variables ? Object.keys(blueprint.input_variables).length : 0} 个</span>
+              <span>
+                输入变量:{' '}
+                {blueprint?.input_variables
+                  ? Object.keys(blueprint.input_variables).length
+                  : 0}{' '}
+                个
+              </span>
             </div>
           )}
 
           {/* 测试运行按钮 */}
           <div className='mt-3'>
-            <Button
-              size='sm'
-              variant='outline'
-              className='h-7 gap-1.5 text-xs'
-            >
+            <Button size='sm' variant='outline' className='h-7 gap-1.5 text-xs'>
               <FlaskConical className='h-3.5 w-3.5' aria-hidden='true' />
               {t('Test Run')}
             </Button>
@@ -205,10 +210,7 @@ export function ExecutionPreviewBar({
         aria-expanded={expanded}
       >
         <div className='flex items-center gap-2'>
-          <Zap
-            className='text-amber-500 h-3.5 w-3.5'
-            aria-hidden='true'
-          />
+          <Zap className='h-3.5 w-3.5 text-amber-500' aria-hidden='true' />
           <span className='text-xs font-medium'>{t('Execution Preview')}</span>
           {stepCount > 0 && (
             <span className='text-muted-foreground text-xs'>

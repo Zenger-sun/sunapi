@@ -10,16 +10,19 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ExternalLink,
-  Github,
+  GitBranch,
   Package,
+  Plug,
   Plus,
   Settings,
+  ShieldCheck,
   Store,
   Trash2,
   Wrench,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -35,13 +38,13 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { cn } from '@/lib/utils'
 import {
   skillsQueryOptions,
   useCreateSkillMutation,
   useDeleteSkillMutation,
   useToggleSkillMutation,
 } from '../api'
+import { getSkillCapabilities } from '../lib/skill-utils'
 import { SkillSourceType, type Skill } from '../types'
 
 // ============================================================================
@@ -79,19 +82,27 @@ function SkillCard({ skill }: { skill: Skill }) {
   const toggleMutation = useToggleSkillMutation()
   const deleteMutation = useDeleteSkillMutation()
   const src = SOURCE_CONFIG[skill.source]
+  const isBuiltin = skill.source === SkillSourceType.BUILTIN
+  const capabilities = getSkillCapabilities(skill)
 
   return (
     <div className='border-border/60 hover:bg-muted/10 flex items-start gap-3 rounded-lg border p-4 transition-colors'>
       {/* 图标占位 */}
       <div className='bg-muted flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-base'>
-        {skill.source === SkillSourceType.BUILTIN ? '⚙️' : '🔌'}
+        {isBuiltin ? (
+          <ShieldCheck className='h-4 w-4' aria-hidden='true' />
+        ) : (
+          <Plug className='h-4 w-4' aria-hidden='true' />
+        )}
       </div>
 
       {/* 信息 */}
       <div className='min-w-0 flex-1'>
         <div className='flex flex-wrap items-center gap-2'>
           <span className='text-sm font-medium'>{skill.name}</span>
-          <span className='text-muted-foreground text-xs'>v{skill.version}</span>
+          <span className='text-muted-foreground text-xs'>
+            v{skill.version}
+          </span>
           <span
             className={cn(
               'rounded border px-1.5 py-0.5 text-[10px] font-medium',
@@ -104,6 +115,19 @@ function SkillCard({ skill }: { skill: Skill }) {
         <p className='text-muted-foreground mt-0.5 line-clamp-1 text-xs'>
           {skill.description}
         </p>
+        {capabilities.length > 0 && (
+          <div className='mt-1.5 flex flex-wrap gap-1'>
+            {capabilities.map((capability) => (
+              <Badge
+                key={capability}
+                variant='secondary'
+                className='h-4 px-1.5 text-[10px]'
+              >
+                {capability}
+              </Badge>
+            ))}
+          </div>
+        )}
         {skill.source_url && (
           <a
             href={skill.source_url}
@@ -135,6 +159,7 @@ function SkillCard({ skill }: { skill: Skill }) {
         <Switch
           checked={skill.enabled}
           onCheckedChange={(enabled) => {
+            if (isBuiltin) return
             toggleMutation.mutate(
               { id: skill.id, enabled },
               {
@@ -145,10 +170,16 @@ function SkillCard({ skill }: { skill: Skill }) {
               }
             )
           }}
-          disabled={toggleMutation.isPending}
-          aria-label={skill.enabled ? t('Disable skill') : t('Enable skill')}
+          disabled={isBuiltin || toggleMutation.isPending}
+          aria-label={
+            isBuiltin
+              ? t('Built-in skill is always enabled')
+              : skill.enabled
+                ? t('Disable skill')
+                : t('Enable skill')
+          }
         />
-        {skill.source !== SkillSourceType.BUILTIN && (
+        {!isBuiltin && (
           <>
             <Button size='sm' variant='ghost' className='h-7 w-7 p-0'>
               <Settings className='h-3.5 w-3.5' aria-hidden='true' />
@@ -183,9 +214,7 @@ type AddSkillDialogProps = {
 
 function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
   const { t } = useTranslation()
-  const [tab, setTab] = useState<'marketplace' | 'github' | 'custom'>(
-    'github'
-  )
+  const [tab, setTab] = useState<'marketplace' | 'github' | 'custom'>('github')
   const [githubUrl, setGithubUrl] = useState('')
   const [customName, setCustomName] = useState('')
   const [customDesc, setCustomDesc] = useState('')
@@ -246,13 +275,13 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
         </DialogHeader>
 
         <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
-          <TabsList className='grid w-full grid-cols-3 h-8'>
+          <TabsList className='grid h-8 w-full grid-cols-3'>
             <TabsTrigger value='marketplace' className='gap-1.5 text-xs'>
               <Store className='h-3 w-3' aria-hidden='true' />
               {t('Marketplace')}
             </TabsTrigger>
             <TabsTrigger value='github' className='gap-1.5 text-xs'>
-              <Github className='h-3 w-3' aria-hidden='true' />
+              <GitBranch className='h-3 w-3' aria-hidden='true' />
               GitHub
             </TabsTrigger>
             <TabsTrigger value='custom' className='gap-1.5 text-xs'>
@@ -263,8 +292,11 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
 
           {/* 商城 */}
           <TabsContent value='marketplace' className='mt-4'>
-            <div className='flex flex-col items-center justify-center py-8 gap-2'>
-              <Package className='text-muted-foreground h-10 w-10' aria-hidden='true' />
+            <div className='flex flex-col items-center justify-center gap-2 py-8'>
+              <Package
+                className='text-muted-foreground h-10 w-10'
+                aria-hidden='true'
+              />
               <p className='text-muted-foreground text-sm'>
                 {t('Marketplace coming soon')}
               </p>
@@ -284,7 +316,9 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
                 />
               </div>
               <p className='text-muted-foreground text-[11px]'>
-                {t('Repository must contain a skill manifest file (skill.json)')}
+                {t(
+                  'Repository must contain a skill manifest file (skill.json)'
+                )}
               </p>
             </div>
           </TabsContent>
@@ -357,9 +391,7 @@ export function SkillsPage() {
       s.description.toLowerCase().includes(search.toLowerCase())
   )
 
-  const installed = filtered.filter(
-    (s) => s.source !== SkillSourceType.BUILTIN
-  )
+  const installed = filtered.filter((s) => s.source !== SkillSourceType.BUILTIN)
   const builtin = filtered.filter((s) => s.source === SkillSourceType.BUILTIN)
 
   return (
@@ -397,7 +429,7 @@ export function SkillsPage() {
             {/* 已安装 */}
             {installed.length > 0 && (
               <div className='flex flex-col gap-2'>
-                <h3 className='text-muted-foreground text-xs font-medium uppercase tracking-wide'>
+                <h3 className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
                   {t('Installed')} ({installed.length})
                 </h3>
                 <div className='flex flex-col gap-2'>
@@ -411,7 +443,7 @@ export function SkillsPage() {
             {/* 内置 */}
             {builtin.length > 0 && (
               <div className='flex flex-col gap-2'>
-                <h3 className='text-muted-foreground text-xs font-medium uppercase tracking-wide'>
+                <h3 className='text-muted-foreground text-xs font-medium tracking-wide uppercase'>
                   {t('Built-in')} ({builtin.length})
                 </h3>
                 <div className='flex flex-col gap-2'>

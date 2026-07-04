@@ -46,7 +46,6 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
-  ArchiveIcon,
   BellIcon,
   BotIcon,
   ChartNetworkIcon,
@@ -55,10 +54,8 @@ import {
   ChevronUpIcon,
   ClockIcon,
   CpuIcon,
-  ExternalLinkIcon,
   FileSpreadsheetIcon,
   FileTextIcon,
-  FilterIcon,
   GlobeIcon,
   ImageIcon,
   MonitorIcon,
@@ -77,6 +74,7 @@ import {
   ZapIcon,
   type LucideIcon,
 } from 'lucide-react'
+import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -89,6 +87,12 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
+  captureAgentBrowserPage,
+  listAgentFiles,
+  uploadAgentFile,
+  writeAgentReport,
+} from '../api'
+import {
   AGENT_BLUEPRINT_COMMAND_EVENT,
   AGENT_BLUEPRINTS_CHANGED_EVENT,
   AGENT_BLUEPRINT_STORAGE_KEY,
@@ -97,7 +101,14 @@ import {
   type AgentBlueprintCommand,
   type AgentBlueprintStatus,
 } from '../lib/agent-blueprints'
-import type { GroupOption, ModelOption } from '../types'
+import type {
+  AgentFileUpload,
+  AgentFileUploadPurpose,
+  AgentReportOutputFile,
+  AgentReportWrittenFile,
+  GroupOption,
+  ModelOption,
+} from '../types'
 
 type AgentNodeKind =
   | 'start'
@@ -138,6 +149,7 @@ type AgentNodeExecutionLog = {
   message: string
   inputSummary: string[]
   outputSummary: string[]
+  modelOutput: string
   steps: string[]
   error?: string
 }
@@ -165,6 +177,7 @@ type SkillChoice = {
   description: string
   source: SkillSource
   reference?: string
+  capabilities?: string[]
 }
 
 type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
@@ -172,6 +185,25 @@ type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
 type SkillDraftSource = Exclude<SkillSource, 'built-in'>
 
 type AgentToolPanel = 'components' | 'skills'
+
+type BuiltinSkillDefinition = SkillChoice & {
+  appliesTo: AgentNodeKind[]
+  instructions: string[]
+}
+
+type TemplateBinding = {
+  path: string
+  originalName: string
+  preview?: string
+  hash?: string
+}
+
+type XianyuOverviewMetric = {
+  label: string
+  current: string
+  previous: string
+  change: string
+}
 
 type NodeTemplate = {
   kind: AgentNodeKind
@@ -216,102 +248,185 @@ const NO_SKILL_CHOICE: SkillChoice = {
   source: 'built-in',
 }
 
-const BASE_SKILL_CHOICES: SkillChoice[] = [
+const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
   {
-    label: '系统编排 Skill',
-    value: 'skill.system-orchestration',
-    description: '处理开始、停止、状态归档和执行守护。',
+    label: 'Web Research Skill',
+    value: 'skill.web-research',
+    description: '检索、网页阅读和事实核验，适合资料收集与趋势调研。',
     source: 'built-in',
+    appliesTo: ['browser', 'request', 'webpage', 'report'],
+    capabilities: ['关键词规划', '来源交叉验证', '引用摘要'],
+    instructions: [
+      '先把任务拆成 2-5 个可检索问题，再围绕当前节点输入进行查找和摘要。',
+      '优先使用权威、官方、近期或一手来源；多个来源冲突时明确说明差异。',
+      '输出结论、依据和不确定点，不要把未验证内容当作事实。',
+    ],
   },
   {
-    label: '定时守护 Skill',
-    value: 'skill.schedule-guard',
-    description: '校验定时规则、重试窗口和循环停止条件。',
+    label: 'File & Document Skill',
+    value: 'skill.file-document',
+    description: '读取整理 Excel、CSV、PDF、Word、Markdown、HTML、TXT 等文件。',
     source: 'built-in',
+    appliesTo: ['transform', 'report', 'webpage'],
+    capabilities: ['多格式解析', '模板遵循', '结构保真'],
+    instructions: [
+      '只使用当前上传或上游显式提供的文件内容，不猜测未提供的表格、标题或业务背景。',
+      '保留文件中的关键字段、工作表、表头、段落层级和格式要求。',
+      '输出格式必须跟模板或节点配置一致；无法读取时说明具体缺失文件或格式限制。',
+    ],
   },
   {
-    label: '浏览器取数 Skill',
-    value: 'skill.browser-reading',
-    description: '优化浏览器页面读取、登录态复用和字段识别。',
+    label: 'Browser Automation Skill',
+    value: 'skill.browser-automation',
+    description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
+    appliesTo: ['browser'],
+    capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
+    instructions: [
+      '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
+      '遇到弹窗、登录、分页、懒加载或动态内容时记录处理步骤和剩余限制。',
+      '默认只读；购买、删除、提交、发布、转账等高风险动作必须停下并等待确认。',
+    ],
   },
   {
-    label: '网络请求 Skill',
-    value: 'skill.network-fetch',
-    description: '优化接口请求、分页、重试和 JSON 结构解析。',
+    label: 'Code Interpreter Skill',
+    value: 'skill.code-interpreter',
+    description: '用于数据清洗、计算、图表、文件转换和可复现脚本化分析。',
     source: 'built-in',
+    appliesTo: ['transform', 'image', 'report'],
+    capabilities: ['数据清洗', '计算分析', '文件生成'],
+    instructions: [
+      '优先用确定性的表格/脚本处理计算、清洗、去重、排序、转换和统计任务。',
+      '输出关键步骤、计算口径、生成文件路径或可复用结果，避免只给泛泛建议。',
+      '如果数据不足或格式不一致，先列出阻塞字段和建议修复方式。',
+    ],
   },
   {
-    label: '数据整理 Skill',
-    value: 'skill.data-cleaning',
-    description: '优化清洗、去重、指标计算和异常标注。',
+    label: 'API & Function Skill',
+    value: 'skill.api-function',
+    description: '组织 HTTP/API 调用、函数参数、重试策略和结构化响应解析。',
     source: 'built-in',
+    appliesTo: ['request', 'notify'],
+    capabilities: ['参数校验', 'JSON 解析', '错误恢复'],
+    instructions: [
+      '根据节点中的 endpoint、method、headers、body、鉴权和超时配置组织请求。',
+      '把响应解析成稳定 JSON、表格或日志摘要，保留状态码、错误信息和关键字段。',
+      '遇到分页、限流、空响应或非 JSON 响应时说明处理策略，不伪造结果。',
+    ],
   },
   {
-    label: '图片生成 Skill',
-    value: 'skill.image-generation',
-    description: '优化封面图、趋势图和数据看板提示词。',
+    label: 'RAG & File Search Skill',
+    value: 'skill.rag-file-search',
+    description: '知识库、文档检索、片段引用和问答总结的检索增强能力。',
     source: 'built-in',
+    appliesTo: ['browser', 'request', 'transform', 'report'],
+    capabilities: ['语义检索', '片段引用', '答案合成'],
+    instructions: [
+      '围绕问题检索最相关的文档片段，并基于片段回答，不使用未命中的外部背景补全。',
+      '保留来源文件、页码、段落或片段标识，区分事实、推断和待确认内容。',
+      '当检索结果不足时，明确说明没有足够依据，而不是生成看似完整的答案。',
+    ],
   },
   {
-    label: '日报写作 Skill',
-    value: 'skill.report-writing',
-    description: '优化日报结构、表格说明和运营建议。',
+    label: 'Database & SQL Skill',
+    value: 'skill.database-sql',
+    description: '结构化数据查询、SQL 生成、指标口径和结果解释。',
     source: 'built-in',
+    appliesTo: ['request', 'transform', 'report'],
+    capabilities: ['Schema 理解', 'SQL 生成', '结果校验'],
+    instructions: [
+      '先确认表结构、字段含义、过滤条件和时间范围，再生成查询或解释结果。',
+      '优先使用只读查询；避免破坏性 SQL，涉及写入、删除、更新时必须请求确认。',
+      '输出 SQL、参数、结果摘要和可能的数据质量风险。',
+    ],
   },
   {
-    label: '通知分发 Skill',
-    value: 'skill.notification-routing',
-    description: '优化发送渠道、确认点和失败补偿。',
+    label: 'MCP & Workflow Skill',
+    value: 'skill.mcp-workflow',
+    description:
+      '适配 MCP/GitHub/文件系统等工具编排，强调权限边界和可追踪步骤。',
     source: 'built-in',
+    appliesTo: ['start', 'schedule', 'notify', 'stop'],
+    capabilities: ['工具选择', '权限边界', '步骤追踪'],
+    instructions: [
+      '根据任务选择最少必要工具，说明每一步输入、输出和失败补偿方案。',
+      '严格遵守工具权限边界，不越权读取、写入或调用未配置的外部系统。',
+      '对 GitHub、文件系统、任务管理等工具操作保留可审计摘要。',
+    ],
   },
 ]
+
+const BASE_SKILL_CHOICES: SkillChoice[] = BUILTIN_SKILL_DEFINITIONS
 
 // 内置 Skill 的展示元数据：图标、颜色、可用状态
 const BUILTIN_SKILL_META: Record<
   string,
   { icon: LucideIcon; accent: string; badge: string }
 > = {
-  'skill.system-orchestration': {
-    icon: CpuIcon,
-    accent: 'bg-slate-500/12 text-slate-600 dark:text-slate-400',
-    badge: '可用',
-  },
-  'skill.schedule-guard': {
-    icon: ClockIcon,
-    accent: 'bg-sky-500/12 text-sky-600 dark:text-sky-400',
-    badge: '可用',
-  },
-  'skill.browser-reading': {
-    icon: GlobeIcon,
+  'skill.web-research': {
+    icon: SearchIcon,
     accent: 'bg-blue-500/12 text-blue-600 dark:text-blue-400',
     badge: '可用',
   },
-  'skill.network-fetch': {
-    icon: NetworkIcon,
-    accent: 'bg-cyan-500/12 text-cyan-600 dark:text-cyan-400',
-    badge: '可用',
-  },
-  'skill.data-cleaning': {
-    icon: FilterIcon,
-    accent: 'bg-violet-500/12 text-violet-600 dark:text-violet-400',
-    badge: '可用',
-  },
-  'skill.image-generation': {
-    icon: ImageIcon,
-    accent: 'bg-fuchsia-500/12 text-fuchsia-600 dark:text-fuchsia-400',
-    badge: '可用',
-  },
-  'skill.report-writing': {
+  'skill.file-document': {
     icon: FileTextIcon,
     accent: 'bg-amber-500/12 text-amber-600 dark:text-amber-400',
     badge: '可用',
   },
-  'skill.notification-routing': {
-    icon: BellIcon,
+  'skill.browser-automation': {
+    icon: GlobeIcon,
+    accent: 'bg-cyan-500/12 text-cyan-600 dark:text-cyan-400',
+    badge: '可用',
+  },
+  'skill.code-interpreter': {
+    icon: CpuIcon,
+    accent: 'bg-violet-500/12 text-violet-600 dark:text-violet-400',
+    badge: '可用',
+  },
+  'skill.api-function': {
+    icon: NetworkIcon,
+    accent: 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400',
+    badge: '可用',
+  },
+  'skill.rag-file-search': {
+    icon: ChartNetworkIcon,
+    accent: 'bg-sky-500/12 text-sky-600 dark:text-sky-400',
+    badge: '可用',
+  },
+  'skill.database-sql': {
+    icon: Table2Icon,
+    accent: 'bg-slate-500/12 text-slate-600 dark:text-slate-400',
+    badge: '可用',
+  },
+  'skill.mcp-workflow': {
+    icon: SparklesIcon,
     accent: 'bg-rose-500/12 text-rose-600 dark:text-rose-400',
     badge: '可用',
   },
+}
+
+const LEGACY_BUILTIN_SKILL_ALIASES: Record<string, string> = {
+  'skill.system-orchestration': 'skill.mcp-workflow',
+  'skill.schedule-guard': 'skill.mcp-workflow',
+  'skill.browser-reading': 'skill.browser-automation',
+  'skill.network-fetch': 'skill.api-function',
+  'skill.data-cleaning': 'skill.code-interpreter',
+  'skill.image-generation': 'skill.code-interpreter',
+  'skill.report-writing': 'skill.file-document',
+  'skill.notification-routing': 'skill.mcp-workflow',
+}
+
+const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
+  start: 'skill.mcp-workflow',
+  schedule: 'skill.mcp-workflow',
+  browser: 'skill.browser-automation',
+  request: 'skill.api-function',
+  transform: 'skill.code-interpreter',
+  image: 'skill.code-interpreter',
+  report: 'skill.file-document',
+  webpage: 'skill.file-document',
+  notify: 'skill.api-function',
+  stop: 'skill.mcp-workflow',
 }
 
 const MARKETPLACE_SKILLS: SkillChoice[] = [
@@ -349,12 +464,34 @@ const TIMEZONE_OPTIONS = [
   'Europe/London',
   'Europe/Berlin',
 ]
-const ARCHIVE_LOCATION_OPTIONS = [
-  '工作区 / 日报归档',
-  '本地执行日志',
-  '团队共享空间',
-  '对象存储 / agent-runs',
-  '不归档',
+const REPORT_OUTPUT_FORMAT_SETTING = '输出格式'
+const REPORT_OUTPUT_PATH_LABEL = '归档路径'
+const BROWSER_PAGE_DATA_SETTING = '页面数据'
+const BROWSER_CAPTURE_TEXT_SETTING = '采集文本'
+const BROWSER_DATA_MISSING_MARKER = 'browser_data_missing'
+const XIANYU_OVERVIEW_METRICS_MARKER = 'xianyu_overview_metrics'
+const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 日报', 'CSV 表格']
+const REPORT_OUTPUT_FORMAT_PRESETS = [
+  'Markdown 日报',
+  'CSV 表格',
+  'Excel 表格',
+  'Word 文档',
+  'PDF 文档',
+  'HTML 网页',
+  'TXT 文本',
+  'JSON 数据',
+]
+const XIANYU_OVERVIEW_METRIC_LABELS = [
+  '商品访问次数',
+  '商品访问人数',
+  '商品曝光次数',
+  '商品曝光人数',
+  '商品浏览次数',
+  '商品浏览人数',
+  '支付笔数',
+  '支付金额（元）',
+  '发起退款笔数',
+  '发起退款金额（元）',
 ]
 const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   触发方式: ['手动', '定时', 'Webhook', '对话触发'],
@@ -385,12 +522,12 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   ],
   表格字段: [
     '自动按数据类型推断',
-    '商品名称, 曝光, 浏览, 想要, 转化建议',
-    '商品 ID, 标题, 价格, 曝光, 浏览, 想要',
+    '名称, 数值, 状态, 备注',
+    'ID, 标题, 类型, 数值, 更新时间',
     '日期, 渠道, 访客, 成交, 转化率',
     '自定义字段',
   ],
-  去重规则: ['按商品 ID', '按商品链接', '按标题 + 日期', '不去重'],
+  去重规则: ['按 ID', '按链接', '按标题 + 日期', '不去重'],
   缺失处理: ['保留空值并标注', '填充 0', '跳过该行', '请求人工确认'],
   尺寸: ['16:9', '1:1', '4:3', '9:16'],
   风格: ['清爽数据看板', '运营日报封面', '极简图表', '品牌营销图'],
@@ -400,7 +537,6 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   渠道: ['邮件', '企业微信', '钉钉', '飞书', 'Slack', 'Webhook'],
   确认: ['发送前确认', '自动发送', '失败时确认'],
   结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
-  归档: ['保存执行日志', '保存日报与日志', '仅保存错误', '不保存'],
   日报模板: ['默认模板', '简洁版', '详细分析版', '自定义模板'],
   输出模式: ['输出网页 + 数据', '仅输出数据'],
 }
@@ -526,6 +662,7 @@ const NODE_META: Record<
       网址: 'https://www.goofish.com/',
       登录态: '使用当前设备浏览器',
       权限: '只读采集',
+      采集等待: '6s',
     },
   },
   request: {
@@ -534,7 +671,8 @@ const NODE_META: Record<
     role: 'fast',
     icon: NetworkIcon,
     accent: 'bg-cyan-500/12 text-cyan-700 dark:text-cyan-300',
-    description: '发起裸 HTTP 请求，获取接口或页面的结构化原始数据，不使用浏览器登录态。',
+    description:
+      '发起裸 HTTP 请求，获取接口或页面的结构化原始数据，不使用浏览器登录态。',
     inputs: ['任务描述'],
     outputs: ['JSON 数据', '请求日志'],
     settings: {
@@ -551,7 +689,8 @@ const NODE_META: Record<
     role: 'reasoning',
     icon: Table2Icon,
     accent: 'bg-violet-500/12 text-violet-700 dark:text-violet-300',
-    description: '清洗、归并、排序数据；有模板时按模板输出，没有模板时按数据类型自动整理。',
+    description:
+      '清洗、归并、排序数据；有模板时按模板输出，没有模板时按数据类型自动整理。',
     inputs: ['原始数据', '字段/格式模板', '任务描述'],
     outputs: ['标准表格', '关键结论'],
     settings: {
@@ -559,8 +698,10 @@ const NODE_META: Record<
       输出格式: '自动整理',
       表格字段: '自动按数据类型推断',
       整理模板: '未上传模板',
+      模板原文件名: '',
+      模板预览: '',
       模板内容: '',
-      去重规则: '按商品 ID',
+      去重规则: '按 ID',
       缺失处理: '保留空值并标注',
     },
   },
@@ -585,12 +726,16 @@ const NODE_META: Record<
     role: 'reasoning',
     icon: FileTextIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
-    description: '把表格、结论和图片整理成日报文档；格式、语气、标题等要求写在任务描述里。',
+    description:
+      '把表格、结论和图片整理成日报文档；格式、语气、标题等要求写在任务描述里。',
     inputs: ['标准表格', '关键结论', '图片 URL'],
-    outputs: ['Markdown 日报', 'CSV 表格', '归档路径'],
+    outputs: [...DEFAULT_REPORT_OUTPUT_FORMATS, REPORT_OUTPUT_PATH_LABEL],
     settings: {
-      模板目录: '/templates/reports',
-      输出目录: '/output/reports',
+      模板文件: '',
+      模板原文件名: '',
+      模板预览: '',
+      输出格式: DEFAULT_REPORT_OUTPUT_FORMATS.join('、'),
+      输出目录: 'data/output/reports',
     },
   },
   notify: {
@@ -613,13 +758,15 @@ const NODE_META: Record<
     role: 'reasoning',
     icon: MonitorIcon,
     accent: 'bg-teal-500/12 text-teal-700 dark:text-teal-300',
-    description: '将日报数据渲染成可交互的网页，支持自定义模板，后续只更新数据无需重新生成网页。',
+    description:
+      '将日报数据渲染成可交互的网页，支持自定义模板，后续只更新数据无需重新生成网页。',
     inputs: ['Markdown 日报', 'CSV 表格'],
     outputs: ['网页 URL', '数据文件'],
     settings: {
-      输出目录: '/output/web-reports',
-      网页模板: '默认模板',
-      模板目录: '/templates/web',
+      输出目录: 'data/output/web-reports',
+      网页模板: '',
+      模板原文件名: '',
+      模板预览: '',
       输出模式: '输出网页 + 数据',
     },
   },
@@ -629,14 +776,11 @@ const NODE_META: Record<
     role: 'system',
     icon: StopCircleIcon,
     accent: 'bg-slate-500/12 text-slate-700 dark:text-slate-300',
-    description: '可选控制节点，用于循环任务、中断流程或单独归档执行记录。',
+    description: '可选控制节点，用于循环任务、中断流程或标记流程结束。',
     inputs: ['执行结果'],
-    outputs: ['归档状态'],
+    outputs: ['结束状态'],
     settings: {
       结束方式: '本轮完成后停止',
-      归档: '保存执行日志',
-      输出目录: '/output/agent-runs',
-      归档位置: '工作区 / 日报归档',
     },
   },
 }
@@ -658,6 +802,7 @@ const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-transform-image', source: 'transform', target: 'image' },
   { id: 'e-transform-report', source: 'transform', target: 'report' },
   { id: 'e-image-report', source: 'image', target: 'report' },
+  { id: 'e-report-stop', source: 'report', target: 'stop' },
 ]
 
 export function AgentWorkspace({
@@ -673,10 +818,7 @@ export function AgentWorkspace({
     () => mergeSkillChoices(BASE_SKILL_CHOICES, managedSkills),
     [managedSkills]
   )
-  const modelChoices = useMemo(
-    () => buildModelChoices(models, currentModel),
-    [currentModel, models]
-  )
+  const modelChoices = useMemo(() => buildModelChoices(models), [models])
   const groupChoices = useMemo(
     () => buildGroupChoices(groups, currentGroup),
     [currentGroup, groups]
@@ -697,7 +839,7 @@ export function AgentWorkspace({
     initialBlueprint?.id ?? null
   )
   const [blueprintTitle, setBlueprintTitle] = useState(
-    initialBlueprint?.title ?? '闲鱼经营日报蓝图'
+    initialBlueprint?.title ?? '自动化任务蓝图'
   )
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(
     initialBlueprint?.updatedAt ?? null
@@ -718,6 +860,8 @@ export function AgentWorkspace({
   const [search, setSearch] = useState('')
   const addCounterRef = useRef(0)
   const lastSeedPromptRef = useRef<string | null>(null)
+  const previewRunIdRef = useRef(0)
+  const previewTimerRefs = useRef<number[]>([])
 
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -725,7 +869,62 @@ export function AgentWorkspace({
   )
 
   const executionNodes = useMemo(() => orderNodes(nodes, edges), [edges, nodes])
-  const currentBlueprintStatus = useMemo(() => getBlueprintStatus(nodes), [nodes])
+  const currentBlueprintStatus = useMemo(
+    () =>
+      getCurrentBlueprintStatus(
+        nodes,
+        currentBlueprintId
+          ? blueprints.find((blueprint) => blueprint.id === currentBlueprintId)
+              ?.status
+          : undefined
+      ),
+    [blueprints, currentBlueprintId, nodes]
+  )
+  const clearPreviewTimers = useCallback(() => {
+    previewTimerRefs.current.forEach((timer) => window.clearTimeout(timer))
+    previewTimerRefs.current = []
+  }, [])
+  const cancelPreviewRun = useCallback(() => {
+    previewRunIdRef.current += 1
+    clearPreviewTimers()
+  }, [clearPreviewTimers])
+  const persistCurrentBlueprintSnapshot = useCallback(
+    (
+      nextNodes: AgentFlowNode[],
+      nextExecutionLog: AgentExecutionLogMap,
+      statusOverride?: AgentBlueprintStatus,
+      nextEdges?: AgentFlowEdge[]
+    ) => {
+      if (!currentBlueprintId) return
+
+      const now = Date.now()
+      setLastSavedAt(now)
+      setBlueprints((current) => {
+        const nextBlueprints = current.map((blueprint) =>
+          blueprint.id === currentBlueprintId
+            ? {
+                ...blueprint,
+                nodes: nextNodes,
+                edges: nextEdges ?? blueprint.edges,
+                updatedAt: now,
+                status: statusOverride ?? getBlueprintStatus(nextNodes),
+                executionLog: nextExecutionLog,
+              }
+            : blueprint
+        )
+        writeSavedBlueprints(nextBlueprints)
+        notifyAgentBlueprintsChanged()
+        return nextBlueprints
+      })
+    },
+    [currentBlueprintId]
+  )
+
+  useEffect(() => {
+    return () => {
+      cancelPreviewRun()
+    }
+  }, [cancelPreviewRun])
 
   const onNodesChange = useCallback((changes: NodeChange<AgentFlowNode>[]) => {
     const removedIds = new Set(
@@ -766,7 +965,9 @@ export function AgentWorkspace({
       const fallbackNodeId = nodes.find((node) => node.id !== nodeId)?.id ?? ''
       setNodes((current) => current.filter((node) => node.id !== nodeId))
       setEdges((current) =>
-        current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId)
+        current.filter(
+          (edge) => edge.source !== nodeId && edge.target !== nodeId
+        )
       )
       setExecutionLog((current) => {
         if (!current[nodeId]) return current
@@ -786,13 +987,15 @@ export function AgentWorkspace({
   }, [])
 
   const handleReset = useCallback(() => {
+    cancelPreviewRun()
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
     setExecutionLog({})
     setSelectedNodeId('browser')
-  }, [templates])
+  }, [cancelPreviewRun, templates])
 
   const handleNewBlueprint = useCallback(() => {
+    cancelPreviewRun()
     setBlueprintTitle('新的智能体蓝图')
     setCurrentBlueprintId(null)
     setLastSavedAt(null)
@@ -800,7 +1003,7 @@ export function AgentWorkspace({
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
     setExecutionLog({})
     setSelectedNodeId('browser')
-  }, [templates])
+  }, [cancelPreviewRun, templates])
 
   const handleSaveBlueprint = useCallback(() => {
     const now = Date.now()
@@ -814,7 +1017,7 @@ export function AgentWorkspace({
       edges,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-      status: getBlueprintStatus(nodes),
+      status: currentBlueprintStatus,
       executionLog,
     }
     const next = [
@@ -828,17 +1031,33 @@ export function AgentWorkspace({
     setBlueprints(next)
     writeSavedBlueprints(next)
     notifyAgentBlueprintsChanged()
-  }, [blueprintTitle, blueprints, currentBlueprintId, edges, executionLog, nodes])
+  }, [
+    blueprintTitle,
+    blueprints,
+    currentBlueprintStatus,
+    currentBlueprintId,
+    edges,
+    executionLog,
+    nodes,
+  ])
 
-  const handleLoadBlueprint = useCallback((blueprint: SavedAgentBlueprint) => {
-    setCurrentBlueprintId(blueprint.id)
-    setBlueprintTitle(blueprint.title)
-    setLastSavedAt(blueprint.updatedAt)
-    setNodes(blueprint.nodes)
-    setEdges(blueprint.edges)
-    setExecutionLog(blueprint.executionLog ?? {})
-    setSelectedNodeId(blueprint.nodes[0]?.id ?? '')
-  }, [])
+  const handleLoadBlueprint = useCallback(
+    (blueprint: SavedAgentBlueprint) => {
+      const normalizedNodes = normalizeSavedBlueprintNodes(
+        blueprint.nodes.map((node) => normalizeNode(node)),
+        blueprint.status
+      )
+      cancelPreviewRun()
+      setCurrentBlueprintId(blueprint.id)
+      setBlueprintTitle(blueprint.title)
+      setLastSavedAt(blueprint.updatedAt)
+      setNodes(normalizedNodes)
+      setEdges(blueprint.edges)
+      setExecutionLog(blueprint.executionLog ?? {})
+      setSelectedNodeId(normalizedNodes[0]?.id ?? '')
+    },
+    [cancelPreviewRun]
+  )
 
   const handleDeleteBlueprint = useCallback(
     (blueprintId: string) => {
@@ -849,6 +1068,7 @@ export function AgentWorkspace({
 
       if (currentBlueprintId !== blueprintId) return
 
+      cancelPreviewRun()
       const fallback = next[0]
       if (fallback) {
         handleLoadBlueprint(fallback)
@@ -863,75 +1083,205 @@ export function AgentWorkspace({
       setExecutionLog({})
       setSelectedNodeId('browser')
     },
-    [blueprints, currentBlueprintId, handleLoadBlueprint, templates]
+    [
+      blueprints,
+      cancelPreviewRun,
+      currentBlueprintId,
+      handleLoadBlueprint,
+      templates,
+    ]
   )
 
   const handleRunPreview = useCallback(() => {
-    const statusById = new Map<string, AgentNodeStatus>()
-    executionNodes.forEach((node) => {
-      statusById.set(node.id, 'done')
-    })
-    const nextExecutionLog = buildPreviewExecutionLog(
-      executionNodes,
-      statusById,
-      skillChoices
-    )
-    setExecutionLog(nextExecutionLog)
-    setNodes((current) => {
-      const nextNodes = current.map((node) => {
-        const status = statusById.get(node.id)
-        if (!status) return node
-        return { ...node, data: { ...node.data, status } }
-      })
-      if (currentBlueprintId) {
-        const nextBlueprints = blueprints.map((blueprint) =>
-          blueprint.id === currentBlueprintId
-            ? {
-                ...blueprint,
-                nodes: nextNodes,
-                updatedAt: Date.now(),
-                status: getBlueprintStatus(nextNodes),
-                executionLog: nextExecutionLog,
-              }
-            : blueprint
+    const prepared = ensureTerminalStopNode(nodes, edges, templateByKind)
+    const runExecutionNodes = orderNodes(prepared.nodes, prepared.edges)
+    if (runExecutionNodes.length === 0) return
+
+    cancelPreviewRun()
+    const runId = previewRunIdRef.current
+    const timers: number[] = []
+
+    if (prepared.changed) {
+      setEdges(prepared.edges)
+    }
+
+    const commitPreviewStateForNodes = (
+      activeNodes: AgentFlowNode[],
+      statusById: Map<string, AgentNodeStatus>,
+      finalizeTriggers = false
+    ) => {
+      const displayStatusById = finalizeTriggers
+        ? finalizeTriggerNodeStatuses(activeNodes, statusById)
+        : statusById
+      const nextExecutionLog = buildPreviewExecutionLog(
+        activeNodes,
+        statusById,
+        skillChoices,
+        prepared.edges
+      )
+
+      setExecutionLog(nextExecutionLog)
+      setNodes((current) => {
+        const activeNodeById = new Map(
+          activeNodes.map((node) => [node.id, node])
         )
-        setBlueprints(nextBlueprints)
-        writeSavedBlueprints(nextBlueprints)
-        notifyAgentBlueprintsChanged()
-      }
-      return nextNodes
-    })
-  }, [blueprints, currentBlueprintId, executionNodes, skillChoices])
+        const currentById = new Map(current.map((node) => [node.id, node]))
+        const nextNodes = current.map((node) => {
+          const activeNode = activeNodeById.get(node.id)
+          const status = displayStatusById.get(node.id)
+          if (!activeNode && !status) return node
+          return {
+            ...(activeNode ?? node),
+            data: {
+              ...(activeNode?.data ?? node.data),
+              status: status ?? activeNode?.data.status ?? node.data.status,
+            },
+          }
+        })
+        activeNodes.forEach((activeNode) => {
+          if (currentById.has(activeNode.id)) return
+          const status =
+            displayStatusById.get(activeNode.id) ?? activeNode.data.status
+          nextNodes.push({
+            ...activeNode,
+            data: { ...activeNode.data, status },
+          })
+        })
+        persistCurrentBlueprintSnapshot(
+          stripTransientNodeSettings(nextNodes),
+          nextExecutionLog,
+          finalizeTriggers ? undefined : 'running',
+          prepared.edges
+        )
+        return nextNodes
+      })
+    }
+
+    const appendReportOutputLogs = (
+      outputsByNodeId: Record<
+        string,
+        { files: AgentReportWrittenFile[]; outputDirectory: string }
+      >
+    ) => {
+      if (Object.keys(outputsByNodeId).length === 0) return
+      setExecutionLog((current) => {
+        const next = { ...current }
+        for (const [nodeId, output] of Object.entries(outputsByNodeId)) {
+          const log = next[nodeId]
+          if (!log) continue
+          next[nodeId] = {
+            ...log,
+            message: '日报文件已写入生成日报节点配置的输出目录。',
+            outputSummary: [
+              ...log.outputSummary.filter(
+                (item) =>
+                  !item.startsWith('实际文件:') && !item.startsWith('归档目录:')
+              ),
+              `归档目录: ${output.outputDirectory}`,
+              ...output.files.map(
+                (file) => `实际文件: ${file.label} -> ${file.path}`
+              ),
+            ],
+            steps: [
+              ...log.steps,
+              ...output.files.map((file) => `写入 ${file.label}: ${file.path}`),
+            ],
+          }
+        }
+        setNodes((currentNodes) => {
+          persistCurrentBlueprintSnapshot(
+            stripTransientNodeSettings(currentNodes),
+            next,
+            undefined,
+            prepared.edges
+          )
+          return currentNodes
+        })
+        return next
+      })
+    }
+
+    const startTimedPreview = (capturedNodes: AgentFlowNode[]) => {
+      capturedNodes.forEach((_, index) => {
+        const timer = window.setTimeout(
+          () => {
+            if (previewRunIdRef.current !== runId) return
+
+            const isFinalStep = index === capturedNodes.length - 1
+            const statusById = buildPreviewStatusMap(capturedNodes, index)
+            commitPreviewStateForNodes(capturedNodes, statusById, isFinalStep)
+
+            if (isFinalStep) {
+              previewTimerRefs.current = []
+              const completedLog = buildPreviewExecutionLog(
+                capturedNodes,
+                statusById,
+                skillChoices,
+                prepared.edges
+              )
+              void writeCompletedReportOutputs(capturedNodes, completedLog)
+                .then((outputsByNodeId) => {
+                  if (previewRunIdRef.current !== runId) return
+                  appendReportOutputLogs(outputsByNodeId)
+                })
+                .catch((error) => {
+                  toast.error(
+                    error instanceof Error ? error.message : '日报文件写入失败'
+                  )
+                })
+            }
+          },
+          480 * (index + 1)
+        )
+        timers.push(timer)
+      })
+      previewTimerRefs.current = timers
+    }
+
+    commitPreviewStateForNodes(
+      runExecutionNodes,
+      buildPreviewStatusMap(runExecutionNodes, -1)
+    )
+
+    void captureBrowserNodes(runExecutionNodes)
+      .then((capturedNodes) => {
+        if (previewRunIdRef.current !== runId) return
+        startTimedPreview(capturedNodes)
+      })
+      .catch((error) => {
+        if (previewRunIdRef.current !== runId) return
+        toast.error(
+          error instanceof Error ? error.message : '浏览器自动采集失败'
+        )
+        startTimedPreview(markBrowserCaptureError(runExecutionNodes, error))
+      })
+  }, [
+    cancelPreviewRun,
+    edges,
+    nodes,
+    persistCurrentBlueprintSnapshot,
+    skillChoices,
+    templateByKind,
+  ])
 
   const handleStopPreview = useCallback(() => {
+    cancelPreviewRun()
     const stoppedAt = Date.now()
     const nextExecutionLog = stopRunningExecutionLogs(executionLog, stoppedAt)
     setExecutionLog(nextExecutionLog)
     setNodes((current) => {
       const nextNodes = current.map((node) =>
         node.data.status === 'running'
-          ? { ...node, data: { ...node.data, status: 'waiting' as AgentNodeStatus } }
+          ? {
+              ...node,
+              data: { ...node.data, status: 'waiting' as AgentNodeStatus },
+            }
           : node
       )
-      if (currentBlueprintId) {
-        const nextBlueprints = blueprints.map((blueprint) =>
-          blueprint.id === currentBlueprintId
-            ? {
-                ...blueprint,
-                nodes: nextNodes,
-                updatedAt: Date.now(),
-                status: 'paused' as const,
-                executionLog: nextExecutionLog,
-              }
-            : blueprint
-        )
-        setBlueprints(nextBlueprints)
-        writeSavedBlueprints(nextBlueprints)
-        notifyAgentBlueprintsChanged()
-      }
+      persistCurrentBlueprintSnapshot(nextNodes, nextExecutionLog, 'paused')
       return nextNodes
     })
-  }, [blueprints, currentBlueprintId, executionLog])
+  }, [cancelPreviewRun, executionLog, persistCurrentBlueprintSnapshot])
 
   const handleAddSkill = useCallback((skill: SkillChoice) => {
     setManagedSkills((current) => {
@@ -983,15 +1333,16 @@ export function AgentWorkspace({
 
   const handleUpdateSetting = useCallback(
     (key: string, value: string) => {
-      if (!selectedNode) return
-      handleUpdateNode({
-        settings: {
-          ...selectedNode.data.settings,
-          [key]: value,
-        },
-      })
+      if (!selectedNodeId) return
+      setNodes((current) =>
+        current.map((node) =>
+          node.id === selectedNodeId
+            ? updateNodeSettingValue(node, key, value)
+            : node
+        )
+      )
     },
-    [handleUpdateNode, selectedNode]
+    [selectedNodeId]
   )
 
   const handleSetNodeSkill = useCallback((nodeId: string, skill: string) => {
@@ -1077,7 +1428,6 @@ export function AgentWorkspace({
         blueprintTitle={blueprintTitle}
         currentBlueprintStatus={currentBlueprintStatus}
         currentGroup={currentGroup}
-        currentModel={currentModel}
         edges={edges}
         executionLog={executionLog}
         executionNodes={executionNodes}
@@ -1125,7 +1475,6 @@ type BlueprintWorkspaceProps = {
   blueprintTitle: string
   currentBlueprintStatus: AgentBlueprintStatus
   currentGroup?: string
-  currentModel?: string
   lastSavedAt: number | null
   search: string
   onSearchChange: (value: string) => void
@@ -1161,7 +1510,6 @@ function BlueprintWorkspace({
   blueprintTitle,
   currentBlueprintStatus,
   currentGroup,
-  currentModel,
   lastSavedAt,
   search,
   onSearchChange,
@@ -1240,7 +1588,7 @@ function BlueprintWorkspace({
         />
       </aside>
 
-      <div className='flex min-w-0 flex-1 flex-col'>
+      <div className='relative flex min-w-0 flex-1 flex-col'>
         <div className='border-border/70 flex min-h-0 shrink-0 items-center gap-2 border-b px-3 py-2 lg:hidden'>
           <CompactPalette groups={filteredGroups} onAddNode={onAddNode} />
         </div>
@@ -1315,7 +1663,7 @@ function BlueprintWorkspace({
                   onClick={onRunPreview}
                 >
                   <ZapIcon className='size-3.5' />
-                  {currentBlueprintStatus === 'paused' ? '继续' : '试运行'}
+                  {getRunPreviewButtonLabel(currentBlueprintStatus)}
                 </Button>
               )}
             </div>
@@ -1365,11 +1713,11 @@ function BlueprintWorkspace({
               gap={20}
             />
             <Controls
-              className='!left-3 !bottom-3 rounded-[8px] border shadow-none'
+              className='!bottom-12 !left-2 rounded-[8px] border shadow-none'
               position='bottom-left'
             />
             <MiniMap
-              className='border-border/70 bg-background/90 !right-3 !bottom-3 overflow-hidden rounded-[8px] border shadow-sm'
+              className='border-border/70 bg-background/90 !right-2 !bottom-12 overflow-hidden rounded-[8px] border shadow-sm'
               maskColor='color-mix(in oklch, var(--background) 68%, transparent)'
               nodeBorderRadius={8}
               nodeColor={(node) =>
@@ -1382,21 +1730,24 @@ function BlueprintWorkspace({
           </ReactFlow>
         </main>
 
-        <ExecutionPreviewDock
-          executionLog={executionLog}
-          executionNodes={executionNodes}
-          isOpen={isPreviewOpen}
-          selectedNode={selectedNode}
-          skillChoices={skillChoices}
-          onSelectNode={onSelectNode}
-          onOpenChange={setIsPreviewOpen}
-        />
+        <div className='pointer-events-none absolute inset-x-0 bottom-0 z-20'>
+          <div className='pointer-events-auto'>
+            <ExecutionPreviewDock
+              executionLog={executionLog}
+              executionNodes={executionNodes}
+              isOpen={isPreviewOpen}
+              selectedNode={selectedNode}
+              skillChoices={skillChoices}
+              onSelectNode={onSelectNode}
+              onOpenChange={setIsPreviewOpen}
+            />
+          </div>
+        </div>
       </div>
 
-      <aside className='border-border/70 bg-background hidden w-82 shrink-0 flex-col border-l xl:flex'>
+      <aside className='border-border/70 bg-background hidden w-[333px] shrink-0 flex-col border-l xl:flex'>
         <Inspector
           currentGroup={currentGroup}
-          currentModel={currentModel}
           groupChoices={groupChoices}
           modelChoices={modelChoices}
           skillChoices={skillChoices}
@@ -1443,16 +1794,16 @@ function Palette({
             <span className='text-sm font-semibold'>工具库</span>
           </div>
 
-          <TabsList className='h-7 w-full rounded-none border-0 bg-transparent p-0 gap-0'>
+          <TabsList className='h-7 w-full gap-0 rounded-none border-0 bg-transparent p-0'>
             <TabsTrigger
               value='components'
-              className='h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+              className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
             >
               组件
             </TabsTrigger>
             <TabsTrigger
               value='skills'
-              className='h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+              className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
             >
               Skill
               <span className='bg-muted text-muted-foreground ml-1 rounded-full px-1.5 py-0 text-[10px] leading-[14px]'>
@@ -1484,7 +1835,7 @@ function Palette({
           <div className='min-h-0 flex-1 overflow-y-auto px-2 pb-3'>
             {groups.map((group) => (
               <div key={group.title} className='mb-1'>
-                <div className='text-muted-foreground px-1 pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-widest'>
+                <div className='text-muted-foreground px-1 pt-0.5 pb-1 text-[10px] font-semibold tracking-widest uppercase'>
                   {group.title}
                 </div>
                 <div className='grid gap-0.5'>
@@ -1514,23 +1865,6 @@ function Palette({
       </Tabs>
     </div>
   )
-}
-
-function ToolPanelToggle({
-  active,
-  description,
-  icon: _Icon,
-  title: _title,
-  onClick: _onClick,
-}: {
-  active: boolean
-  description: string
-  icon: LucideIcon
-  title: string
-  onClick: () => void
-}) {
-  // Kept for API compatibility but no longer rendered in the new Palette design
-  return null
 }
 
 function CompactPalette({
@@ -1580,7 +1914,7 @@ function PaletteItem({
   return (
     <button
       type='button'
-      className='hover:bg-accent/60 group flex w-full items-center gap-2.5 rounded-[7px] px-2 py-2 text-left transition-colors'
+      className='hover:bg-accent/60 group flex w-full items-start gap-2.5 rounded-[7px] px-2 py-2 text-left transition-colors'
       draggable
       onClick={() => onAddNode(kind)}
       onDragStart={(event) => {
@@ -1590,7 +1924,7 @@ function PaletteItem({
     >
       <span
         className={cn(
-          'flex size-7 shrink-0 items-center justify-center rounded-[6px]',
+          'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-[6px]',
           meta.accent
         )}
       >
@@ -1598,11 +1932,11 @@ function PaletteItem({
       </span>
       <span className='min-w-0 flex-1'>
         <span className='block truncate text-xs font-medium'>{meta.label}</span>
-        <span className='text-muted-foreground line-clamp-2 block whitespace-normal break-words text-[10px] leading-snug'>
+        <span className='text-muted-foreground line-clamp-2 block text-[10px] leading-snug break-words whitespace-normal'>
           {meta.description}
         </span>
       </span>
-      <PlusIcon className='text-muted-foreground size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
+      <PlusIcon className='text-muted-foreground mt-2 size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
     </button>
   )
 }
@@ -1831,7 +2165,9 @@ function SkillLinkBadge({
         />
         Skill
       </span>
-      {!hasSkill && <PlusIcon className='text-muted-foreground size-3 shrink-0' />}
+      {!hasSkill && (
+        <PlusIcon className='text-muted-foreground size-3 shrink-0' />
+      )}
       <select
         value={skill}
         onClick={(event) => event.stopPropagation()}
@@ -1886,7 +2222,6 @@ function Inspector({
   groupChoices,
   skillChoices,
   currentGroup,
-  currentModel,
   onDeleteNode,
   onUpdateNode,
   onUpdateSetting,
@@ -1896,7 +2231,6 @@ function Inspector({
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   currentGroup?: string
-  currentModel?: string
   onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
@@ -1918,7 +2252,6 @@ function Inspector({
           <div className='space-y-4 p-3'>
             <NodeConfigPanel
               currentGroup={currentGroup}
-              currentModel={currentModel}
               groupChoices={groupChoices}
               modelChoices={modelChoices}
               node={selectedNode}
@@ -1950,7 +2283,9 @@ function ExecutionLogPanel({
       <div className='text-muted-foreground flex flex-col items-center justify-center gap-2 p-8 text-center text-xs'>
         <FileSpreadsheetIcon className='size-8 opacity-30' />
         <p>暂无执行记录</p>
-        <p className='opacity-60'>点击「试运行」后此处会显示每个节点的执行状态</p>
+        <p className='opacity-60'>
+          点击「试运行」后此处会显示每个节点的执行状态
+        </p>
       </div>
     )
   }
@@ -1964,7 +2299,7 @@ function ExecutionLogPanel({
           还没有生成详细日志。点击「试运行」后会记录每个节点的输入、输出、步骤和耗时。
         </div>
       )}
-      {executionNodes.map((node, index) => {
+      {executionNodes.map((node) => {
         const meta = NODE_META[node.data.kind]
         const Icon = meta.icon
         const status = node.data.status
@@ -1983,9 +2318,6 @@ function ExecutionLogPanel({
             )}
           >
             <div className='flex items-center gap-2'>
-              <div className='bg-background flex size-5 shrink-0 items-center justify-center rounded border text-[10px] font-semibold'>
-                {index + 1}
-              </div>
               <div
                 className={cn(
                   'flex size-6 shrink-0 items-center justify-center rounded-[6px]',
@@ -1995,13 +2327,17 @@ function ExecutionLogPanel({
                 <Icon className='size-3' />
               </div>
               <div className='min-w-0 flex-1'>
-                <div className='truncate text-[11px] font-medium'>{node.data.title}</div>
-                <div className='text-muted-foreground truncate text-[10px]'>{node.data.model}</div>
+                <div className='truncate text-[11px] font-medium'>
+                  {node.data.title}
+                </div>
+                <div className='text-muted-foreground truncate text-[10px]'>
+                  {node.data.model}
+                </div>
               </div>
               <StatusDot status={status} />
             </div>
 
-            <div className='mt-2 space-y-2 pl-[52px]'>
+            <div className='mt-2 space-y-2 pl-8'>
               <div className='flex flex-wrap items-center gap-1.5 text-[10px]'>
                 <span
                   className={cn(
@@ -2009,16 +2345,15 @@ function ExecutionLogPanel({
                     logStatus === 'running' && 'bg-blue-500/12 text-blue-700',
                     logStatus === 'completed' &&
                       'bg-emerald-500/12 text-emerald-700',
-                    logStatus === 'pending' &&
-                      'bg-amber-500/12 text-amber-700',
-                    logStatus === 'stopped' &&
-                      'bg-slate-500/12 text-slate-700'
+                    logStatus === 'pending' && 'bg-amber-500/12 text-amber-700',
+                    logStatus === 'stopped' && 'bg-slate-500/12 text-slate-700'
                   )}
                 >
                   {formatLogStatus(logStatus)}
                 </span>
                 <span className='text-muted-foreground'>
-                  开始 {log?.startedAt ? formatLogTime(log.startedAt) : '未开始'}
+                  开始{' '}
+                  {log?.startedAt ? formatLogTime(log.startedAt) : '未开始'}
                 </span>
                 <span className='text-muted-foreground'>
                   耗时 {formatDuration(log?.durationMs)}
@@ -2026,13 +2361,15 @@ function ExecutionLogPanel({
               </div>
 
               <p className='text-muted-foreground text-[10px] leading-relaxed'>
-                {log?.message ?? '节点尚未开始执行，等待上游节点完成后进入队列。'}
+                {log?.message ??
+                  '节点尚未开始执行，等待上游节点完成后进入队列。'}
               </p>
 
               {log && (
                 <>
                   <LogSummaryList title='输入' values={log.inputSummary} />
                   <LogSummaryList title='输出' values={log.outputSummary} />
+                  <ModelOutputBlock output={log.modelOutput} />
                   <div>
                     <div className='text-muted-foreground mb-1 text-[10px] font-medium'>
                       步骤
@@ -2097,6 +2434,19 @@ function LogSummaryList({
   )
 }
 
+function ModelOutputBlock({ output }: { output: string }) {
+  return (
+    <div>
+      <div className='text-muted-foreground mb-1 text-[10px] font-medium'>
+        模型输出结果
+      </div>
+      <div className='bg-background/80 border-border/60 max-h-32 overflow-y-auto rounded-[6px] border px-2 py-1.5 text-[10px] leading-relaxed whitespace-pre-wrap'>
+        {output || '暂无模型输出。'}
+      </div>
+    </div>
+  )
+}
+
 function formatLogStatus(status: AgentNodeLogStatus) {
   const labels: Record<AgentNodeLogStatus, string> = {
     pending: '等待',
@@ -2127,6 +2477,118 @@ function formatDuration(durationMs?: number) {
   return `${(durationMs / 1000).toFixed(1)}s`
 }
 
+function parseBrowserCaptureWaitSeconds(value: string | undefined) {
+  const parsed = Number.parseInt(value || '', 10)
+  if (!Number.isFinite(parsed)) return 6
+  return Math.min(30, Math.max(1, parsed))
+}
+
+function browserCapturedText(node: AgentFlowNode) {
+  return (
+    node.data.settings[BROWSER_CAPTURE_TEXT_SETTING] ||
+    node.data.settings[BROWSER_PAGE_DATA_SETTING] ||
+    ''
+  ).trim()
+}
+
+function browserCaptureError(node: AgentFlowNode) {
+  return node.data.settings['采集错误']?.trim() || ''
+}
+
+function updateNodeRuntimeSettings(
+  nodes: AgentFlowNode[],
+  nodeId: string,
+  patch: Record<string, string>
+) {
+  return nodes.map((node) =>
+    node.id === nodeId
+      ? {
+          ...node,
+          data: {
+            ...node.data,
+            settings: { ...node.data.settings, ...patch },
+          },
+        }
+      : node
+  )
+}
+
+async function captureBrowserNodes(nodes: AgentFlowNode[]) {
+  let nextNodes = nodes
+
+  for (const node of nodes) {
+    if (node.data.kind !== 'browser') continue
+
+    const url = node.data.settings['网址']?.trim()
+    if (!url) {
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        采集错误: '浏览器取数节点未配置网址。',
+      })
+      continue
+    }
+
+    try {
+      const result = await captureAgentBrowserPage({
+        url,
+        login_state: node.data.settings['登录态'] || '',
+        wait_seconds: parseBrowserCaptureWaitSeconds(
+          node.data.settings['采集等待']
+        ),
+      })
+      const text = result.text.trim()
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [BROWSER_CAPTURE_TEXT_SETTING]: text,
+        [BROWSER_PAGE_DATA_SETTING]: text,
+        采集标题: result.title,
+        采集网址: result.final_url || result.url,
+        采集时间: String(result.captured_at),
+        采集错误: text ? '' : '浏览器已打开页面，但未返回可解析的页面文本。',
+      })
+    } catch (error) {
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [BROWSER_CAPTURE_TEXT_SETTING]: '',
+        [BROWSER_PAGE_DATA_SETTING]: '',
+        采集错误:
+          error instanceof Error ? error.message : '浏览器自动采集失败。',
+      })
+    }
+  }
+
+  return nextNodes
+}
+
+function markBrowserCaptureError(nodes: AgentFlowNode[], error: unknown) {
+  const message =
+    error instanceof Error ? error.message : '浏览器自动采集失败。'
+  return nodes.map((node) =>
+    node.data.kind === 'browser'
+      ? updateNodeRuntimeSettings([node], node.id, {
+          [BROWSER_CAPTURE_TEXT_SETTING]: '',
+          [BROWSER_PAGE_DATA_SETTING]: '',
+          采集错误: message,
+        })[0]
+      : node
+  )
+}
+
+function stripTransientNodeSettings(nodes: AgentFlowNode[]) {
+  return nodes.map((node) => {
+    if (node.data.kind !== 'browser') return node
+
+    const settings = { ...node.data.settings }
+    for (const key of TRANSIENT_BROWSER_SETTING_LABELS) {
+      delete settings[key]
+    }
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        settings,
+      },
+    }
+  })
+}
+
 function stopRunningExecutionLogs(
   current: AgentExecutionLogMap,
   stoppedAt: number
@@ -2144,16 +2606,50 @@ function stopRunningExecutionLogs(
       endedAt: stoppedAt,
       durationMs,
       message: '试运行已手动停止，节点保留最后一次执行上下文。',
+      modelOutput:
+        log.modelOutput || '执行被停止，尚未产生完整的模型输出结果。',
       steps: [...log.steps, '收到停止指令并写入节点日志。'],
     }
   }
   return next
 }
 
+function buildPreviewStatusMap(
+  executionNodes: AgentFlowNode[],
+  completedIndex: number
+): Map<string, AgentNodeStatus> {
+  const statusById = new Map<string, AgentNodeStatus>()
+  executionNodes.forEach((node, index) => {
+    if (index <= completedIndex) {
+      statusById.set(node.id, 'done')
+    } else if (index === completedIndex + 1) {
+      statusById.set(node.id, 'running')
+    } else {
+      statusById.set(node.id, 'waiting')
+    }
+  })
+  return statusById
+}
+
+function finalizeTriggerNodeStatuses(
+  executionNodes: AgentFlowNode[],
+  statusById: Map<string, AgentNodeStatus>
+): Map<string, AgentNodeStatus> {
+  const next = new Map(statusById)
+  executionNodes.forEach((node) => {
+    if (statusById.get(node.id) !== 'done') return
+    if (node.data.kind === 'schedule') {
+      next.set(node.id, 'waiting')
+    }
+  })
+  return next
+}
+
 function buildPreviewExecutionLog(
   executionNodes: AgentFlowNode[],
   statusById: Map<string, AgentNodeStatus>,
-  skillChoices: SkillChoice[]
+  skillChoices: SkillChoice[],
+  edges: AgentFlowEdge[] = []
 ): AgentExecutionLogMap {
   const now = Date.now()
   let completedIndex = 0
@@ -2179,6 +2675,8 @@ function buildPreviewExecutionLog(
       durationMs = now - startedAt
     }
 
+    const upstreamLogs = directUpstreamLogs(node, acc, edges)
+
     acc[node.id] = {
       nodeId: node.id,
       status: logStatus,
@@ -2186,12 +2684,188 @@ function buildPreviewExecutionLog(
       endedAt,
       durationMs,
       message: buildNodeLogMessage(node, logStatus),
-      inputSummary: buildNodeInputSummary(node),
-      outputSummary: buildNodeOutputSummary(node, logStatus),
-      steps: buildNodeLogSteps(node, logStatus, skillChoices),
+      inputSummary: buildNodeInputSummary(node, upstreamLogs),
+      outputSummary: buildNodeOutputSummary(node, logStatus, upstreamLogs),
+      modelOutput: buildNodeModelOutput(
+        node,
+        logStatus,
+        skillChoices,
+        upstreamLogs
+      ),
+      steps: buildNodeLogSteps(node, logStatus, skillChoices, upstreamLogs),
     }
     return acc
   }, {})
+}
+
+function directUpstreamLogs(
+  node: AgentFlowNode,
+  logs: AgentExecutionLogMap,
+  edges: AgentFlowEdge[]
+) {
+  return edges
+    .filter((edge) => edge.target === node.id)
+    .map((edge) => logs[edge.source])
+    .filter((log): log is AgentNodeExecutionLog => Boolean(log))
+}
+
+async function writeCompletedReportOutputs(
+  executionNodes: AgentFlowNode[],
+  executionLog: AgentExecutionLogMap
+) {
+  const results: Record<
+    string,
+    { files: AgentReportWrittenFile[]; outputDirectory: string }
+  > = {}
+
+  for (const node of executionNodes) {
+    if (node.data.kind !== 'report') continue
+    const log = executionLog[node.id]
+    if (!log || log.status !== 'completed') continue
+    const files = buildReportArtifactFiles(node, log)
+    if (files.length === 0) continue
+
+    const outputDir =
+      node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
+    const result = await writeAgentReport({
+      title: node.data.title,
+      output_directory: outputDir,
+      files,
+    })
+    results[node.id] = {
+      files: result.files,
+      outputDirectory: result.output_directory,
+    }
+  }
+
+  return results
+}
+
+function buildReportArtifactFiles(
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+): AgentReportOutputFile[] {
+  const templateFiles = buildReportArtifactFilesFromTemplates(node, log)
+  if (templateFiles.length > 0) return templateFiles
+
+  return reportFileOutputLabels(node).map((label) => {
+    const extension = reportExtensionForLabel(label)
+    const template = findReportTemplateForExtension(node, extension)
+    return {
+      label,
+      extension,
+      content: buildReportArtifactContent(label, extension, node, log),
+      template_path: template?.path,
+      template_original_name: template?.originalName,
+    }
+  })
+}
+
+function buildReportArtifactFilesFromTemplates(
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+): AgentReportOutputFile[] {
+  const bindings = parseTemplateBindings(
+    node.data.settings['模板文件'] || '',
+    node.data.settings
+  )
+  return bindings
+    .map<AgentReportOutputFile | null>((binding) => {
+      const label = reportOutputFormatForTemplatePath(binding.path)
+      if (!label) return null
+      const extension = reportExtensionForLabel(label)
+      return {
+        label,
+        extension,
+        content: buildReportArtifactContent(label, extension, node, log),
+        template_path: binding.path,
+        template_original_name: binding.originalName,
+      }
+    })
+    .filter((file): file is AgentReportOutputFile => Boolean(file))
+}
+
+function buildReportArtifactContent(
+  label: string,
+  extension: string,
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+) {
+  if (extension === 'csv') return buildReportCsvContent(label, node, log)
+  if (extension === 'json') return buildReportJsonContent(label, node, log)
+  if (extension === 'html') return buildReportHtmlContent(label, node, log)
+  if (extension === 'txt') return log.modelOutput
+  return log.modelOutput
+}
+
+function buildReportCsvContent(
+  label: string,
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+) {
+  const rows = [
+    ['类型', '内容'],
+    ['节点', node.data.title],
+    ['输出格式', label],
+    ['节点描述', node.data.description],
+    ...log.inputSummary.map((item) => ['输入', item]),
+    ['生成内容', log.modelOutput],
+  ]
+  return rows.map((row) => row.map(csvCell).join(',')).join('\n')
+}
+
+function buildReportJsonContent(
+  label: string,
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+) {
+  return JSON.stringify(
+    {
+      node: node.data.title,
+      output_format: label,
+      description: node.data.description,
+      input_summary: log.inputSummary,
+      output_summary: log.outputSummary,
+      content: log.modelOutput,
+    },
+    null,
+    2
+  )
+}
+
+function buildReportHtmlContent(
+  label: string,
+  node: AgentFlowNode,
+  log: AgentNodeExecutionLog
+) {
+  return [
+    '<!doctype html>',
+    '<html lang="zh-CN">',
+    '<head>',
+    '<meta charset="utf-8" />',
+    `<title>${escapeHtml(node.data.title)}</title>`,
+    '</head>',
+    '<body>',
+    `<h1>${escapeHtml(node.data.title)}</h1>`,
+    `<p><strong>输出格式:</strong> ${escapeHtml(label)}</p>`,
+    `<p>${escapeHtml(node.data.description)}</p>`,
+    `<pre>${escapeHtml(log.modelOutput)}</pre>`,
+    '</body>',
+    '</html>',
+  ].join('\n')
+}
+
+function csvCell(value: string) {
+  return `"${value.replace(/"/g, '""')}"`
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 function estimateNodeDuration(node: AgentFlowNode, index: number) {
@@ -2210,12 +2884,31 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
   return baseByKind[node.data.kind] + index * 90
 }
 
-function buildNodeInputSummary(node: AgentFlowNode) {
+function buildNodeInputSummary(
+  node: AgentFlowNode,
+  upstreamLogs: AgentNodeExecutionLog[] = []
+) {
   const summaries = node.data.inputs.map((input) => {
     const settingValue = node.data.settings[input]
     if (settingValue) return `${input}: ${settingValue}`
-    return `${input}: 来自上游节点或当前运行上下文`
+    return `${input}: 来自上一节点输出`
   })
+
+  if (node.data.kind === 'browser') {
+    const pageData = browserCapturedText(node)
+    const error = browserCaptureError(node)
+    summaries.push(
+      pageData
+        ? `页面数据: 已自动采集 ${pageData.length} 个字符`
+        : error
+          ? `页面数据: 自动采集失败，${error}`
+          : '页面数据: 等待自动浏览器采集'
+    )
+  } else if (upstreamLogs.length > 0) {
+    summaries.push(
+      `上游输出: ${upstreamLogs.filter((log) => log.status === 'completed').length} 个已完成节点`
+    )
+  }
 
   if (summaries.length > 0) return summaries
 
@@ -2226,9 +2919,34 @@ function buildNodeInputSummary(node: AgentFlowNode) {
 
 function buildNodeOutputSummary(
   node: AgentFlowNode,
-  status: AgentNodeLogStatus
+  status: AgentNodeLogStatus,
+  upstreamLogs: AgentNodeExecutionLog[] = []
 ) {
   if (node.data.outputs.length === 0) return ['无显式输出']
+
+  if (node.data.kind === 'browser' && status === 'completed') {
+    const metrics = parseXianyuOverviewMetrics(browserCapturedText(node))
+    const error = browserCaptureError(node)
+    return metrics.length > 0
+      ? [
+          `页面数据: 已解析 ${metrics.length} 个闲鱼数据总览指标`,
+          '截图证据: 当前版本先采集 DOM 文本，暂未写入截图文件',
+        ]
+      : [
+          error
+            ? `页面数据: 自动采集失败，${error}`
+            : '页面数据: 未获取可解析的真实页面数据',
+          '截图证据: 当前版本先采集 DOM 文本，暂未写入截图文件',
+        ]
+  }
+
+  if (
+    (node.data.kind === 'transform' || node.data.kind === 'report') &&
+    hasMissingBrowserData(upstreamLogs) &&
+    status === 'completed'
+  ) {
+    return node.data.outputs.map((output) => `${output}: 上游真实数据缺失`)
+  }
 
   if (node.data.kind === 'report') {
     return buildReportOutputSummary(node, status)
@@ -2238,48 +2956,450 @@ function buildNodeOutputSummary(
     pending: '等待生成',
     running: '生成中',
     completed: '已生成预览样本',
-    stopped: '已停止，保留部分上下文',
+    stopped: '已停止，保留部分输入',
   }
 
   return node.data.outputs.map((output) => `${output}: ${suffix[status]}`)
+}
+
+function buildNodeModelOutput(
+  node: AgentFlowNode,
+  status: AgentNodeLogStatus,
+  skillChoices: SkillChoice[],
+  upstreamLogs: AgentNodeExecutionLog[] = []
+) {
+  if (status === 'pending') {
+    return '节点尚未调用模型，等待上游节点完成后生成输出。'
+  }
+  if (status === 'running') {
+    return '模型调用进行中，输出会在当前节点完成后写入这里。'
+  }
+  if (status === 'stopped') {
+    return '执行被停止，尚未产生完整的模型输出结果。'
+  }
+
+  const skill = getSkillChoice(node.data.skill, skillChoices)
+  const skillLine = node.data.skill ? `\nSkill: ${skill.label}` : ''
+
+  switch (node.data.kind) {
+    case 'start':
+      return [
+        '本地执行结果: 已触发当前流程。',
+        `启动节点: ${node.data.title}`,
+        '后续节点仅接收上一节点输出和自身描述。',
+      ].join('\n')
+    case 'schedule':
+      return [
+        '本地执行结果: 定时触发条件已匹配。',
+        `执行频率: ${node.data.settings['执行频率'] || '每日 09:00'}`,
+        '已向后续节点传递调度触发信号。',
+      ].join('\n')
+    case 'browser':
+      return buildBrowserNodeModelOutput(node, skillLine)
+    case 'request':
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '输出摘要:',
+        '- 已完成接口请求与响应解析。',
+        '- 已过滤空字段和重复记录。',
+        '- 原始响应已转换为结构化 JSON 数据。',
+      ].join('\n')
+    case 'transform': {
+      const templateName = node.data.settings['整理模板']
+      const templateOriginalName = node.data.settings['模板原文件名']
+      const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
+      if (metrics.length > 0) {
+        return [
+          `模型: ${node.data.model}${skillLine}`,
+          '整理结果: 仅使用上一节点提供的闲鱼数据总览。',
+          '',
+          formatXianyuMetricsMarkdown(metrics),
+          '',
+          '限制: 上游未提供商品排行明细，后续节点不得生成商品ID、商品标题或TOP排行。',
+          templateName && templateName !== '未上传模板'
+            ? `已按当前模板文件「${templateOriginalName || templateName}」整理字段。`
+            : '未上传模板，已按上一节点数据结构自动归并。',
+        ].join('\n')
+      }
+      if (hasMissingBrowserData(upstreamLogs)) {
+        return buildBlockedByMissingBrowserDataOutput(node)
+      }
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '整理结果:',
+        '| 字段 | 值 | 说明 |',
+        '| --- | --- | --- |',
+        '| 指标 A | 示例值 1 | 来自上一节点数据 |',
+        '| 指标 B | 示例值 2 | 按当前节点描述整理 |',
+        '',
+        templateName && templateName !== '未上传模板'
+          ? `已按当前模板文件「${templateOriginalName || templateName}」整理字段。`
+          : '未上传模板，已按上一节点数据结构自动归并。',
+      ].join('\n')
+    }
+    case 'image':
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '图片生成结果:',
+        '- 已根据上一节点输出和当前节点描述生成图片提示。',
+        '- 图片 URL: /api/playground/image-history/files/demo-dashboard.png',
+        '- 图片说明: 预览图内容由当前节点描述决定。',
+      ].join('\n')
+    case 'report': {
+      const outputDir =
+        node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
+      const outputFormats = reportFileOutputLabels(node)
+      const previewPaths = reportPreviewPaths(node)
+      const templateBindings = parseTemplateBindings(
+        node.data.settings['模板文件'] || '',
+        node.data.settings
+      )
+      const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
+      if (metrics.length > 0) {
+        return [
+          `模型: ${node.data.model}${skillLine}`,
+          '# 日报预览',
+          '',
+          '## 数据来源',
+          '- 仅使用上一节点提供的闲鱼数据总览和当前节点描述。',
+          '- 未使用标题、模板旧内容或其他隐含上下文补全数据。',
+          '',
+          '## 数据总览',
+          formatXianyuMetricsMarkdown(metrics),
+          '',
+          '## 结论',
+          ...buildXianyuMetricInsightLines(metrics),
+          '',
+          '## 后续处理',
+          `1. 按当前节点输出格式生成: ${outputFormats.join('、')}。`,
+          '2. 上游未提供商品排行明细，不生成商品ID、商品标题或TOP排行。',
+          '3. 正式执行时输出到当前节点配置的归档目录。',
+          '',
+          `预览输出目录: ${outputDir}`,
+          ...previewPaths.map((path) => `预览文件: ${path}`),
+        ].join('\n')
+      }
+      if (hasMissingBrowserData(upstreamLogs)) {
+        return buildBlockedByMissingBrowserDataOutput(node)
+      }
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '# 日报预览',
+        '',
+        '## 摘要',
+        '- 根据上一节点提供的数据整理主要结论。',
+        templateBindings.length > 0
+          ? `- 按当前模板文件「${templateBindingNames(templateBindings)}」和节点描述控制标题、格式、语气和归档要求。`
+          : '- 未绑定模板文件，按当前节点描述控制标题、格式、语气和归档要求。',
+        '',
+        '## 后续处理',
+        '1. 保留上一节点数据中的关键字段。',
+        `2. 按当前节点输出格式生成: ${outputFormats.join('、')}。`,
+        '3. 正式执行时输出到当前节点配置的归档目录。',
+        '',
+        `预览输出目录: ${outputDir}`,
+        ...previewPaths.map((path) => `预览文件: ${path}`),
+      ].join('\n')
+    }
+    case 'webpage': {
+      const templateBindings = parseTemplateBindings(
+        node.data.settings['网页模板'] || '',
+        node.data.settings
+      )
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '网页输出结果:',
+        '- 已生成交互式日报页面。',
+        templateBindings.length > 0
+          ? `- 按当前网页模板「${templateBindingNames(templateBindings)}」和节点描述渲染页面。`
+          : '- 未绑定网页模板，按当前节点描述和上一节点输出渲染页面。',
+        `- 输出目录: ${node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_WEB}`,
+        '- 页面仅使用上一节点输出和当前节点描述中的渲染要求。',
+      ].join('\n')
+    }
+    case 'notify':
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '通知结果:',
+        '- 已生成通知摘要。',
+        `- 渠道: ${node.data.settings['渠道'] || '邮件'}`,
+        `- 确认策略: ${node.data.settings['确认'] || '发送前确认'}`,
+      ].join('\n')
+    case 'stop':
+      return [
+        '本地执行结果: 流程结束节点已执行。',
+        `结束方式: ${node.data.settings['结束方式'] || '本轮完成后停止'}`,
+        '产物目录: 以上游输出节点配置为准。',
+      ].join('\n')
+    default:
+      return `模型: ${node.data.model}${skillLine}\n节点已完成，输出将传给下一节点。`
+  }
+}
+
+function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
+  const capturedText = browserCapturedText(node)
+  const captureError = browserCaptureError(node)
+  const metrics = parseXianyuOverviewMetrics(capturedText)
+
+  if (metrics.length > 0) {
+    return [
+      `模型: ${node.data.model}${skillLine}`,
+      '数据来源: 浏览器节点自动采集的真实页面文本。',
+      `采集网址: ${node.data.settings['采集网址'] || node.data.settings['网址'] || '未记录'}`,
+      `${XIANYU_OVERVIEW_METRICS_MARKER}:`,
+      JSON.stringify(metrics, null, 2),
+      '',
+      '数据总览:',
+      formatXianyuMetricsMarkdown(metrics),
+      '',
+      '限制: 当前数据仅包含数据总览；未获取商品排行明细。下游不得生成商品ID、商品标题或TOP排行。',
+    ].join('\n')
+  }
+
+  return [
+    `模型: ${node.data.model}${skillLine}`,
+    `${BROWSER_DATA_MISSING_MARKER}: true`,
+    '未拿到真实浏览器页面数据。',
+    `原因: ${captureError || '浏览器自动采集未返回可解析的页面文本。'}`,
+    `目标网址: ${node.data.settings['网址'] || '未配置'}`,
+    '处理: 请确认目标页面已登录并能在浏览器中正常打开，然后重新执行。',
+    '限制: 不会根据模板、标题、历史内容或模型常识补全商品排行、商品ID、商品标题。',
+  ].join('\n')
+}
+
+function buildBlockedByMissingBrowserDataOutput(node: AgentFlowNode) {
+  return [
+    `模型: ${node.data.model}`,
+    `${BROWSER_DATA_MISSING_MARKER}: true`,
+    '无法生成有效输出: 上游浏览器取数节点没有提供真实页面数据。',
+    '请先让浏览器取数节点自动采集到可解析的真实页面数据。',
+    '为避免错误数据，本节点不会根据模板、标题或隐含上下文生成商品排行、商品ID、商品标题。',
+  ].join('\n')
+}
+
+function extractXianyuMetricsFromLogs(logs: AgentNodeExecutionLog[]) {
+  for (const log of [...logs].reverse()) {
+    if (log.status !== 'completed') continue
+    const metrics = parseXianyuOverviewMetrics(log.modelOutput)
+    if (metrics.length > 0) return metrics
+  }
+  return []
+}
+
+function hasMissingBrowserData(logs: AgentNodeExecutionLog[]) {
+  return logs.some(
+    (log) =>
+      log.status === 'completed' &&
+      log.modelOutput.includes(BROWSER_DATA_MISSING_MARKER)
+  )
+}
+
+function parseXianyuOverviewMetrics(value: string): XianyuOverviewMetric[] {
+  const raw = value.trim()
+  if (!raw) return []
+
+  const fromJson = parseXianyuMetricJson(raw)
+  if (fromJson.length > 0) return fromJson
+
+  const metrics: XianyuOverviewMetric[] = []
+  const compact = raw
+    .replace(/\u00a0/g, ' ')
+    .replace(/[：:]/g, ' ')
+    .replace(/\s+/g, ' ')
+
+  for (const label of XIANYU_OVERVIEW_METRIC_LABELS) {
+    const tableMetric = parseMetricFromMarkdownTable(raw, label)
+    if (tableMetric) {
+      metrics.push(tableMetric)
+      continue
+    }
+
+    const index = compact.indexOf(label)
+    if (index < 0) continue
+    const segment = compact.slice(
+      index + label.length,
+      index + label.length + 120
+    )
+    const current = segment.match(
+      /\s*([¥￥]?\s*(?:-|\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?))/
+    )?.[1]
+    if (!current) continue
+    const previous = segment.match(
+      /前\s*1\s*日\s*([¥￥]?\s*(?:-|\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?))/
+    )?.[1]
+    const change = segment.match(/([↑↓]\s*\d+(?:\.\d+)?%|[-－])/)?.[1]
+    metrics.push({
+      label,
+      current: normalizeMetricValue(current),
+      previous: normalizeMetricValue(previous || '-'),
+      change: normalizeMetricValue(change || '-'),
+    })
+  }
+
+  return dedupeXianyuMetrics(metrics)
+}
+
+function parseXianyuMetricJson(value: string) {
+  const marker = `${XIANYU_OVERVIEW_METRICS_MARKER}:`
+  const markerIndex = value.indexOf(marker)
+  const source =
+    markerIndex >= 0 ? value.slice(markerIndex + marker.length) : value
+  const jsonText = source.match(/\[[\s\S]*?\]/)?.[0]
+  if (!jsonText) return []
+
+  try {
+    const parsed: unknown = JSON.parse(jsonText)
+    if (!Array.isArray(parsed)) return []
+    return dedupeXianyuMetrics(
+      parsed
+        .map((item) => {
+          if (!item || typeof item !== 'object') return null
+          const candidate = item as Partial<XianyuOverviewMetric>
+          if (typeof candidate.label !== 'string') return null
+          if (!XIANYU_OVERVIEW_METRIC_LABELS.includes(candidate.label)) {
+            return null
+          }
+          return {
+            label: candidate.label,
+            current: normalizeMetricValue(candidate.current || '-'),
+            previous: normalizeMetricValue(candidate.previous || '-'),
+            change: normalizeMetricValue(candidate.change || '-'),
+          }
+        })
+        .filter((item): item is XianyuOverviewMetric => Boolean(item))
+    )
+  } catch {
+    return []
+  }
+}
+
+function parseMetricFromMarkdownTable(value: string, label: string) {
+  const regex = new RegExp(
+    `\\|\\s*${escapeRegExp(label)}\\s*\\|\\s*([^|]+)\\|\\s*([^|]+)\\|\\s*([^|]+)\\|`,
+    'm'
+  )
+  const match = value.match(regex)
+  if (!match) return null
+  return {
+    label,
+    current: normalizeMetricValue(match[1]),
+    previous: normalizeMetricValue(match[2]),
+    change: normalizeMetricValue(match[3]),
+  }
+}
+
+function dedupeXianyuMetrics(metrics: XianyuOverviewMetric[]) {
+  const byLabel = new Map<string, XianyuOverviewMetric>()
+  for (const metric of metrics) {
+    if (!byLabel.has(metric.label)) {
+      byLabel.set(metric.label, metric)
+    }
+  }
+  return XIANYU_OVERVIEW_METRIC_LABELS.map((label) =>
+    byLabel.get(label)
+  ).filter((metric): metric is XianyuOverviewMetric => Boolean(metric))
+}
+
+function normalizeMetricValue(value: string) {
+  return value
+    .replace(/[￥¥]\s*/g, '¥')
+    .replace(/\s+/g, '')
+    .replace(/^－$/, '-')
+    .trim()
+}
+
+function formatXianyuMetricsMarkdown(metrics: XianyuOverviewMetric[]) {
+  return [
+    '| 指标 | 当前值 | 前1日 | 变化 |',
+    '| --- | ---: | ---: | ---: |',
+    ...metrics.map(
+      (metric) =>
+        `| ${metric.label} | ${metric.current} | ${metric.previous} | ${metric.change} |`
+    ),
+  ].join('\n')
+}
+
+function buildXianyuMetricInsightLines(metrics: XianyuOverviewMetric[]) {
+  const byLabel = new Map(metrics.map((metric) => [metric.label, metric]))
+  const focusLabels = [
+    '商品访问次数',
+    '商品曝光次数',
+    '商品浏览次数',
+    '支付笔数',
+    '支付金额（元）',
+  ]
+  const lines = focusLabels
+    .map((label) => byLabel.get(label))
+    .filter((metric): metric is XianyuOverviewMetric => Boolean(metric))
+    .map(
+      (metric) =>
+        `- ${metric.label}: 当前 ${metric.current}，前1日 ${metric.previous}，变化 ${metric.change}。`
+    )
+  return lines.length > 0 ? lines : ['- 已按上游结构化指标生成摘要。']
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function buildReportOutputSummary(
   node: AgentFlowNode,
   status: AgentNodeLogStatus
 ) {
-  const templateDir = node.data.settings['模板目录'] || '/templates/reports'
-  const outputDir = node.data.settings['输出目录'] || '/output/reports'
+  const templateBindings = parseTemplateBindings(
+    node.data.settings['模板文件'] || '',
+    node.data.settings
+  )
+  const outputDir = node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
+  const outputFormats = reportFileOutputLabels(node)
+  const statusText: Record<AgentNodeLogStatus, string> = {
+    pending: '等待生成',
+    running: '生成中',
+    completed: '已生成预览',
+    stopped: '已停止',
+  }
+  const formatLines = outputFormats.map(
+    (format) => `${format}: ${statusText[status]}`
+  )
 
   if (status === 'completed') {
     return [
-      'Markdown 日报: 已生成',
-      'CSV 表格: 已生成',
-      `模板目录: ${templateDir}`,
-      `输出目录: ${outputDir}`,
+      ...formatLines,
+      templateBindings.length > 0
+        ? `模板文件: ${templateBindingNames(templateBindings)}`
+        : '模板文件: 未绑定，按节点描述生成',
+      `预览输出目录: ${outputDir}`,
     ]
   }
   if (status === 'running') {
-    return ['Markdown 日报: 生成中', 'CSV 表格: 生成中', `输出目录: ${outputDir}`]
+    return [...formatLines, `输出目录: ${outputDir}`]
   }
   if (status === 'stopped') {
-    return ['Markdown 日报: 已停止', 'CSV 表格: 已停止', '输出: 保留部分上下文']
+    return [...formatLines, '输出: 保留部分上下文']
   }
-  return ['Markdown 日报: 等待生成', 'CSV 表格: 等待生成', `输出目录: ${outputDir}`]
+  return [...formatLines, `输出目录: ${outputDir}`]
 }
 
 function buildNodeLogSteps(
   node: AgentFlowNode,
   status: AgentNodeLogStatus,
-  skillChoices: SkillChoice[]
+  skillChoices: SkillChoice[],
+  upstreamLogs: AgentNodeExecutionLog[] = []
 ) {
   const skill = getSkillChoice(node.data.skill, skillChoices)
+  const capabilityLine =
+    node.data.skill && skill.capabilities?.length
+      ? `Skill 能力: ${skill.capabilities.join('、')}`
+      : ''
   const steps = [
     '读取节点配置、输入字段和上游依赖。',
     node.data.skill
       ? `加载 Skill: ${skill.label}`
       : '未启用 Skill，使用节点基础提示执行。',
   ]
+  if (capabilityLine) {
+    steps.push(capabilityLine)
+  }
 
   if (NODE_META[node.data.kind].role === 'system') {
     steps.push('执行本地编排逻辑。')
@@ -2287,34 +3407,78 @@ function buildNodeLogSteps(
     steps.push(`准备模型调用: ${node.data.model}`)
   }
 
+  if (node.data.kind === 'browser') {
+    const metrics = parseXianyuOverviewMetrics(browserCapturedText(node))
+    const error = browserCaptureError(node)
+    steps.push(
+      metrics.length > 0
+        ? `从自动采集的页面文本解析 ${metrics.length} 个闲鱼数据总览指标。`
+        : error
+          ? `浏览器自动采集失败: ${error}`
+          : '等待 Edge/浏览器 DOM 采集器返回真实页面文本。'
+    )
+  }
+
   if (node.data.kind === 'transform') {
     const templateName = node.data.settings['整理模板']
+    const templateOriginalName = node.data.settings['模板原文件名']
     const dataType = node.data.settings['数据类型'] || '自动识别'
+    const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
     steps.push(
-      templateName && templateName !== '未上传模板'
-        ? `应用整理模板: ${templateName}`
-        : `未上传模板，按数据类型「${dataType}」自动推断字段与格式。`
+      metrics.length > 0
+        ? `使用上游 ${metrics.length} 个真实指标整理，不扩展隐含上下文。`
+        : templateName && templateName !== '未上传模板'
+          ? `应用当前模板文件: ${templateOriginalName || templateName}`
+          : `未上传模板，按数据类型「${dataType}」自动推断字段与格式。`
     )
   }
 
   if (node.data.kind === 'report') {
-    const templateDir = node.data.settings['模板目录'] || '/templates/reports'
-    const outputDir = node.data.settings['输出目录'] || '/output/reports'
-    steps.push(`读取模板目录: ${templateDir}`)
-    steps.push(`将日报产物写入输出目录: ${outputDir}`)
+    const templateBindings = parseTemplateBindings(
+      node.data.settings['模板文件'] || '',
+      node.data.settings
+    )
+    const outputFormats = reportFileOutputLabels(node)
+    const outputDir =
+      node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
+    const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
+    steps.push(
+      templateBindings.length > 0
+        ? `读取当前模板文件: ${templateBindingNames(templateBindings)}`
+        : '未绑定模板文件，按当前节点描述生成日报。'
+    )
+    if (metrics.length > 0) {
+      steps.push(
+        `使用上游 ${metrics.length} 个真实指标生成，不读取模板旧数据。`
+      )
+    } else if (hasMissingBrowserData(upstreamLogs)) {
+      steps.push('上游真实页面数据缺失，本节点停止生成业务内容。')
+    }
+    steps.push(`输出格式: ${outputFormats.join('、')}`)
+    steps.push(`生成日报预览；正式执行时写入输出目录: ${outputDir}`)
+  }
+
+  if (node.data.kind === 'webpage') {
+    const templateBindings = parseTemplateBindings(
+      node.data.settings['网页模板'] || '',
+      node.data.settings
+    )
+    steps.push(
+      templateBindings.length > 0
+        ? `读取当前网页模板文件: ${templateBindingNames(templateBindings)}`
+        : '未绑定网页模板，按当前节点描述渲染网页。'
+    )
   }
 
   if (node.data.kind === 'stop') {
-    const archiveMode = node.data.settings['归档'] || '保存执行日志'
-    const archiveLocation = node.data.settings['归档位置'] || '工作区 / 日报归档'
-    steps.push(`结束节点归档策略: ${archiveMode}，位置 ${archiveLocation}。`)
+    steps.push('结束当前流程；不覆盖上游输出节点的产物目录。')
   }
 
   if (status === 'completed') {
     steps.push(
       node.data.kind === 'stop'
-        ? '执行日志归档完成，流程结束。'
-        : '校验输出字段并写入下游上下文。'
+        ? '流程结束，产物目录以上游输出节点配置为准。'
+        : '校验输出字段并传递给下一节点。'
     )
   } else if (status === 'running') {
     steps.push('节点正在执行，等待模型或工具返回结果。')
@@ -2327,16 +3491,13 @@ function buildNodeLogSteps(
   return steps
 }
 
-function buildNodeLogMessage(
-  node: AgentFlowNode,
-  status: AgentNodeLogStatus
-) {
+function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
   if (status === 'completed') {
     if (node.data.kind === 'report') {
-      return `${node.data.title} 已生成日报产物，并写入输出目录。`
+      return `${node.data.title} 已生成日报预览；正式执行时会写入输出目录。`
     }
     if (node.data.kind === 'stop') {
-      return `${node.data.title} 已完成归档与结束动作，流程已结束。`
+      return `${node.data.title} 已完成流程结束动作，输出目录以上游节点配置为准。`
     }
     return `${node.data.title} 已完成，输出已进入后续节点上下文。`
   }
@@ -2355,7 +3516,6 @@ function NodeConfigPanel({
   groupChoices,
   skillChoices,
   currentGroup,
-  currentModel,
   onDeleteNode,
   onUpdateNode,
   onUpdateSetting,
@@ -2365,17 +3525,105 @@ function NodeConfigPanel({
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   currentGroup?: string
-  currentModel?: string
   onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
+  return (
+    <div className='space-y-3'>
+      <ConfigCard title='基础信息'>
+        <NodeCommonConfig
+          currentGroup={currentGroup}
+          groupChoices={groupChoices}
+          modelChoices={modelChoices}
+          node={node}
+          skillChoices={skillChoices}
+          onDeleteNode={onDeleteNode}
+          onUpdateNode={onUpdateNode}
+        />
+      </ConfigCard>
+
+      <ConfigCard title='描述信息'>
+        <Textarea
+          value={node.data.description}
+          onChange={(event) =>
+            onUpdateNode({ description: event.target.value })
+          }
+          className='min-h-22 rounded-[8px] px-2.5 py-2 text-sm leading-relaxed'
+        />
+      </ConfigCard>
+
+      <ConfigCard title='参数'>
+        {Object.keys(node.data.settings).length === 0 ? (
+          <div className='text-muted-foreground text-xs'>无参数</div>
+        ) : (
+          <div className='space-y-2'>
+            {Object.entries(node.data.settings).map(([key, value]) => (
+              <SettingControl
+                key={key}
+                label={key}
+                value={value}
+                nodeKind={node.data.kind}
+                settings={node.data.settings}
+                onChange={(nextValue) => onUpdateSetting(key, nextValue)}
+                onChangeSetting={onUpdateSetting}
+              />
+            ))}
+          </div>
+        )}
+      </ConfigCard>
+
+      <div className='grid grid-cols-2 gap-2'>
+        <ConfigCard title='输入'>
+          <FieldList values={node.data.inputs} />
+        </ConfigCard>
+        <ConfigCard title='输出'>
+          <FieldList values={node.data.outputs} />
+        </ConfigCard>
+      </div>
+    </div>
+  )
+}
+
+function NodeCommonConfig({
+  node,
+  modelChoices,
+  groupChoices,
+  skillChoices,
+  currentGroup,
+  onDeleteNode,
+  onUpdateNode,
+}: {
+  node: AgentFlowNode
+  modelChoices: ModelChoice[]
+  groupChoices: GroupOption[]
+  skillChoices: SkillChoice[]
+  currentGroup?: string
+  onDeleteNode: (nodeId: string) => void
+  onUpdateNode: (patch: Partial<AgentNodeData>) => void
+}) {
   const meta = NODE_META[node.data.kind]
   const Icon = meta.icon
+  const modelExists = modelChoices.some(
+    (model) => model.value === node.data.model
+  )
+  const choices = modelExists
+    ? modelChoices
+    : [
+        {
+          label: node.data.model,
+          value: node.data.model,
+          source: 'current' as const,
+        },
+        ...modelChoices,
+      ]
+  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
+  const selectedGroup =
+    node.data.group || currentGroup || groupChoices[0]?.value || 'default'
 
   return (
-    <section className='border-border/70 rounded-[8px] border p-3'>
-      <div className='mb-3 flex items-center gap-2'>
+    <div className='space-y-3'>
+      <div className='flex items-center gap-2'>
         <div
           className={cn(
             'flex size-8 shrink-0 items-center justify-center rounded-[8px]',
@@ -2405,75 +3653,6 @@ function NodeConfigPanel({
         </Button>
       </div>
 
-      <div className='space-y-3'>
-        <NodeCommonConfig
-          currentGroup={currentGroup}
-          currentModel={currentModel}
-          groupChoices={groupChoices}
-          modelChoices={modelChoices}
-          node={node}
-          skillChoices={skillChoices}
-          onUpdateNode={onUpdateNode}
-        />
-
-        <div className='space-y-2'>
-          <div className='text-xs font-medium'>参数</div>
-          {Object.entries(node.data.settings).map(([key, value]) => (
-            <SettingControl
-              key={key}
-              label={key}
-              value={value}
-              onChange={(nextValue) => onUpdateSetting(key, nextValue)}
-              onChangeSetting={onUpdateSetting}
-            />
-          ))}
-        </div>
-
-        <div className='grid grid-cols-2 gap-2'>
-          <FieldList title='输入' values={node.data.inputs} />
-          <FieldList title='输出' values={node.data.outputs} />
-        </div>
-      </div>
-    </section>
-  )
-}
-
-function NodeCommonConfig({
-  node,
-  modelChoices,
-  groupChoices,
-  skillChoices,
-  currentGroup,
-  currentModel,
-  onUpdateNode,
-}: {
-  node: AgentFlowNode
-  modelChoices: ModelChoice[]
-  groupChoices: GroupOption[]
-  skillChoices: SkillChoice[]
-  currentGroup?: string
-  currentModel?: string
-  onUpdateNode: (patch: Partial<AgentNodeData>) => void
-}) {
-  const modelExists = modelChoices.some(
-    (model) => model.value === node.data.model
-  )
-  const choices = modelExists
-    ? modelChoices
-    : [
-        {
-          label: node.data.model,
-          value: node.data.model,
-          source: 'current' as const,
-        },
-        ...modelChoices,
-      ]
-  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
-  const selectedGroup =
-    node.data.group || currentGroup || groupChoices[0]?.value || 'default'
-
-  return (
-    <div className='border-border/70 bg-muted/15 rounded-[8px] border p-2.5'>
       <div className='grid grid-cols-2 gap-2'>
         <CompactField label='名称'>
           <Input
@@ -2538,7 +3717,7 @@ function NodeCommonConfig({
         <CompactField label='Skill'>
           <NativeSelect
             size='sm'
-            value={node.data.skill}
+            value={normalizeBuiltinSkillValue(node.data.skill)}
             title={selectedSkill.description}
             onChange={(event) => onUpdateNode({ skill: event.target.value })}
             className='w-full'
@@ -2554,32 +3733,22 @@ function NodeCommonConfig({
           </NativeSelect>
         </CompactField>
       </div>
-
-      <div className='mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground'>
-        <span className='bg-background/80 max-w-full truncate rounded-[5px] px-1.5 py-0.5'>
-          对话组 {currentGroup || 'default'}
-        </span>
-        <span className='bg-background/80 max-w-full truncate rounded-[5px] px-1.5 py-0.5'>
-          对话模型 {currentModel || '未选择'}
-        </span>
-        <span
-          className='min-w-0 flex-1 truncate px-0.5'
-          title={selectedSkill.description}
-        >
-          {selectedSkill.description}
-        </span>
-      </div>
-
-      <CompactField label='任务描述' className='mt-2'>
-        <Textarea
-          value={node.data.description}
-          onChange={(event) =>
-            onUpdateNode({ description: event.target.value })
-          }
-          className='min-h-16 rounded-[7px] px-2 py-1.5 text-xs leading-relaxed'
-        />
-      </CompactField>
     </div>
+  )
+}
+
+function ConfigCard({
+  title,
+  children,
+}: {
+  title: string
+  children: ReactNode
+}) {
+  return (
+    <section className='border-border/70 rounded-[8px] border p-3'>
+      <div className='mb-2 text-xs font-medium'>{title}</div>
+      {children}
+    </section>
   )
 }
 
@@ -2634,7 +3803,7 @@ function ExecutionPreviewDock({
         <FileSpreadsheetIcon className='text-muted-foreground size-3.5 shrink-0' />
         <span className='text-xs font-semibold'>执行预览</span>
         <span className='text-muted-foreground truncate text-[11px]'>
-          {executionNodes.length} 个节点 · 闲鱼/鱼小铺日报链路
+          {executionNodes.length} 个节点 · 当前蓝图链路
         </span>
       </button>
 
@@ -2658,7 +3827,8 @@ function ExecutionPreviewDock({
                         type='button'
                         className={cn(
                           'border-border/70 bg-muted/20 hover:bg-accent/40 flex min-h-16 items-start gap-2 rounded-[8px] border p-2 text-left transition-colors',
-                          selected && 'border-primary/50 bg-primary/5 ring-primary/20 ring-2'
+                          selected &&
+                            'border-primary/50 bg-primary/5 ring-primary/20 ring-2'
                         )}
                         onClick={() => onSelectNode(node.id)}
                       >
@@ -2676,7 +3846,11 @@ function ExecutionPreviewDock({
                             {node.data.model}
                           </div>
                           <div className='text-muted-foreground mt-0.5 truncate text-[11px]'>
-                            Skill · {getSkillChoice(node.data.skill, skillChoices).label}
+                            Skill ·{' '}
+                            {
+                              getSkillChoice(node.data.skill, skillChoices)
+                                .label
+                            }
                           </div>
                         </div>
                         <StatusDot status={node.data.status} />
@@ -2717,22 +3891,333 @@ function ExecutionPreviewDock({
   )
 }
 
-const DEFAULT_TEMPLATE_DIR_REPORT = '/templates/reports'
-const DEFAULT_TEMPLATE_DIR_WEB = '/templates/web'
+const DEFAULT_OUTPUT_DIR_REPORT = 'data/output/reports'
+const DEFAULT_OUTPUT_DIR_WEB = 'data/output/web-reports'
+const LEGACY_TEMPLATE_DIR_REPORT = '/templates/reports'
+const LEGACY_TEMPLATE_DIR_WEB = '/templates/web'
+const LEGACY_OUTPUT_DIR_REPORT = '/output/reports'
+const LEGACY_OUTPUT_DIR_WEB = '/output/web-reports'
+const TEMPLATE_FILE_ACCEPT =
+  '.xlsx,.xls,.doc,.docx,.pdf,.html,.htm,.md,.txt,.csv,.json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/pdf,text/html,text/markdown,text/plain,text/csv,application/json'
+const TRANSIENT_BROWSER_SETTING_LABELS = new Set([
+  BROWSER_PAGE_DATA_SETTING,
+  BROWSER_CAPTURE_TEXT_SETTING,
+  '采集标题',
+  '采集网址',
+  '采集时间',
+  '采集错误',
+])
+const HIDDEN_SETTING_LABELS = new Set([
+  '模板目录',
+  '模板原文件名',
+  '模板预览',
+  ...TRANSIENT_BROWSER_SETTING_LABELS,
+])
 const DEFAULT_TRANSFORM_TEMPLATE_PLACEHOLDER =
-  '字段: 商品名称, 曝光, 浏览, 想要, 转化建议\n格式: Markdown 表格 + JSON 数组\n排序: 按曝光降序\n说明: 缺失字段保留空值并标注来源'
+  '字段: 名称, 数值, 状态, 备注\n格式: Markdown 表格 + JSON 数组\n排序: 按数值降序\n说明: 缺失字段保留空值并标注来源'
+
+function defaultOutputDirForNode(kind: AgentNodeKind) {
+  if (kind === 'webpage') return DEFAULT_OUTPUT_DIR_WEB
+  return DEFAULT_OUTPUT_DIR_REPORT
+}
+
+function shouldUseDefaultOutputDirectory(
+  value: string | undefined,
+  kind: AgentNodeKind
+) {
+  const normalized = (value ?? '').trim()
+  if (normalized === '') return true
+  return legacyOrDefaultOutputDirsForNode(kind).includes(normalized)
+}
+
+function legacyOrDefaultOutputDirsForNode(kind: AgentNodeKind) {
+  if (kind === 'webpage') return [LEGACY_OUTPUT_DIR_WEB, DEFAULT_OUTPUT_DIR_WEB]
+  return [LEGACY_OUTPUT_DIR_REPORT, DEFAULT_OUTPUT_DIR_REPORT]
+}
+
+function splitReportOutputFormatSetting(value: string) {
+  return value
+    .split(/[、,，;；|/\n\r]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function isReportPathOutputLabel(label: string) {
+  return /归档|路径|目录/.test(label)
+}
+
+function normalizeReportOutputFormats(
+  value = '',
+  fallbackOutputs: string[] = []
+) {
+  const explicitFormats = splitReportOutputFormatSetting(value)
+  const source =
+    explicitFormats.length > 0
+      ? explicitFormats
+      : fallbackOutputs.filter((output) => !isReportPathOutputLabel(output))
+  const seen = new Set<string>()
+  const formats: string[] = []
+
+  for (const item of source) {
+    const format = item.trim()
+    if (!format || isReportPathOutputLabel(format) || seen.has(format)) {
+      continue
+    }
+    seen.add(format)
+    formats.push(format)
+  }
+
+  return formats.length > 0 ? formats : [...DEFAULT_REPORT_OUTPUT_FORMATS]
+}
+
+function reportOutputsFromFormatSetting(
+  value: string,
+  fallbackOutputs: string[] = []
+) {
+  return [
+    ...normalizeReportOutputFormats(value, fallbackOutputs),
+    REPORT_OUTPUT_PATH_LABEL,
+  ]
+}
+
+function reportFileOutputLabels(node: AgentFlowNode) {
+  const templateFormats = reportOutputFormatsFromTemplates(
+    parseTemplateBindings(
+      node.data.settings['模板文件'] || '',
+      node.data.settings
+    )
+  )
+  if (templateFormats.length > 0) return templateFormats
+
+  return normalizeReportOutputFormats(
+    node.data.settings[REPORT_OUTPUT_FORMAT_SETTING] || '',
+    node.data.outputs
+  )
+}
+
+function reportOutputFormatsFromTemplates(bindings: TemplateBinding[]) {
+  const formats: string[] = []
+  for (const binding of bindings) {
+    const format = reportOutputFormatForTemplatePath(binding.path)
+    if (!format) continue
+    formats.push(format)
+  }
+  return formats
+}
+
+function reportOutputFormatForTemplatePath(path: string) {
+  const ext = normalizeExtension(path.split('.').pop() || '')
+  switch (ext) {
+    case 'xlsx':
+    case 'xls':
+      return 'Excel 表格'
+    case 'csv':
+      return 'CSV 表格'
+    case 'md':
+    case 'markdown':
+      return 'Markdown 日报'
+    case 'doc':
+    case 'docx':
+      return 'Word 文档'
+    case 'pdf':
+      return 'PDF 文档'
+    case 'html':
+    case 'htm':
+      return 'HTML 网页'
+    case 'txt':
+      return 'TXT 文本'
+    case 'json':
+      return 'JSON 数据'
+    default:
+      return ''
+  }
+}
+
+function reportExtensionForLabel(label: string) {
+  const lower = label.toLowerCase()
+  if (lower.includes('markdown') || /\bmd\b/.test(lower)) return 'md'
+  if (
+    lower.includes('html') ||
+    lower.includes('htm') ||
+    label.includes('网页')
+  ) {
+    return 'html'
+  }
+  if (lower.includes('json')) return 'json'
+  if (lower.includes('txt') || label.includes('文本')) return 'txt'
+  if (
+    lower.includes('xlsx') ||
+    lower.includes('excel') ||
+    label.includes('Excel')
+  ) {
+    return 'xlsx'
+  }
+  if (lower.includes('pdf')) return 'pdf'
+  if (
+    lower.includes('docx') ||
+    lower.includes('word') ||
+    (label.includes('文档') && !lower.includes('pdf'))
+  ) {
+    return 'docx'
+  }
+  if (
+    lower.includes('csv') ||
+    lower.includes('excel') ||
+    label.includes('表格')
+  ) {
+    return 'csv'
+  }
+  return 'md'
+}
+
+function findReportTemplateForExtension(
+  node: AgentFlowNode,
+  extension: string
+) {
+  const targetExt = normalizeExtension(extension)
+  const bindings = parseTemplateBindings(
+    node.data.settings['模板文件'] || '',
+    node.data.settings
+  )
+  return bindings.find((binding) => {
+    const pathExt = normalizeExtension(binding.path.split('.').pop() || '')
+    if (pathExt === targetExt) return true
+    if (targetExt === 'html' && pathExt === 'htm') return true
+    if (targetExt === 'xlsx' && pathExt === 'xls') return true
+    if (targetExt === 'docx' && pathExt === 'doc') return true
+    return false
+  })
+}
+
+function normalizeExtension(value: string) {
+  return value.trim().toLowerCase().replace(/^\./, '')
+}
+
+function reportPreviewPaths(node: AgentFlowNode) {
+  const outputDir = node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
+  const labels = reportFileOutputLabels(node)
+  return labels.map((label, index) => {
+    const suffix = labels.length > 1 ? `-${index + 1}` : ''
+    return `${outputDir}/daily-report${suffix}.${reportExtensionForLabel(label)}`
+  })
+}
+
+function parseTemplateBindings(
+  value: string,
+  settings: Record<string, string>
+): TemplateBinding[] {
+  const trimmed = value.trim()
+  if (!trimmed || trimmed === '未上传模板') return []
+
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) => {
+            if (typeof item === 'string') {
+              return {
+                path: item,
+                originalName: item.split('/').pop() || item,
+              }
+            }
+            if (!item || typeof item !== 'object') return null
+            const candidate = item as Partial<TemplateBinding>
+            const path =
+              typeof candidate.path === 'string' ? candidate.path : ''
+            if (!path.trim()) return null
+            return {
+              path,
+              originalName:
+                typeof candidate.originalName === 'string' &&
+                candidate.originalName.trim()
+                  ? candidate.originalName
+                  : path.split('/').pop() || path,
+              preview:
+                typeof candidate.preview === 'string'
+                  ? candidate.preview
+                  : undefined,
+              hash:
+                typeof candidate.hash === 'string' ? candidate.hash : undefined,
+            }
+          })
+          .filter((item): item is TemplateBinding => !!item)
+      }
+    } catch {
+      /* Fall back to legacy single path below. */
+    }
+  }
+
+  return [
+    {
+      path: trimmed,
+      originalName:
+        settings['模板原文件名']?.trim() || trimmed.split('/').pop() || trimmed,
+      preview: settings['模板预览']?.trim() || undefined,
+    },
+  ]
+}
+
+function serializeTemplateBindings(bindings: TemplateBinding[]) {
+  if (bindings.length === 0) return ''
+  if (bindings.length === 1) return bindings[0].path
+  return JSON.stringify(bindings)
+}
+
+function agentUploadToTemplateBinding(
+  upload: AgentFileUpload
+): TemplateBinding {
+  return {
+    path: upload.path,
+    originalName: upload.original_name || upload.filename || upload.path,
+    preview: upload.content_preview,
+    hash: upload.hash,
+  }
+}
+
+function mergeTemplateBindings(
+  current: TemplateBinding[],
+  additions: TemplateBinding[]
+) {
+  let next = [...current]
+  for (const addition of additions) {
+    const nameKey = addition.originalName.trim().toLowerCase()
+    next = next.filter((item) => {
+      if (item.path === addition.path) return false
+      return item.originalName.trim().toLowerCase() !== nameKey
+    })
+    next.push(addition)
+  }
+  return next
+}
+
+function templateBindingNames(bindings: TemplateBinding[]) {
+  return bindings
+    .map((binding) => binding.originalName || binding.path)
+    .join('、')
+}
 
 function SettingControl({
   label,
   value,
+  nodeKind,
+  settings,
   onChange,
   onChangeSetting,
 }: {
   label: string
   value: string
+  nodeKind: AgentNodeKind
+  settings: Record<string, string>
   onChange: (value: string) => void
   onChangeSetting?: (key: string, value: string) => void
 }) {
+  const [isUploadingTemplate, setIsUploadingTemplate] = useState(false)
+  const [isTemplateLibraryOpen, setIsTemplateLibraryOpen] = useState(false)
+  const [isLoadingTemplateLibrary, setIsLoadingTemplateLibrary] =
+    useState(false)
+  const [templateLibrary, setTemplateLibrary] = useState<AgentFileUpload[]>([])
+
   // 请求 URL —— 文本输入，带描述提示
   if (label === '请求URL') {
     return (
@@ -2764,6 +4249,50 @@ function SettingControl({
     )
   }
 
+  if (nodeKind === 'report' && label === REPORT_OUTPUT_FORMAT_SETTING) {
+    const selectedFormats = normalizeReportOutputFormats(value)
+    const togglePreset = (preset: string) => {
+      const exists = selectedFormats.includes(preset)
+      const next = exists
+        ? selectedFormats.filter((format) => format !== preset)
+        : [...selectedFormats, preset]
+      onChange(next.join('、'))
+    }
+
+    return (
+      <LabeledField label='输出格式'>
+        <div className='space-y-2'>
+          <Textarea
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            placeholder='Markdown 日报、CSV 表格、Excel 表格、Word 文档、PDF 文档、HTML 网页、TXT 文本、JSON 数据'
+            className='min-h-16 rounded-[8px] text-sm'
+          />
+          <div className='flex flex-wrap gap-1.5'>
+            {REPORT_OUTPUT_FORMAT_PRESETS.map((preset) => {
+              const active = selectedFormats.includes(preset)
+              return (
+                <Button
+                  key={preset}
+                  type='button'
+                  size='sm'
+                  variant={active ? 'default' : 'outline'}
+                  className='h-7 rounded-[6px] px-2 text-xs'
+                  onClick={() => togglePreset(preset)}
+                >
+                  {preset}
+                </Button>
+              )
+            })}
+          </div>
+        </div>
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          绑定模板后会优先按模板扩展名自动选择输出格式；没有模板时可用顿号、逗号或换行分隔手动指定。归档路径会自动返回，不单独生成文件。
+        </div>
+      </LabeledField>
+    )
+  }
+
   // 输出目录 —— 文本输入
   if (label === '输出目录') {
     return (
@@ -2771,46 +4300,250 @@ function SettingControl({
         <Input
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          placeholder='/output/reports'
+          placeholder={defaultOutputDirForNode(nodeKind)}
           className='h-8 rounded-[8px] text-sm'
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
-          生成的文件会写入此目录；标题、格式、语气、归档规则等要求请写在任务描述中。
+          生成的文件默认写入 exe 同级 data
+          目录；标题、格式、语气、归档规则等要求请写在任务描述中。
         </div>
       </LabeledField>
     )
   }
 
-  // 模板目录 —— 文本输入 + 显示内置目录
-  if (label === '模板目录') {
-    return (
-      <LabeledField label='模板目录'>
-        <Input
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder={DEFAULT_TEMPLATE_DIR_REPORT}
-          className='h-8 rounded-[8px] text-sm'
-        />
-        <div className='text-muted-foreground text-[11px] leading-relaxed'>
-          上传的模板文件存放在此目录中，支持 <code className='bg-muted rounded px-1 text-[10px]'>.md</code> / <code className='bg-muted rounded px-1 text-[10px]'>.html</code> 格式。
-        </div>
-      </LabeledField>
-    )
+  if (HIDDEN_SETTING_LABELS.has(label)) {
+    return null
   }
 
-  // 网页模板 —— 文本输入 + 提示
-  if (label === '网页模板') {
+  // 模板文件 —— 每次上传绑定当前文件，允许重复上传同名模板。
+  if (label === '模板文件' || label === '网页模板') {
+    const purpose: AgentFileUploadPurpose =
+      nodeKind === 'webpage' ? 'web-template' : 'report-template'
+    const bindings = parseTemplateBindings(value, settings)
+    const selectedPaths = new Set(bindings.map((binding) => binding.path))
+
+    const applyTemplateBindings = (nextBindings: TemplateBinding[]) => {
+      onChange(serializeTemplateBindings(nextBindings))
+      onChangeSetting?.('模板原文件名', templateBindingNames(nextBindings))
+      onChangeSetting?.(
+        '模板预览',
+        nextBindings
+          .map((binding) => binding.preview)
+          .filter(Boolean)
+          .join('\n\n')
+      )
+      if (nodeKind === 'report') {
+        const templateFormats = reportOutputFormatsFromTemplates(nextBindings)
+        if (templateFormats.length > 0) {
+          onChangeSetting?.(
+            REPORT_OUTPUT_FORMAT_SETTING,
+            templateFormats.join('、')
+          )
+        }
+      }
+    }
+
+    const refreshTemplateLibrary = async () => {
+      setIsLoadingTemplateLibrary(true)
+      try {
+        setTemplateLibrary(await listAgentFiles(purpose))
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : '模板列表加载失败')
+      } finally {
+        setIsLoadingTemplateLibrary(false)
+      }
+    }
+
+    const handleTemplateFileUpload = async (
+      event: ChangeEvent<HTMLInputElement>
+    ) => {
+      const input = event.currentTarget
+      const files = Array.from(input.files ?? [])
+      if (files.length === 0) return
+
+      setIsUploadingTemplate(true)
+      try {
+        const uploadedFiles: AgentFileUpload[] = []
+        for (const file of files) {
+          const uploaded = await uploadAgentFile(file, purpose)
+          uploadedFiles.push(uploaded)
+          if (
+            uploaded.output_directory &&
+            shouldUseDefaultOutputDirectory(settings['输出目录'], nodeKind)
+          ) {
+            onChangeSetting?.('输出目录', uploaded.output_directory)
+          }
+        }
+        applyTemplateBindings(
+          mergeTemplateBindings(
+            bindings,
+            uploadedFiles.map(agentUploadToTemplateBinding)
+          )
+        )
+        if (isTemplateLibraryOpen) {
+          void refreshTemplateLibrary()
+        }
+        const reusedCount = uploadedFiles.filter((file) => file.reused).length
+        const replacedCount = uploadedFiles.filter(
+          (file) => file.replaced
+        ).length
+        toast.success('模板已更新', {
+          description:
+            reusedCount || replacedCount
+              ? `复用 ${reusedCount} 个，替换 ${replacedCount} 个`
+              : `已绑定 ${uploadedFiles.length} 个模板`,
+        })
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : '模板上传失败')
+      } finally {
+        input.value = ''
+        setIsUploadingTemplate(false)
+      }
+    }
+
     return (
-      <LabeledField label='网页模板'>
-        <Input
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder='默认模板'
-          className='h-8 rounded-[8px] text-sm'
-        />
+      <LabeledField label='当前模板文件'>
+        <div className='space-y-2'>
+          <div className='border-border/70 bg-muted/20 rounded-[8px] border p-2'>
+            {bindings.length === 0 ? (
+              <div className='flex items-center gap-2'>
+                <FileTextIcon className='text-muted-foreground size-4 shrink-0' />
+                <div className='min-w-0 flex-1'>
+                  <div className='text-xs font-medium'>未上传模板文件</div>
+                  <div className='text-muted-foreground truncate text-[11px]'>
+                    上传或从模板库选择后会绑定到当前节点
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className='space-y-1.5'>
+                {bindings.map((binding) => (
+                  <div
+                    key={binding.path}
+                    className='bg-background/70 flex max-w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] px-2 py-1.5'
+                  >
+                    <FileTextIcon className='text-muted-foreground size-3.5 shrink-0' />
+                    <div className='min-w-0 flex-1 overflow-hidden'>
+                      <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
+                        {binding.originalName}
+                      </div>
+                      <div className='text-muted-foreground max-w-full truncate overflow-hidden text-[11px] whitespace-nowrap'>
+                        {binding.path}
+                      </div>
+                    </div>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='ghost'
+                      className='h-7 rounded-[6px] px-2 text-xs'
+                      onClick={() =>
+                        applyTemplateBindings(
+                          bindings.filter((item) => item.path !== binding.path)
+                        )
+                      }
+                    >
+                      移除
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2'>
+            <div className='flex min-w-0 items-center gap-2 overflow-hidden'>
+              <label
+                aria-disabled={isUploadingTemplate}
+                className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[6px] px-2.5 text-xs font-medium whitespace-nowrap aria-disabled:pointer-events-none aria-disabled:opacity-50'
+              >
+                {isUploadingTemplate ? '上传中' : '上传模板'}
+                <input
+                  type='file'
+                  multiple
+                  accept={TEMPLATE_FILE_ACCEPT}
+                  className='sr-only'
+                  disabled={isUploadingTemplate}
+                  onChange={handleTemplateFileUpload}
+                />
+              </label>
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                className='h-7 min-w-0 rounded-[6px] px-2.5 text-xs'
+                onClick={() => {
+                  const nextOpen = !isTemplateLibraryOpen
+                  setIsTemplateLibraryOpen(nextOpen)
+                  if (nextOpen) {
+                    void refreshTemplateLibrary()
+                  }
+                }}
+              >
+                <span className='truncate'>使用之前的模板</span>
+              </Button>
+            </div>
+            {bindings.length > 0 && (
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                className='h-7 shrink-0 rounded-[6px] px-2 text-xs'
+                onClick={() => applyTemplateBindings([])}
+              >
+                清空
+              </Button>
+            )}
+          </div>
+
+          {isTemplateLibraryOpen && (
+            <div className='border-border/70 max-h-44 overflow-y-auto rounded-[8px] border p-2'>
+              {isLoadingTemplateLibrary ? (
+                <div className='text-muted-foreground py-2 text-center text-xs'>
+                  正在加载模板…
+                </div>
+              ) : templateLibrary.length === 0 ? (
+                <div className='text-muted-foreground py-2 text-center text-xs'>
+                  还没有可复用模板。
+                </div>
+              ) : (
+                <div className='space-y-1.5'>
+                  {templateLibrary.map((template) => {
+                    const selected = selectedPaths.has(template.path)
+                    return (
+                      <button
+                        key={template.path}
+                        type='button'
+                        className='hover:bg-accent/50 flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] px-2 py-1.5 text-left'
+                        onClick={() =>
+                          applyTemplateBindings(
+                            mergeTemplateBindings(bindings, [
+                              agentUploadToTemplateBinding(template),
+                            ])
+                          )
+                        }
+                      >
+                        <FileTextIcon className='text-muted-foreground size-3.5 shrink-0' />
+                        <div className='min-w-0 flex-1 overflow-hidden'>
+                          <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
+                            {template.original_name || template.filename}
+                          </div>
+                          <div className='text-muted-foreground max-w-full truncate overflow-hidden text-[11px] whitespace-nowrap'>
+                            {template.path}
+                          </div>
+                        </div>
+                        <span className='text-muted-foreground shrink-0 text-[11px]'>
+                          {selected ? '已使用' : '使用'}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
-          将 HTML 模板上传至 <code className='bg-muted rounded px-1 text-[10px]'>{DEFAULT_TEMPLATE_DIR_WEB}</code> 后在此填写模板文件名。
-          数据文件输出至网页同级 <code className='bg-muted rounded px-1 text-[10px]'>/data/</code> 目录。
+          支持一次上传多个模板；相同内容会合并为一个模板，同名新模板只保留最新文件。生成时只参考当前绑定模板、上一节点输出和当前节点描述。
         </div>
       </LabeledField>
     )
@@ -2818,20 +4551,31 @@ function SettingControl({
 
   if (label === '整理模板') {
     const hasTemplate = value.trim() !== '' && value !== '未上传模板'
+    const originalName = settings['模板原文件名']?.trim()
 
-    const handleTemplateUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    const handleTemplateUpload = async (
+      event: ChangeEvent<HTMLInputElement>
+    ) => {
       const input = event.currentTarget
       const file = input.files?.[0]
       if (!file) return
 
-      const reader = new FileReader()
-      reader.onload = () => {
-        const content = typeof reader.result === 'string' ? reader.result : ''
-        onChange(file.name)
-        onChangeSetting?.('模板内容', content.slice(0, 12000))
+      setIsUploadingTemplate(true)
+      try {
+        const uploaded = await uploadAgentFile(file, 'report-template')
+        onChange(uploaded.path)
+        onChangeSetting?.('模板原文件名', uploaded.original_name || file.name)
+        onChangeSetting?.('模板预览', uploaded.content_preview || '')
+        onChangeSetting?.('模板内容', '')
+        toast.success('模板已上传', {
+          description: uploaded.original_name || uploaded.path,
+        })
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : '模板上传失败')
+      } finally {
         input.value = ''
+        setIsUploadingTemplate(false)
       }
-      reader.readAsText(file)
     }
 
     return (
@@ -2840,12 +4584,10 @@ function SettingControl({
           <FileTextIcon className='text-muted-foreground size-4 shrink-0' />
           <div className='min-w-0 flex-1'>
             <div className='truncate text-xs font-medium'>
-              {hasTemplate ? value : '未上传模板'}
+              {hasTemplate ? originalName || value : '未上传模板'}
             </div>
             <div className='text-muted-foreground truncate text-[11px]'>
-              {hasTemplate
-                ? '将优先按上传模板整理字段和输出格式'
-                : '未上传时按数据类型自动推断字段和格式'}
+              {hasTemplate ? value : '未上传时按数据类型自动推断字段和格式'}
             </div>
           </div>
           {hasTemplate && (
@@ -2857,23 +4599,30 @@ function SettingControl({
               onClick={() => {
                 onChange('未上传模板')
                 onChangeSetting?.('模板内容', '')
+                onChangeSetting?.('模板原文件名', '')
+                onChangeSetting?.('模板预览', '')
               }}
             >
               清除
             </Button>
           )}
-          <label className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[6px] px-2.5 text-xs font-medium'>
-            上传
+          <label
+            aria-disabled={isUploadingTemplate}
+            className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[6px] px-2.5 text-xs font-medium aria-disabled:pointer-events-none aria-disabled:opacity-50'
+          >
+            {isUploadingTemplate ? '上传中' : hasTemplate ? '替换' : '上传'}
             <input
               type='file'
-              accept='.csv,.json,.md,.txt,text/csv,application/json,text/markdown,text/plain'
+              accept={TEMPLATE_FILE_ACCEPT}
               className='sr-only'
+              disabled={isUploadingTemplate}
               onChange={handleTemplateUpload}
             />
           </label>
         </div>
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
-          支持 CSV、JSON、Markdown、TXT 模板。模板可写字段顺序、输出格式、排序规则和字段说明。
+          每次上传都会保存为独立文件，并绑定当前节点；整理时只参考该模板文件、上一节点数据和当前节点描述。支持
+          Excel、Word、PDF、网页、Markdown、TXT、CSV、JSON。
         </div>
       </LabeledField>
     )
@@ -2889,7 +4638,7 @@ function SettingControl({
           className='min-h-28 rounded-[8px] text-sm'
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
-          留空时会根据“数据类型”和上游数据结构自动整理；填写或上传模板后优先按模板输出。
+          上传模板文件后优先按当前文件输出；这里可补充字段顺序、格式和排序规则，留空时按上游数据结构自动整理。
         </div>
       </LabeledField>
     )
@@ -2944,24 +4693,6 @@ function SettingControl({
     )
   }
 
-  if (label === '归档位置') {
-    return (
-      <LabeledField label={label}>
-        <NativeSelect
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          className='w-full'
-        >
-          {ARCHIVE_LOCATION_OPTIONS.map((option) => (
-            <NativeSelectOption key={option} value={option}>
-              {option}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
-      </LabeledField>
-    )
-  }
-
   const selectOptions = SETTING_SELECT_OPTIONS[label]
   if (selectOptions) {
     const options = selectOptions.includes(value)
@@ -2997,7 +4728,7 @@ function SettingControl({
 
 function SkillManagerPanel({
   skillChoices,
-  managedSkills,
+  managedSkills: _managedSkills,
   compact: _compact,
   onAddSkill,
   onDeleteSkill,
@@ -3033,7 +4764,9 @@ function SkillManagerPanel({
       return
     }
     if (activeTab === 'marketplace') {
-      const skill = MARKETPLACE_SKILLS.find((s) => !installedValues.has(s.value))
+      const skill = MARKETPLACE_SKILLS.find(
+        (s) => !installedValues.has(s.value)
+      )
       if (skill) onAddSkill(skill)
       return
     }
@@ -3056,7 +4789,7 @@ function SkillManagerPanel({
     <div className='flex flex-col gap-3'>
       {/* ── 添加来源 Tab ── */}
       <div className='border-border/60 rounded-[10px] border p-3'>
-        <div className='text-muted-foreground mb-2 text-[10px] font-semibold uppercase tracking-wider'>
+        <div className='text-muted-foreground mb-2 text-[10px] font-semibold tracking-wider uppercase'>
           添加 Skill
         </div>
 
@@ -3118,7 +4851,9 @@ function SkillManagerPanel({
                   className='border-border/50 flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-2'
                 >
                   <div className='min-w-0 flex-1'>
-                    <div className='truncate text-[11px] font-medium'>{skill.label}</div>
+                    <div className='truncate text-[11px] font-medium'>
+                      {skill.label}
+                    </div>
                     <div className='text-muted-foreground truncate text-[10px]'>
                       {skill.description}
                     </div>
@@ -3170,7 +4905,7 @@ function SkillManagerPanel({
       {/* ── 已安装 Skill 列表 ── */}
       {userSkills.length > 0 && (
         <div>
-          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wider'>
+          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold tracking-wider uppercase'>
             已安装 ({userSkills.length})
           </div>
           <div className='flex flex-col gap-1'>
@@ -3180,20 +4915,27 @@ function SkillManagerPanel({
                 className='bg-muted/30 hover:bg-muted/50 group flex items-center gap-2 rounded-[7px] px-2.5 py-2 transition-colors'
               >
                 <div className='min-w-0 flex-1'>
-                  <div className='truncate text-[11px] font-medium'>{skill.label}</div>
+                  <div className='truncate text-[11px] font-medium'>
+                    {skill.label}
+                  </div>
                   <div className='text-muted-foreground flex items-center gap-1 truncate text-[10px]'>
                     <span
                       className={cn(
                         'rounded px-1 py-0 text-[9px] font-medium',
-                        skill.source === 'github' && 'bg-purple-500/10 text-purple-600',
-                        skill.source === 'marketplace' && 'bg-blue-500/10 text-blue-600',
-                        skill.source === 'custom' && 'bg-amber-500/10 text-amber-600'
+                        skill.source === 'github' &&
+                          'bg-purple-500/10 text-purple-600',
+                        skill.source === 'marketplace' &&
+                          'bg-blue-500/10 text-blue-600',
+                        skill.source === 'custom' &&
+                          'bg-amber-500/10 text-amber-600'
                       )}
                     >
                       {formatSkillSource(skill.source)}
                     </span>
                     {skill.reference && (
-                      <span className='truncate opacity-60'>{skill.reference}</span>
+                      <span className='truncate opacity-60'>
+                        {skill.reference}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -3214,7 +4956,7 @@ function SkillManagerPanel({
       {/* ── 内置 Skill ── */}
       {builtinSkills.length > 0 && (
         <div>
-          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wider'>
+          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold tracking-wider uppercase'>
             内置 ({builtinSkills.length})
           </div>
           <div className='flex flex-col gap-1'>
@@ -3248,6 +4990,11 @@ function SkillManagerPanel({
                     <div className='text-muted-foreground truncate text-[10px] leading-snug'>
                       {skill.description}
                     </div>
+                    {skill.capabilities?.length ? (
+                      <div className='text-muted-foreground mt-0.5 truncate text-[10px] leading-snug'>
+                        {skill.capabilities.join(' · ')}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
               )
@@ -3274,35 +5021,29 @@ function LabeledField({
   )
 }
 
-function FieldList({ title, values }: { title: string; values: string[] }) {
+function FieldList({ values }: { values: string[] }) {
   return (
-    <div className='border-border/70 min-w-0 rounded-[8px] border p-2'>
-      <div className='text-muted-foreground mb-1 text-[11px]'>{title}</div>
-      <div className='space-y-1'>
-        {values.length === 0 ? (
-          <div className='text-muted-foreground text-xs'>无</div>
-        ) : (
-          values.map((value) => (
-            <div
-              key={value}
-              className='bg-muted/55 truncate rounded-[6px] px-1.5 py-1 text-xs'
-              title={value}
-            >
-              {value}
-            </div>
-          ))
-        )}
-      </div>
+    <div className='space-y-1'>
+      {values.length === 0 ? (
+        <div className='text-muted-foreground text-xs'>无</div>
+      ) : (
+        values.map((value) => (
+          <div
+            key={value}
+            className='bg-muted/55 truncate rounded-[6px] px-1.5 py-1 text-xs'
+            title={value}
+          >
+            {value}
+          </div>
+        ))
+      )}
     </div>
   )
 }
 
-function buildModelChoices(models: ModelOption[], currentModel?: string) {
+function buildModelChoices(models: ModelOption[]) {
   const currentChoices: ModelChoice[] = models.map((model) => ({
-    label:
-      model.value === currentModel
-        ? `${model.label || model.value}（对话当前）`
-        : model.label || model.value,
+    label: model.label || model.value,
     value: model.value,
     description: model.description,
     supportsImage: model.supportsImage,
@@ -3384,7 +5125,10 @@ function writeSavedSkills(skills: SkillChoice[]) {
   if (typeof window === 'undefined') return
 
   try {
-    window.localStorage.setItem(AGENT_SKILLS_STORAGE_KEY, JSON.stringify(skills))
+    window.localStorage.setItem(
+      AGENT_SKILLS_STORAGE_KEY,
+      JSON.stringify(skills)
+    )
   } catch {
     /* localStorage may be unavailable or full. */
   }
@@ -3415,12 +5159,15 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
     return parsed
       .filter(isSavedBlueprint)
       .map((blueprint) => {
-        const nodes = blueprint.nodes.map((node) => normalizeNode(node))
+        const nodes = normalizeSavedBlueprintNodes(
+          blueprint.nodes.map((node) => normalizeNode(node)),
+          blueprint.status
+        )
         return {
           ...blueprint,
           nodes,
           edges: blueprint.edges.map((edge) => normalizeEdge(edge)),
-          status: blueprint.status ?? getBlueprintStatus(nodes),
+          status: normalizeSavedBlueprintStatus(nodes, blueprint.status),
           executionLog: normalizeExecutionLog(blueprint.executionLog),
         }
       })
@@ -3450,6 +5197,55 @@ function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
   }
   // paused is set externally via handleStopPreview
   return 'pending'
+}
+
+function normalizeSavedBlueprintNodes(
+  nodes: AgentFlowNode[],
+  savedStatus?: AgentBlueprintStatus
+): AgentFlowNode[] {
+  if (savedStatus !== 'ended') return nodes
+  if (!nodes.some((node) => node.data.kind === 'schedule')) return nodes
+
+  return nodes.map((node) =>
+    node.data.kind === 'schedule' && node.data.status === 'done'
+      ? { ...node, data: { ...node.data, status: 'waiting' } }
+      : node
+  )
+}
+
+function normalizeSavedBlueprintStatus(
+  nodes: AgentFlowNode[],
+  savedStatus?: AgentBlueprintStatus
+): AgentBlueprintStatus {
+  if (savedStatus === 'paused') return 'paused'
+  if (
+    savedStatus === 'running' &&
+    nodes.some((node) => node.data.status === 'running')
+  ) {
+    return 'running'
+  }
+  if (
+    savedStatus === 'ended' &&
+    nodes.some((node) => node.data.kind === 'schedule')
+  ) {
+    return 'pending'
+  }
+  return savedStatus ?? getBlueprintStatus(nodes)
+}
+
+function getCurrentBlueprintStatus(
+  nodes: AgentFlowNode[],
+  savedStatus?: AgentBlueprintStatus
+): AgentBlueprintStatus {
+  if (nodes.some((node) => node.data.status === 'running')) return 'running'
+  if (savedStatus === 'paused') return 'paused'
+  return getBlueprintStatus(nodes)
+}
+
+function getRunPreviewButtonLabel(status: AgentBlueprintStatus) {
+  if (status === 'paused') return '继续'
+  if (status === 'ended') return '重新执行'
+  return '试运行'
 }
 
 function buildSeedBlueprintTitle(prompt: string) {
@@ -3492,10 +5288,11 @@ function normalizeExecutionLog(value: unknown): AgentExecutionLogMap {
       startedAt: numberOrUndefined(candidate.startedAt),
       endedAt: numberOrUndefined(candidate.endedAt),
       durationMs: numberOrUndefined(candidate.durationMs),
-      message:
-        typeof candidate.message === 'string' ? candidate.message : '',
+      message: typeof candidate.message === 'string' ? candidate.message : '',
       inputSummary: stringArray(candidate.inputSummary),
       outputSummary: stringArray(candidate.outputSummary),
+      modelOutput:
+        typeof candidate.modelOutput === 'string' ? candidate.modelOutput : '',
       steps: stringArray(candidate.steps),
       error: typeof candidate.error === 'string' ? candidate.error : undefined,
     }
@@ -3503,9 +5300,7 @@ function normalizeExecutionLog(value: unknown): AgentExecutionLogMap {
   return out
 }
 
-function isAgentNodeLogStatus(
-  status: unknown
-): status is AgentNodeLogStatus {
+function isAgentNodeLogStatus(status: unknown): status is AgentNodeLogStatus {
   return (
     status === 'pending' ||
     status === 'running' ||
@@ -3515,9 +5310,7 @@ function isAgentNodeLogStatus(
 }
 
 function numberOrUndefined(value: unknown) {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? value
-    : undefined
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 function stringArray(value: unknown) {
@@ -3526,12 +5319,50 @@ function stringArray(value: unknown) {
     : []
 }
 
+function updateNodeSettingValue(
+  node: AgentFlowNode,
+  key: string,
+  value: string
+): AgentFlowNode {
+  const settings = {
+    ...node.data.settings,
+    [key]: value,
+  }
+  const outputs =
+    node.data.kind === 'report' && key === REPORT_OUTPUT_FORMAT_SETTING
+      ? reportOutputsFromFormatSetting(value, node.data.outputs)
+      : node.data.outputs
+
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      settings,
+      outputs,
+    },
+  }
+}
+
 function normalizeNode(node: AgentFlowNode): AgentFlowNode {
   const data = node.data ?? ({} as Partial<AgentNodeData>)
   const kind =
     data.kind && NODE_META[data.kind] ? data.kind : ('start' as AgentNodeKind)
   const meta = NODE_META[kind]
   const outputs = Array.isArray(data.outputs) ? data.outputs : meta.outputs
+  const settings = normalizeNodeSettings(kind, data.settings, meta.settings)
+  if (kind === 'report' && !data.settings?.[REPORT_OUTPUT_FORMAT_SETTING]) {
+    settings[REPORT_OUTPUT_FORMAT_SETTING] = normalizeReportOutputFormats(
+      '',
+      outputs
+    ).join('、')
+  }
+  const normalizedOutputs =
+    kind === 'report'
+      ? reportOutputsFromFormatSetting(
+          settings[REPORT_OUTPUT_FORMAT_SETTING] || '',
+          outputs
+        )
+      : outputs
 
   return {
     ...node,
@@ -3545,10 +5376,10 @@ function normalizeNode(node: AgentFlowNode): AgentFlowNode {
       group: data.group,
       model:
         data.model ?? MODEL_FALLBACKS[meta.role][0]?.value ?? 'gpt-4.1-mini',
-      skill: data.skill ?? pickDefaultSkill(kind),
+      skill: normalizeBuiltinSkillValue(data.skill ?? pickDefaultSkill(kind)),
       inputs: Array.isArray(data.inputs) ? data.inputs : meta.inputs,
-      outputs: kind === 'report' ? mergeStringList(outputs, meta.outputs) : outputs,
-      settings: normalizeNodeSettings(kind, data.settings, meta.settings),
+      outputs: normalizedOutputs,
+      settings,
       status: data.status ?? 'ready',
     },
   }
@@ -3559,23 +5390,53 @@ function normalizeNodeSettings(
   settings: Record<string, string> | undefined,
   defaults: Record<string, string>
 ) {
-  if (kind !== 'report') {
-    return { ...defaults, ...(settings ?? {}) }
+  const normalized = { ...defaults, ...(settings ?? {}) }
+
+  if (kind === 'report') {
+    delete normalized['模板目录']
+    if (normalized['模板文件'] === LEGACY_TEMPLATE_DIR_REPORT) {
+      normalized['模板文件'] = ''
+    }
+    normalized[REPORT_OUTPUT_FORMAT_SETTING] = normalizeReportOutputFormats(
+      normalized[REPORT_OUTPUT_FORMAT_SETTING] || ''
+    ).join('、')
+  }
+  if (kind === 'webpage') {
+    delete normalized['模板目录']
+    if (
+      normalized['网页模板'] === '默认模板' ||
+      normalized['网页模板'] === LEGACY_TEMPLATE_DIR_WEB
+    ) {
+      normalized['网页模板'] = ''
+    }
+  }
+  if (kind === 'browser') {
+    for (const key of TRANSIENT_BROWSER_SETTING_LABELS) {
+      delete normalized[key]
+    }
+    if (!normalized['采集等待']) {
+      normalized['采集等待'] = '6s'
+    }
+  }
+  if (kind === 'stop') {
+    delete normalized['归档']
+    delete normalized['输出目录']
+    delete normalized['归档位置']
   }
 
-  return {
-    模板目录: settings?.['模板目录'] ?? defaults['模板目录'] ?? '/templates/reports',
-    输出目录: settings?.['输出目录'] ?? defaults['输出目录'] ?? '/output/reports',
+  if (
+    normalized['输出目录'] === LEGACY_OUTPUT_DIR_REPORT ||
+    (kind === 'report' && !normalized['输出目录'])
+  ) {
+    normalized['输出目录'] = DEFAULT_OUTPUT_DIR_REPORT
   }
-}
-
-function mergeStringList(current: string[], defaults: string[]) {
-  const seen = new Set<string>()
-  return [...current, ...defaults].filter((value) => {
-    if (seen.has(value)) return false
-    seen.add(value)
-    return true
-  })
+  if (
+    normalized['输出目录'] === LEGACY_OUTPUT_DIR_WEB ||
+    (kind === 'webpage' && !normalized['输出目录'])
+  ) {
+    normalized['输出目录'] = DEFAULT_OUTPUT_DIR_WEB
+  }
+  return normalized
 }
 
 function normalizeEdge(edge: AgentFlowEdge): AgentFlowEdge {
@@ -3629,20 +5490,25 @@ function pickDefaultModel(
   return MODEL_FALLBACKS[meta.role][0]?.value ?? currentModel ?? 'gpt-4.1-mini'
 }
 
-function pickDefaultSkill(_kind: AgentNodeKind) {
-  return NO_SKILL_VALUE
+function pickDefaultSkill(kind: AgentNodeKind) {
+  return DEFAULT_SKILL_BY_NODE_KIND[kind] ?? NO_SKILL_VALUE
 }
 
 function getSkillChoice(value: string, skillChoices: SkillChoice[]) {
-  if (!value) return NO_SKILL_CHOICE
+  const normalizedValue = normalizeBuiltinSkillValue(value)
+  if (!normalizedValue) return NO_SKILL_CHOICE
   return (
-    skillChoices.find((skill) => skill.value === value) ?? {
-      label: value,
-      value,
+    skillChoices.find((skill) => skill.value === normalizedValue) ?? {
+      label: normalizedValue,
+      value: normalizedValue,
       description: '自定义 Skill',
       source: 'custom',
     }
   )
+}
+
+function normalizeBuiltinSkillValue(value: string) {
+  return LEGACY_BUILTIN_SKILL_ALIASES[value] ?? value
 }
 
 function formatSkillSource(source: SkillSource) {
@@ -3736,7 +5602,7 @@ function createInitialNodes(templates: NodeTemplate[]) {
       position: { x: -360, y: -120 },
       patch: {
         title: '每天早上执行',
-        description: '每天 08:30 自动启动鱼小铺经营数据日报。',
+        description: '每天 08:30 自动启动当前自动化任务。',
         status: 'waiting',
       },
     },
@@ -3746,7 +5612,7 @@ function createInitialNodes(templates: NodeTemplate[]) {
       position: { x: -360, y: 90 },
       patch: {
         title: '立即执行一次',
-        description: '手动触发当前蓝图，适合临时补跑日报。',
+        description: '手动触发当前蓝图，适合临时执行一次任务。',
       },
     },
     {
@@ -3754,13 +5620,14 @@ function createInitialNodes(templates: NodeTemplate[]) {
       id: 'browser',
       position: { x: 0, y: -20 },
       patch: {
-        title: '打开鱼小铺后台',
+        title: '打开目标页面',
         description:
-          '使用当前设备浏览器登录态打开闲鱼/鱼小铺后台，逐个读取商品每日曝光、浏览、想要数据。',
+          '使用当前设备浏览器登录态打开目标页面，按照节点描述读取需要的数据。',
         settings: {
-          网址: 'https://seller.goofish.com/',
+          网址: 'https://www.baidu.com/',
           登录态: '使用当前设备浏览器',
           权限: '只读采集',
+          采集等待: '6s',
         },
       },
     },
@@ -3769,9 +5636,9 @@ function createInitialNodes(templates: NodeTemplate[]) {
       id: 'transform',
       position: { x: 350, y: -20 },
       patch: {
-        title: '清洗商品指标',
+        title: '整理数据',
         description:
-          '按商品维度合并曝光、浏览、想要数据，计算浏览率和想要率，标记异常波动。',
+          '根据上一节点输出清洗、归并和排序数据，按当前节点描述生成结构化结果。',
       },
     },
     {
@@ -3779,8 +5646,8 @@ function createInitialNodes(templates: NodeTemplate[]) {
       id: 'image',
       position: { x: 700, y: -145 },
       patch: {
-        title: '生成趋势封面图',
-        description: '用今日核心指标生成一张适合日报封面的经营趋势看板图。',
+        title: '生成图片',
+        description: '根据上一节点输出和当前节点描述生成配图或封面图。',
       },
     },
     {
@@ -3788,9 +5655,19 @@ function createInitialNodes(templates: NodeTemplate[]) {
       id: 'report',
       position: { x: 700, y: 95 },
       patch: {
-        title: '整理日报文档',
+        title: '生成日报',
         description:
-          '按模板输出 Markdown 日报和 CSV 表格，包含商品排名、关键变化和运营建议。',
+          '根据上一节点给出的表格、结论和图片生成日报文档；标题、格式、语气和归档规则只以当前节点描述为准。',
+      },
+    },
+    {
+      kind: 'stop',
+      id: 'stop',
+      position: { x: 1050, y: 95 },
+      patch: {
+        title: '结束',
+        description:
+          '确认上游产物已生成后结束当前流程；产物目录以上游输出节点配置为准。',
       },
     },
   ]
@@ -3837,6 +5714,67 @@ function createNodeFromTemplate(
       status: template.status ?? 'ready',
     },
   }
+}
+
+function ensureTerminalStopNode(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[],
+  templateByKind: Map<AgentNodeKind, NodeTemplate>
+) {
+  const stopTemplate = templateByKind.get('stop')
+  if (!stopTemplate) return { nodes, edges, changed: false }
+
+  let changed = false
+  let nextNodes = nodes
+  const stopNode =
+    nodes.find((node) => node.data.kind === 'stop') ??
+    createNodeFromTemplate(stopTemplate, `stop-${Date.now()}`, {
+      x: Math.max(...nodes.map((node) => node.position.x), 0) + 350,
+      y: findTerminalSourceNode(nodes, edges)?.position.y ?? 95,
+    })
+
+  if (!nodes.some((node) => node.id === stopNode.id)) {
+    nextNodes = [...nodes, stopNode]
+    changed = true
+  }
+
+  const terminalSource = findTerminalSourceNode(nextNodes, edges)
+  if (!terminalSource || terminalSource.id === stopNode.id) {
+    return { nodes: nextNodes, edges, changed }
+  }
+
+  const hasStopIncoming = edges.some((edge) => edge.target === stopNode.id)
+  if (hasStopIncoming) {
+    return { nodes: nextNodes, edges, changed }
+  }
+
+  return {
+    nodes: nextNodes,
+    edges: [
+      ...edges,
+      decorateEdge({
+        id: `e-${terminalSource.id}-${stopNode.id}`,
+        source: terminalSource.id,
+        target: stopNode.id,
+      }),
+    ],
+    changed: true,
+  }
+}
+
+function findTerminalSourceNode(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+) {
+  const outgoing = new Set(edges.map((edge) => edge.source).filter(Boolean))
+  const preferred = nodes.find((node) => node.data.kind === 'report')
+  if (preferred && !outgoing.has(preferred.id)) return preferred
+
+  return [...nodes]
+    .filter((node) => node.data.kind !== 'stop' && !outgoing.has(node.id))
+    .sort(
+      (a, b) => b.position.x - a.position.x || b.position.y - a.position.y
+    )[0]
 }
 
 function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {

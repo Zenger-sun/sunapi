@@ -27,6 +27,7 @@ export type AgentBlueprintSummary = {
 
 type StoredAgentNode = {
   data?: {
+    kind?: string
     status?: string
   }
 }
@@ -154,12 +155,14 @@ function normalizeBlueprintStatus(
   status: unknown,
   nodes: unknown[]
 ): AgentBlueprintStatus {
-  if (
-    status === 'pending' ||
-    status === 'running' ||
-    status === 'paused' ||
-    status === 'ended'
-  ) {
+  const hasScheduleNode = nodes.some(
+    (node) =>
+      node &&
+      typeof node === 'object' &&
+      (node as StoredAgentNode).data?.kind === 'schedule'
+  )
+
+  if (status === 'pending' || status === 'running' || status === 'paused') {
     return status
   }
 
@@ -174,11 +177,14 @@ function normalizeBlueprintStatus(
   if (nodeStatuses.some((nodeStatus) => nodeStatus === 'running')) {
     return 'running'
   }
+  if (status === 'ended') {
+    return hasScheduleNode ? 'pending' : 'ended'
+  }
   if (
     nodeStatuses.length > 0 &&
     nodeStatuses.every((nodeStatus) => nodeStatus === 'done')
   ) {
-    return 'ended'
+    return hasScheduleNode ? 'pending' : 'ended'
   }
   return 'pending'
 }
