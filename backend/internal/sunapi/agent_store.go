@@ -31,6 +31,12 @@ func newSkillID() string {
 	return "sk-" + hex.EncodeToString(b)
 }
 
+func newComponentID() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return "cmp-" + hex.EncodeToString(b)
+}
+
 func newExecLogID() string {
 	b := make([]byte, 12)
 	_, _ = rand.Read(b)
@@ -379,26 +385,43 @@ func (s *Store) ListSkills(ctx context.Context, userID int64) ([]AgentSkill, err
 	return out, rows.Err()
 }
 
-func (s *Store) CreateSkill(ctx context.Context, userID int64, f SkillFormData) (*AgentSkill, error) {
+func (s *Store) CreateSkill(ctx context.Context, userID int64, f SkillFormData, config json.RawMessage, permissions json.RawMessage, version string) (*AgentSkill, error) {
 	if strings.TrimSpace(f.Name) == "" {
 		return nil, errors.New("skill name is required")
 	}
 	now := time.Now().UnixMilli()
-	config := f.Config
+	if len(config) == 0 || string(config) == "null" {
+		config = f.Config
+	}
 	if len(config) == 0 || string(config) == "null" {
 		config = json.RawMessage(`{}`)
 	}
+	if len(permissions) == 0 || string(permissions) == "null" {
+		permissions = json.RawMessage(`[]`)
+	}
+	if strings.TrimSpace(version) == "" {
+		version = "1.0.0"
+	}
+	installKeySource := strings.TrimSpace(f.SourceURL)
+	if f.SourceType == "marketplace" {
+		var cfg map[string]any
+		if err := json.Unmarshal(config, &cfg); err == nil {
+			if marketplaceID, ok := cfg["marketplace_id"].(string); ok && strings.TrimSpace(marketplaceID) != "" {
+				installKeySource = marketplaceID
+			}
+		}
+	}
 	sk := &AgentSkill{
-		ID:          newSkillID(),
+		ID:          stableSkillInstallKey(f.SourceType, installKeySource, strings.TrimSpace(f.Name)),
 		UserID:      userID,
 		Name:        strings.TrimSpace(f.Name),
 		Description: strings.TrimSpace(f.Description),
-		Version:     "1.0.0",
+		Version:     strings.TrimSpace(version),
 		Source:      f.SourceType,
 		SourceURL:   strings.TrimSpace(f.SourceURL),
 		Enabled:     true,
 		Config:      config,
-		Permissions: json.RawMessage(`[]`),
+		Permissions: permissions,
 		CreatedTime: now,
 		UpdatedTime: now,
 	}
@@ -408,8 +431,25 @@ func (s *Store) CreateSkill(ctx context.Context, userID int64, f SkillFormData) 
 		VALUES (?,?,?,?,?,?,?,1,?,?,?,?)`,
 		sk.ID, sk.UserID, sk.Name, sk.Description, sk.Version, sk.Source, sk.SourceURL,
 		sk.Config, sk.Permissions, sk.CreatedTime, sk.UpdatedTime)
+	if err == nil {
+		return sk, nil
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE agent_skills
+		SET name=?, description=?, version=?, source=?, source_url=?, enabled=1,
+		    config=?, permissions=?, updated_time=?
+		WHERE id=? AND user_id=?`,
+		sk.Name, sk.Description, sk.Version, sk.Source, sk.SourceURL,
+		sk.Config, sk.Permissions, sk.UpdatedTime, sk.ID, sk.UserID)
 	if err != nil {
 		return nil, err
+	}
+	var createdTime int64
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT created_time FROM agent_skills WHERE id=? AND user_id=?`,
+		sk.ID, sk.UserID).Scan(&createdTime)
+	if createdTime > 0 {
+		sk.CreatedTime = createdTime
 	}
 	return sk, nil
 }
@@ -428,6 +468,79 @@ func (s *Store) ToggleSkill(ctx context.Context, id string, userID int64, enable
 func (s *Store) DeleteSkill(ctx context.Context, id string, userID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM agent_skills WHERE id=? AND user_id=?`, id, userID)
+	return err
+}
+
+// ── Component CRUD ───────────────────────────────────────────────────────────
+
+func (s *Store) ListComponents(ctx context.Context, userID int64) ([]AgentComponent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, user_id, name, description, kind, group_name, source,
+		       enabled, config, created_time, updated_time
+		FROM agent_components
+		WHERE user_id = ?
+		ORDER BY group_name, created_time DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]AgentComponent, 0)
+	for rows.Next() {
+		var component AgentComponent
+		var enabled int
+		if err := rows.Scan(&component.ID, &component.UserID, &component.Name,
+			&component.Description, &component.Kind, &component.Group,
+			&component.Source, &enabled, &component.Config,
+			&component.CreatedTime, &component.UpdatedTime); err != nil {
+			return nil, err
+		}
+		component.Enabled = enabled == 1
+		out = append(out, component)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreateComponent(ctx context.Context, userID int64, f ComponentFormData, config json.RawMessage) (*AgentComponent, error) {
+	if strings.TrimSpace(f.Name) == "" {
+		return nil, errors.New("component name is required")
+	}
+	if len(config) == 0 || string(config) == "null" {
+		config = json.RawMessage(`{}`)
+	}
+	now := time.Now().UnixMilli()
+	component := &AgentComponent{
+		ID:          newComponentID(),
+		UserID:      userID,
+		Name:        strings.TrimSpace(f.Name),
+		Description: strings.TrimSpace(f.Description),
+		Kind:        "custom",
+		Group:       normalizeComponentGroup(f.Group),
+		Source:      "custom",
+		Enabled:     true,
+		Config:      config,
+		CreatedTime: now,
+		UpdatedTime: now,
+	}
+	if component.Group == "" {
+		component.Group = "process"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO agent_components
+		(id, user_id, name, description, kind, group_name, source, enabled, config, created_time, updated_time)
+		VALUES (?,?,?,?,?,?,?,1,?,?,?)`,
+		component.ID, component.UserID, component.Name, component.Description,
+		component.Kind, component.Group, component.Source, component.Config,
+		component.CreatedTime, component.UpdatedTime)
+	if err != nil {
+		return nil, err
+	}
+	return component, nil
+}
+
+func (s *Store) DeleteComponent(ctx context.Context, id string, userID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM agent_components WHERE id=? AND user_id=? AND source='custom'`, id, userID)
 	return err
 }
 

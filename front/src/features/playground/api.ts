@@ -18,8 +18,12 @@ import type {
   ModelOption,
   AgentBrowserCaptureRequest,
   AgentBrowserCaptureResult,
+  AgentComponentFormData,
+  AgentComponentItem,
   AgentFileUpload,
   AgentFileUploadPurpose,
+  AgentHTTPRequestPayload,
+  AgentHTTPResponse,
   AgentReportOutputFile,
   AgentReportWriteResult,
   GroupOption,
@@ -328,6 +332,62 @@ export async function captureAgentBrowserPage(
   }
 
   return data.data as AgentBrowserCaptureResult
+}
+
+export async function executeAgentHTTPRequest(
+  payload: AgentHTTPRequestPayload
+): Promise<AgentHTTPResponse> {
+  const res = await api.post(API_ENDPOINTS.AGENT_HTTP_REQUEST, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to execute HTTP request')
+  }
+
+  return data.data as AgentHTTPResponse
+}
+
+export async function listAgentComponents(): Promise<AgentComponentItem[]> {
+  const res = await api.get(API_ENDPOINTS.AGENT_COMPONENTS, {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list components')
+  }
+
+  return data.data as AgentComponentItem[]
+}
+
+export async function createAgentComponent(
+  payload: AgentComponentFormData
+): Promise<AgentComponentItem> {
+  const res = await api.post(API_ENDPOINTS.AGENT_COMPONENTS, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to create component')
+  }
+
+  return data.data as AgentComponentItem
+}
+
+export async function deleteAgentComponent(id: string): Promise<void> {
+  const res = await api.delete(`${API_ENDPOINTS.AGENT_COMPONENTS}/${id}`, {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success) {
+    throw new Error(data.message || 'Failed to delete component')
+  }
 }
 
 export async function getImageGenerationHistory(): Promise<

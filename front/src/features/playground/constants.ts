@@ -36,6 +36,8 @@ export const API_ENDPOINTS = {
   AGENT_FILES: '/api/agents/files',
   AGENT_REPORTS: '/api/agents/reports',
   AGENT_BROWSER_CAPTURE: '/api/agents/browser-capture',
+  AGENT_HTTP_REQUEST: '/api/agents/http-request',
+  AGENT_COMPONENTS: '/api/agent-components',
   PLAYGROUND_IMAGE_HISTORY: '/api/playground/image-history',
   PLAYGROUND_IMAGE_TASKS: '/api/playground/image-tasks',
   PLAYGROUND_VIDEO_HISTORY: '/api/playground/video-history',

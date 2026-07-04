@@ -55,6 +55,35 @@ type AgentSkill struct {
 	UpdatedTime int64           `json:"updated_time"`
 }
 
+// AgentSkillMarketplaceItem is a curated installable skill entry.
+type AgentSkillMarketplaceItem struct {
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	Version      string          `json:"version"`
+	SourceURL    string          `json:"source_url,omitempty"`
+	Tags         []string        `json:"tags,omitempty"`
+	Capabilities []string        `json:"capabilities,omitempty"`
+	Permissions  []string        `json:"permissions,omitempty"`
+	Config       json.RawMessage `json:"config,omitempty"`
+	Installed    bool            `json:"installed"`
+}
+
+// AgentComponent defines a creator-studio workflow component template.
+type AgentComponent struct {
+	ID          string          `json:"id"`
+	UserID      int64           `json:"user_id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Kind        string          `json:"kind"`   // built-in node kind or custom
+	Group       string          `json:"group"`  // trigger, collect, process, output
+	Source      string          `json:"source"` // builtin, custom
+	Enabled     bool            `json:"enabled"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	CreatedTime int64           `json:"created_time"`
+	UpdatedTime int64           `json:"updated_time"`
+}
+
 // AgentExecutionLog 执行日志
 type AgentExecutionLog struct {
 	ID          string          `json:"id"`
@@ -91,9 +120,27 @@ type BlueprintFormData struct {
 
 // SkillFormData 创建Skill的表单数据
 type SkillFormData struct {
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	SourceType    string          `json:"source_type"` // builtin, marketplace, github, custom
+	SourceURL     string          `json:"source_url,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+	MarketplaceID string          `json:"marketplace_id,omitempty"`
+	ModelGroup    string          `json:"model_group,omitempty"`
+	ModelName     string          `json:"model_name,omitempty"`
+	Tags          []string        `json:"tags,omitempty"`
+}
+
+// ComponentFormData creates a user-defined component template.
+type ComponentFormData struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
-	SourceType  string          `json:"source_type"` // builtin, marketplace, github, custom
-	SourceURL   string          `json:"source_url,omitempty"`
-	Config      json.RawMessage `json:"config,omitempty"`
+	Group       string          `json:"group"`
+	ModelGroup  string          `json:"model_group,omitempty"`
+	ModelName   string          `json:"model_name,omitempty"`
+	Skill       string          `json:"skill,omitempty"`
+	Inputs      []string        `json:"inputs,omitempty"`
+	Outputs     []string        `json:"outputs,omitempty"`
+	Settings    json.RawMessage `json:"settings,omitempty"`
+	Tags        []string        `json:"tags,omitempty"`
 }

@@ -253,6 +253,71 @@ export interface GroupOption {
   description?: string
 }
 
+export type AgentComponentSource = 'builtin' | 'custom'
+
+export interface AgentComponentConfig {
+  tags?: string[]
+  capabilities?: string[]
+  inputs?: string[]
+  outputs?: string[]
+  settings?: Record<string, string>
+  model_group?: string
+  model_name?: string
+  skill?: string
+  role?: string
+  icon?: string
+  accent?: string
+}
+
+export interface AgentComponentItem {
+  id: string
+  user_id: number
+  name: string
+  description: string
+  kind: string
+  group: string
+  source: AgentComponentSource
+  enabled: boolean
+  config?: AgentComponentConfig
+  created_time: number
+  updated_time: number
+}
+
+export interface AgentComponentFormData {
+  name: string
+  description: string
+  group: string
+  model_group?: string
+  model_name?: string
+  skill?: string
+  inputs?: string[]
+  outputs?: string[]
+  settings?: Record<string, string>
+  tags?: string[]
+}
+
+export interface AgentHTTPRequestPayload {
+  url: string
+  method?: string
+  headers?: Record<string, string>
+  body?: string
+  timeout_seconds?: number
+}
+
+export interface AgentHTTPResponse {
+  url: string
+  final_url: string
+  method: string
+  status_code: number
+  headers: Record<string, string>
+  body: string
+  body_bytes: number
+  truncated: boolean
+  content_type?: string
+  duration_ms: number
+  executed_at: number
+}
+
 export type ImageResolutionPreset = 'auto' | '1k' | '2k' | '4k'
 
 export type ImageAspectRatio =

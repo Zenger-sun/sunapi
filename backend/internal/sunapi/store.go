@@ -301,6 +301,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_time INTEGER NOT NULL,
 			updated_time INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS agent_components (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL DEFAULT 'custom',
+			group_name TEXT NOT NULL DEFAULT 'process',
+			source TEXT NOT NULL DEFAULT 'custom',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			config TEXT NOT NULL DEFAULT '{}',
+			created_time INTEGER NOT NULL,
+			updated_time INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS agent_execution_logs (
 			id TEXT PRIMARY KEY,
 			blueprint_id TEXT NOT NULL,
@@ -318,6 +331,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_agent_blueprints_agent ON agent_blueprints(agent_id, updated_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_blueprints_user ON agent_blueprints(user_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_skills_user ON agent_skills(user_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_components_user ON agent_components(user_id, created_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_execution_logs_blueprint ON agent_execution_logs(blueprint_id, start_time DESC)`,
 	}
 	for _, stmt := range stmts {

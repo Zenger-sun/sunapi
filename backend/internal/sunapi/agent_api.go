@@ -46,12 +46,19 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	api.POST("/agents/files", handleUploadAgentFile(store))
 	api.POST("/agents/reports", handleWriteAgentReport(store))
 	api.POST("/agents/browser-capture", handleCaptureAgentBrowserPage(store))
+	api.POST("/agents/http-request", handleAgentHTTPRequest(store))
 
 	// ── Skill CRUD ────────────────────────────────────────────────────────
 	api.GET("/agent-skills", handleListSkills(store))
+	api.GET("/agent-skills/marketplace", handleListSkillMarketplace(store))
 	api.POST("/agent-skills", handleCreateSkill(store))
 	api.PUT("/agent-skills/:id/toggle", handleToggleSkill(store))
 	api.DELETE("/agent-skills/:id", handleDeleteSkill(store))
+
+	// ── Component CRUD ────────────────────────────────────────────────────
+	api.GET("/agent-components", handleListComponents(store))
+	api.POST("/agent-components", handleCreateComponent(store))
+	api.DELETE("/agent-components/:id", handleDeleteComponent(store))
 }
 
 // ── 智能体处理器 ──────────────────────────────────────────────────────────────
@@ -308,18 +315,31 @@ func handleListSkills(store *Store) gin.HandlerFunc {
 	}
 }
 
+func handleListSkillMarketplace(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := playgroundUserID(c)
+		skills, err := store.ListSkills(c.Request.Context(), userID)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, listMarketplaceSkills(skills))
+	}
+}
+
 func handleCreateSkill(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var f SkillFormData
 		if !bindJSON(c, &f) {
 			return
 		}
-		if strings.TrimSpace(f.SourceType) == "builtin" {
-			fail(c, http.StatusBadRequest, errConflict("built-in skills are managed by system"))
+		prepared, config, permissions, version, err := prepareSkillForm(c.Request.Context(), f)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
 			return
 		}
 		userID := playgroundUserID(c)
-		sk, err := store.CreateSkill(c.Request.Context(), userID, f)
+		sk, err := store.CreateSkill(c.Request.Context(), userID, prepared, config, permissions, version)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
@@ -359,6 +379,55 @@ func handleDeleteSkill(store *Store) gin.HandlerFunc {
 			return
 		}
 		if err := store.DeleteSkill(c.Request.Context(), id, userID); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, gin.H{"deleted": true})
+	}
+}
+
+func handleListComponents(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := playgroundUserID(c)
+		customComponents, err := store.ListComponents(c.Request.Context(), userID)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, mergeBuiltinAgentComponents(userID, customComponents))
+	}
+}
+
+func handleCreateComponent(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var f ComponentFormData
+		if !bindJSON(c, &f) {
+			return
+		}
+		prepared, config, err := prepareComponentForm(f)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		userID := playgroundUserID(c)
+		component, err := store.CreateComponent(c.Request.Context(), userID, prepared, config)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		ok(c, component)
+	}
+}
+
+func handleDeleteComponent(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := strings.TrimSpace(c.Param("id"))
+		if strings.HasPrefix(id, "component.") {
+			fail(c, http.StatusBadRequest, errConflict("built-in components cannot be removed"))
+			return
+		}
+		userID := playgroundUserID(c)
+		if err := store.DeleteComponent(c.Request.Context(), id, userID); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}

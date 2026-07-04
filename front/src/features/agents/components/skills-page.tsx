@@ -6,7 +6,7 @@ it under the terms of the GNU Affero General Public License as
 published by the Free Software Foundation, either version 3 of the
 License, or (at your option) any later version.
 */
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ExternalLink,
@@ -35,17 +35,34 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
   skillsQueryOptions,
+  skillMarketplaceQueryOptions,
   useCreateSkillMutation,
   useDeleteSkillMutation,
   useToggleSkillMutation,
 } from '../api'
-import { getSkillCapabilities } from '../lib/skill-utils'
-import { SkillSourceType, type Skill } from '../types'
+import { getSkillCapabilities, getSkillTags } from '../lib/skill-utils'
+import {
+  SkillSourceType,
+  type Skill,
+  type SkillMarketplaceItem,
+} from '../types'
+import { getUserGroups, getUserModels } from '@/features/playground/api'
+import type {
+  GroupOption,
+  ModelOption,
+} from '@/features/playground/types'
 
 // ============================================================================
 // Skill 来源徽章
@@ -84,6 +101,7 @@ function SkillCard({ skill }: { skill: Skill }) {
   const src = SOURCE_CONFIG[skill.source]
   const isBuiltin = skill.source === SkillSourceType.BUILTIN
   const capabilities = getSkillCapabilities(skill)
+  const tags = getSkillTags(skill)
 
   return (
     <div className='border-border/60 hover:bg-muted/10 flex items-start gap-3 rounded-lg border p-4 transition-colors'>
@@ -124,6 +142,19 @@ function SkillCard({ skill }: { skill: Skill }) {
                 className='h-4 px-1.5 text-[10px]'
               >
                 {capability}
+              </Badge>
+            ))}
+          </div>
+        )}
+        {tags.length > 0 && (
+          <div className='mt-1.5 flex flex-wrap gap-1'>
+            {tags.map((tag) => (
+              <Badge
+                key={tag}
+                variant='outline'
+                className='h-4 px-1.5 text-[10px]'
+              >
+                #{tag}
               </Badge>
             ))}
           </div>
@@ -212,13 +243,120 @@ type AddSkillDialogProps = {
   onOpenChange: (open: boolean) => void
 }
 
+function splitTags(value: string) {
+  return value
+    .split(/[,，\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function pickDefaultGroup(groups: GroupOption[]) {
+  return (
+    groups.find((group) => group.value === 'default')?.value ??
+    groups[0]?.value ??
+    'default'
+  )
+}
+
+function MarketplaceSkillRow({
+  skill,
+  onInstall,
+  installing,
+}: {
+  skill: SkillMarketplaceItem
+  onInstall: (skill: SkillMarketplaceItem) => void
+  installing: boolean
+}) {
+  return (
+    <div className='border-border/60 flex items-start gap-3 rounded-lg border p-3'>
+      <div className='bg-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-md'>
+        <Package className='h-4 w-4' aria-hidden='true' />
+      </div>
+      <div className='min-w-0 flex-1'>
+        <div className='flex items-center gap-2'>
+          <span className='truncate text-sm font-medium'>{skill.name}</span>
+          <span className='text-muted-foreground shrink-0 text-[10px]'>
+            v{skill.version}
+          </span>
+        </div>
+        <p className='text-muted-foreground mt-0.5 line-clamp-2 text-xs'>
+          {skill.description}
+        </p>
+        {!!skill.tags?.length && (
+          <div className='mt-1.5 flex flex-wrap gap-1'>
+            {skill.tags.slice(0, 4).map((tag) => (
+              <Badge key={tag} variant='outline' className='h-4 px-1.5 text-[10px]'>
+                #{tag}
+              </Badge>
+            ))}
+          </div>
+        )}
+      </div>
+      <Button
+        size='sm'
+        variant={skill.installed ? 'outline' : 'default'}
+        className='h-7 shrink-0 text-xs'
+        disabled={skill.installed || installing}
+        onClick={() => onInstall(skill)}
+      >
+        {skill.installed ? '已安装' : '安装'}
+      </Button>
+    </div>
+  )
+}
+
 function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
   const { t } = useTranslation()
-  const [tab, setTab] = useState<'marketplace' | 'github' | 'custom'>('github')
+  const [tab, setTab] = useState<'marketplace' | 'github' | 'custom'>(
+    'marketplace'
+  )
   const [githubUrl, setGithubUrl] = useState('')
   const [customName, setCustomName] = useState('')
   const [customDesc, setCustomDesc] = useState('')
+  const [customTags, setCustomTags] = useState('')
   const createMutation = useCreateSkillMutation()
+  const { data: marketplace = [], isLoading: marketplaceLoading } = useQuery(
+    skillMarketplaceQueryOptions
+  )
+  const { data: groups = [] } = useQuery({
+    queryKey: ['playground-groups'],
+    queryFn: getUserGroups,
+  })
+  const defaultGroup = pickDefaultGroup(groups)
+  const [selectedGroup, setSelectedGroup] = useState(defaultGroup)
+  const effectiveGroup = selectedGroup || defaultGroup
+  const { data: models = [] } = useQuery({
+    queryKey: ['playground-models', effectiveGroup],
+    queryFn: () => getUserModels(effectiveGroup),
+    enabled: !!effectiveGroup,
+  })
+  const selectedModel = useMemo(
+    () => models[0]?.value ?? 'gpt-4.1-mini',
+    [models]
+  )
+  const [customModel, setCustomModel] = useState('')
+  const effectiveModel = customModel || selectedModel
+
+  useEffect(() => {
+    if (!selectedGroup && defaultGroup) {
+      setSelectedGroup(defaultGroup)
+    }
+  }, [defaultGroup, selectedGroup])
+
+  const installMarketplaceSkill = (skill: SkillMarketplaceItem) => {
+    createMutation.mutate(
+      {
+        name: skill.name,
+        description: skill.description,
+        source_type: SkillSourceType.MARKETPLACE,
+        source_url: skill.source_url,
+        marketplace_id: skill.id,
+      },
+      {
+        onSuccess: () => toast.success(t('Skill installed')),
+      }
+    )
+  }
 
   const handleImportGithub = () => {
     if (!githubUrl.trim()) {
@@ -227,8 +365,8 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
     }
     createMutation.mutate(
       {
-        name: githubUrl.split('/').pop() ?? 'custom-skill',
-        description: `Imported from ${githubUrl}`,
+        name: '',
+        description: '',
         source_type: SkillSourceType.GITHUB,
         source_url: githubUrl,
       },
@@ -247,11 +385,18 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
       toast.error(t('Please enter a skill name'))
       return
     }
+    if (!customDesc.trim()) {
+      toast.error(t('Please describe what this skill should do'))
+      return
+    }
     createMutation.mutate(
       {
         name: customName,
         description: customDesc,
         source_type: SkillSourceType.CUSTOM,
+        model_group: effectiveGroup,
+        model_name: effectiveModel,
+        tags: splitTags(customTags),
       },
       {
         onSuccess: () => {
@@ -259,6 +404,7 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
           onOpenChange(false)
           setCustomName('')
           setCustomDesc('')
+          setCustomTags('')
         },
       }
     )
@@ -266,7 +412,7 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className='max-w-md'>
+      <DialogContent className='max-w-2xl'>
         <DialogHeader>
           <DialogTitle>{t('Add Skill')}</DialogTitle>
           <DialogDescription>
@@ -292,14 +438,26 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
 
           {/* 商城 */}
           <TabsContent value='marketplace' className='mt-4'>
-            <div className='flex flex-col items-center justify-center gap-2 py-8'>
-              <Package
-                className='text-muted-foreground h-10 w-10'
-                aria-hidden='true'
-              />
-              <p className='text-muted-foreground text-sm'>
-                {t('Marketplace coming soon')}
-              </p>
+            <div className='max-h-[360px] space-y-2 overflow-y-auto pr-1'>
+              {marketplaceLoading ? (
+                <div className='flex flex-col gap-2'>
+                  {[1, 2, 3].map((item) => (
+                    <div
+                      key={item}
+                      className='bg-muted/40 h-[86px] animate-pulse rounded-lg'
+                    />
+                  ))}
+                </div>
+              ) : (
+                marketplace.map((skill) => (
+                  <MarketplaceSkillRow
+                    key={skill.id}
+                    skill={skill}
+                    installing={createMutation.isPending}
+                    onInstall={installMarketplaceSkill}
+                  />
+                ))
+              )}
             </div>
           </TabsContent>
 
@@ -317,7 +475,7 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
               </div>
               <p className='text-muted-foreground text-[11px]'>
                 {t(
-                  'Repository must contain a skill manifest file (skill.json)'
+                  'Repository must contain skill.json or SKILL.md; imported metadata is parsed on the server.'
                 )}
               </p>
             </div>
@@ -336,12 +494,67 @@ function AddSkillDialog({ open, onOpenChange }: AddSkillDialogProps) {
                 />
               </div>
               <div className='flex flex-col gap-1.5'>
-                <Label className='text-xs'>{t('Description')}</Label>
+                <Label className='text-xs'>{t('Description')} *</Label>
                 <Textarea
                   className='min-h-[60px] resize-none text-xs'
                   placeholder={t('What does this skill do?')}
                   value={customDesc}
                   onChange={(e) => setCustomDesc(e.target.value)}
+                />
+              </div>
+              <div className='grid grid-cols-2 gap-3'>
+                <div className='flex flex-col gap-1.5'>
+                  <Label className='text-xs'>{t('Group')}</Label>
+                  <Select
+                    value={effectiveGroup}
+                    onValueChange={(value) => {
+                      setSelectedGroup(value)
+                      setCustomModel('')
+                    }}
+                  >
+                    <SelectTrigger className='h-8 text-xs'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {groups.length === 0 ? (
+                        <SelectItem value='default'>default</SelectItem>
+                      ) : (
+                        groups.map((group) => (
+                          <SelectItem key={group.value} value={group.value}>
+                            {group.label}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className='flex flex-col gap-1.5'>
+                  <Label className='text-xs'>{t('Model')}</Label>
+                  <Select value={effectiveModel} onValueChange={setCustomModel}>
+                    <SelectTrigger className='h-8 text-xs'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {models.length === 0 ? (
+                        <SelectItem value='gpt-4.1-mini'>gpt-4.1-mini</SelectItem>
+                      ) : (
+                        models.map((model: ModelOption) => (
+                          <SelectItem key={model.value} value={model.value}>
+                            {model.label}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className='flex flex-col gap-1.5'>
+                <Label className='text-xs'>{t('Tags')}</Label>
+                <Input
+                  className='h-8 text-xs'
+                  placeholder='report, data, browser'
+                  value={customTags}
+                  onChange={(e) => setCustomTags(e.target.value)}
                 />
               </div>
             </div>

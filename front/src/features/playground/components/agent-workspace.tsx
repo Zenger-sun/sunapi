@@ -56,8 +56,10 @@ import {
   CpuIcon,
   FileSpreadsheetIcon,
   FileTextIcon,
+  FilterIcon,
   GlobeIcon,
   ImageIcon,
+  MergeIcon,
   MonitorIcon,
   NetworkIcon,
   PauseIcon,
@@ -73,6 +75,8 @@ import {
   Table2Icon,
   Trash2Icon,
   Undo2Icon,
+  WebhookIcon,
+  WrenchIcon,
   XIcon,
   ZapIcon,
   type LucideIcon,
@@ -91,7 +95,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
   captureAgentBrowserPage,
+  createAgentComponent,
+  deleteAgentComponent,
+  executeAgentHTTPRequest,
   listAgentFiles,
+  listAgentComponents,
   uploadAgentFile,
   writeAgentReport,
 } from '../api'
@@ -107,6 +115,8 @@ import {
 import type {
   AgentFileUpload,
   AgentFileUploadPurpose,
+  AgentComponentItem,
+  AgentComponentFormData,
   AgentReportOutputFile,
   AgentReportWrittenFile,
   GroupOption,
@@ -124,6 +134,7 @@ type AgentNodeKind =
   | 'webpage'
   | 'notify'
   | 'stop'
+  | 'custom'
 
 type AgentNodeStatus = 'ready' | 'waiting' | 'running' | 'done'
 type AgentNodeLogStatus = 'pending' | 'running' | 'completed' | 'stopped'
@@ -132,6 +143,7 @@ type ModelRole = 'system' | 'browser' | 'fast' | 'reasoning' | 'image'
 
 type AgentNodeData = {
   kind: AgentNodeKind
+  componentId?: string
   title: string
   description: string
   group?: string
@@ -210,6 +222,8 @@ type XianyuOverviewMetric = {
 
 type NodeTemplate = {
   kind: AgentNodeKind
+  componentId?: string
+  source?: 'builtin' | 'custom'
   title: string
   description: string
   group?: string
@@ -443,25 +457,52 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
 
 const MARKETPLACE_SKILLS: SkillChoice[] = [
   {
-    label: '电商运营分析 Skill',
-    value: 'skill.marketplace.ecommerce-ops',
-    description: '面向商品指标、竞品跟踪和日报建议的运营 Skill。',
+    label: '网页研究简报 Skill',
+    value: 'skill.marketplace.web-research-brief',
+    description: '围绕网页资料收集、来源核验和引用摘要生成研究简报。',
     source: 'marketplace',
-    reference: 'SunAPI Skill 商城',
+    reference: 'n8n / Web research workflow',
+    capabilities: ['搜索计划', '网页摘要', '来源核验'],
   },
   {
-    label: '工单总结 Skill',
-    value: 'skill.marketplace.ticket-summary',
-    description: '整理客服工单、归类问题并生成跟进清单。',
+    label: '浏览器自动化 Skill',
+    value: 'skill.marketplace.browser-operator',
+    description: '处理登录态页面读取、动态 DOM 抽取、截图证据和安全操作边界。',
     source: 'marketplace',
-    reference: 'SunAPI Skill 商城',
+    reference: 'n8n / Browser workflow',
+    capabilities: ['页面导航', 'DOM 抽取', '截图证据'],
   },
   {
-    label: '财务对账 Skill',
-    value: 'skill.marketplace.reconciliation',
-    description: '抽取账单字段、核对差异并生成归档记录。',
+    label: 'HTTP API 调用 Skill',
+    value: 'skill.marketplace.http-api-tool',
+    description: '组织 HTTP 请求、鉴权、分页、重试和 JSON/文本响应解析。',
     source: 'marketplace',
-    reference: 'SunAPI Skill 商城',
+    reference: 'n8n HTTP Request / Zapier actions',
+    capabilities: ['参数校验', '分页重试', '响应解析'],
+  },
+  {
+    label: '文件转换与表格 Skill',
+    value: 'skill.marketplace.file-transformer',
+    description: '读取 Excel、CSV、PDF、Word、HTML、Markdown 和 TXT 并进行结构化转换。',
+    source: 'marketplace',
+    reference: 'n8n Read/Write Files',
+    capabilities: ['多格式读取', '表格整理', '文件生成'],
+  },
+  {
+    label: '数据清洗分析 Skill',
+    value: 'skill.marketplace.data-cleaning',
+    description: '用于去重、排序、统计、字段映射、指标口径和可复现数据处理。',
+    source: 'marketplace',
+    reference: 'n8n Code node',
+    capabilities: ['数据清洗', '指标计算', '口径校验'],
+  },
+  {
+    label: '通知路由 Skill',
+    value: 'skill.marketplace.notification-router',
+    description: '把任务结果投递到邮件、Webhook、飞书、企业微信、Slack 等通道。',
+    source: 'marketplace',
+    reference: 'Zapier actions / Webhook',
+    capabilities: ['通道选择', '消息格式化', '失败重试'],
   },
 ]
 
@@ -481,6 +522,9 @@ const REPORT_OUTPUT_PATH_LABEL = '归档路径'
 const BROWSER_PAGE_DATA_SETTING = '页面数据'
 const BROWSER_CAPTURE_TEXT_SETTING = '采集文本'
 const BROWSER_DATA_MISSING_MARKER = 'browser_data_missing'
+const HTTP_RESPONSE_SETTING = 'HTTP 响应'
+const HTTP_STATUS_SETTING = 'HTTP 状态码'
+const HTTP_ERROR_SETTING = 'HTTP 错误'
 const XIANYU_OVERVIEW_METRICS_MARKER = 'xianyu_overview_metrics'
 const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 日报', 'CSV 表格']
 const REPORT_OUTPUT_FORMAT_PRESETS = [
@@ -551,6 +595,14 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
   日报模板: ['默认模板', '简洁版', '详细分析版', '自定义模板'],
   输出模式: ['输出网页 + 数据', '仅输出数据'],
+  组件来源: ['系统内置', '自定义'],
+  执行策略: ['按描述执行', '结构化处理', '只读采集', '写入前确认'],
+  模式: ['读取', '写入', '追加', '转换'],
+  鉴权: ['无', '签名校验', 'Token', 'Basic Auth'],
+  合并方式: ['追加', '按字段', '按索引', '保留全部分支'],
+  冲突处理: ['保留最新', '保留最早', '输出冲突记录', '请求人工确认'],
+  条件: ['字段存在', '表达式为真', '数值比较', '文本包含'],
+  未命中处理: ['跳过', '输出空数组', '中断流程', '请求人工确认'],
 }
 
 const MODEL_FALLBACKS: Record<ModelRole, ModelChoice[]> = {
@@ -762,6 +814,21 @@ const NODE_META: Record<
     settings: {
       渠道: '邮件',
       确认: '发送前确认',
+      Webhook: '',
+    },
+  },
+  custom: {
+    label: '自定义组件',
+    group: '智能处理',
+    role: 'fast',
+    icon: WrenchIcon,
+    accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
+    description: '根据自定义组件模板执行独立功能模块。',
+    inputs: ['上游数据'],
+    outputs: ['执行结果'],
+    settings: {
+      组件来源: '自定义',
+      执行策略: '按描述执行',
     },
   },
   webpage: {
@@ -807,6 +874,11 @@ const PALETTE_GROUPS: Array<{
   { title: '输出', kinds: ['report', 'webpage', 'notify'] },
 ]
 
+type PaletteTemplateGroup = {
+  title: '触发' | '采集' | '智能处理' | '输出'
+  templates: NodeTemplate[]
+}
+
 const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-schedule-browser', source: 'schedule', target: 'browser' },
   { id: 'e-start-browser', source: 'start', target: 'browser' },
@@ -826,6 +898,11 @@ export function AgentWorkspace({
 }: AgentWorkspaceProps) {
   const [managedSkills, setManagedSkills] =
     useState<SkillChoice[]>(readSavedSkills)
+  const [componentCatalog, setComponentCatalog] = useState<
+    AgentComponentItem[]
+  >([])
+  const [isComponentCatalogLoading, setIsComponentCatalogLoading] =
+    useState(false)
   const skillChoices = useMemo(
     () => mergeSkillChoices(BASE_SKILL_CHOICES, managedSkills),
     [managedSkills]
@@ -836,13 +913,29 @@ export function AgentWorkspace({
     [currentGroup, groups]
   )
   const templates = useMemo(
-    () => buildTemplates(models, currentModel, currentGroup),
-    [currentGroup, currentModel, models]
+    () =>
+      buildTemplates(
+        models,
+        currentModel,
+        currentGroup,
+        componentCatalog
+      ),
+    [componentCatalog, currentGroup, currentModel, models]
   )
   const initialBlueprints = useMemo(() => readSavedBlueprints(), [])
   const initialBlueprint = initialBlueprints[0] ?? null
   const templateByKind = useMemo(
     () => new Map(templates.map((template) => [template.kind, template])),
+    [templates]
+  )
+  const templateById = useMemo(
+    () =>
+      new Map(
+        templates.map((template) => [
+          template.componentId ?? template.kind,
+          template,
+        ])
+      ),
     [templates]
   )
   const [blueprints, setBlueprints] =
@@ -896,6 +989,14 @@ export function AgentWorkspace({
     [blueprints, currentBlueprintId, nodes]
   )
   const hasScheduledBlueprint = useMemo(() => hasScheduleNode(nodes), [nodes])
+  const paletteGroups = useMemo(
+    () => buildPaletteTemplateGroups(templates),
+    [templates]
+  )
+  const filteredPaletteGroups = useMemo(
+    () => filterPaletteTemplateGroups(paletteGroups, search),
+    [paletteGroups, search]
+  )
   const canUndoBlueprint = undoStackRef.current.length > 0
   const canRedoBlueprint = redoStackRef.current.length > 0
   const clearPreviewTimers = useCallback(() => {
@@ -1153,6 +1254,22 @@ export function AgentWorkspace({
     [bumpHistoryVersion, cancelPreviewRun]
   )
 
+  const reloadComponents = useCallback(async () => {
+    setIsComponentCatalogLoading(true)
+    try {
+      const components = await listAgentComponents()
+      setComponentCatalog(components)
+    } catch (error) {
+      console.warn('Failed to load agent components', error)
+    } finally {
+      setIsComponentCatalogLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void reloadComponents()
+  }, [reloadComponents])
+
   const handleDeleteBlueprint = useCallback(
     (blueprintId: string) => {
       const next = blueprints.filter((item) => item.id !== blueprintId)
@@ -1338,6 +1455,7 @@ export function AgentWorkspace({
     )
 
     void captureBrowserNodes(runExecutionNodes)
+      .then((capturedNodes) => executeHTTPNodes(capturedNodes))
       .then((capturedNodes) => {
         if (previewRunIdRef.current !== runId) return
         startTimedPreview(capturedNodes)
@@ -1395,13 +1513,35 @@ export function AgentWorkspace({
     })
   }, [])
 
+  const handleCreateComponent = useCallback(
+    async (payload: AgentComponentFormData) => {
+      const component = await createAgentComponent(payload)
+      setComponentCatalog((current) => [
+        ...current.filter((item) => item.id !== component.id),
+        component,
+      ])
+      toast.success('自定义组件已创建')
+    },
+    []
+  )
+
+  const handleDeleteComponent = useCallback(async (componentId: string) => {
+    await deleteAgentComponent(componentId)
+    setComponentCatalog((current) =>
+      current.filter((component) => component.id !== componentId)
+    )
+    toast.success('自定义组件已删除')
+  }, [])
+
   const handleAddNode = useCallback(
-    (kind: AgentNodeKind, position?: { x: number; y: number }) => {
-      const template = templateByKind.get(kind)
+    (templateKey: AgentNodeKind | string, position?: { x: number; y: number }) => {
+      const template =
+        templateById.get(templateKey) ??
+        templateByKind.get(templateKey as AgentNodeKind)
       if (!template) return
       recordHistorySnapshot()
       addCounterRef.current += 1
-      const id = `${kind}-${Date.now()}-${addCounterRef.current}`
+      const id = `${template.kind}-${Date.now()}-${addCounterRef.current}`
       const node = createNodeFromTemplate(template, id, {
         x: position?.x ?? 120 + addCounterRef.current * 36,
         y: position?.y ?? 120 + addCounterRef.current * 28,
@@ -1409,7 +1549,7 @@ export function AgentWorkspace({
       setNodes((current) => [...current, node])
       setSelectedNodeId(id)
     },
-    [recordHistorySnapshot, templateByKind]
+    [recordHistorySnapshot, templateById, templateByKind]
   )
 
   const handleUpdateNode = useCallback(
@@ -1548,11 +1688,15 @@ export function AgentWorkspace({
         nodes={nodes}
         skillChoices={skillChoices}
         managedSkills={managedSkills}
+        paletteGroups={filteredPaletteGroups}
+        isComponentCatalogLoading={isComponentCatalogLoading}
         onAddSkill={handleAddSkill}
         onAddNode={handleAddNode}
+        onCreateComponent={handleCreateComponent}
         onConnect={onConnect}
         onDeleteEdge={handleDeleteEdge}
         onDeleteNode={handleDeleteNode}
+        onDeleteComponent={handleDeleteComponent}
         onDeleteSkill={handleDeleteSkill}
         onEdgesChange={onEdgesChange}
         onNodesChange={onNodesChange}
@@ -1586,6 +1730,8 @@ type BlueprintWorkspaceProps = {
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
+  paletteGroups: PaletteTemplateGroup[]
+  isComponentCatalogLoading: boolean
   blueprintTitle: string
   canRedo: boolean
   canUndo: boolean
@@ -1599,7 +1745,7 @@ type BlueprintWorkspaceProps = {
   onEdgesChange: (changes: EdgeChange<AgentFlowEdge>[]) => void
   onConnect: (connection: Connection) => void
   onSelectNode: (nodeId: string) => void
-  onAddNode: (kind: AgentNodeKind, position?: { x: number; y: number }) => void
+  onAddNode: (templateKey: AgentNodeKind | string, position?: { x: number; y: number }) => void
   onDeleteNode: (nodeId: string) => void
   onDeleteEdge: (edgeId: string) => void
   onTitleChange: (value: string) => void
@@ -1608,6 +1754,8 @@ type BlueprintWorkspaceProps = {
   onUpdateSetting: (key: string, value: string) => void
   onAddSkill: (skill: SkillChoice) => void
   onDeleteSkill: (skillValue: string) => void
+  onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
+  onDeleteComponent: (componentId: string) => Promise<void>
   onSetNodeSkill: (nodeId: string, skill: string) => void
   onRedo: () => void
   onReset: () => void
@@ -1626,6 +1774,8 @@ function BlueprintWorkspace({
   groupChoices,
   skillChoices,
   managedSkills,
+  paletteGroups,
+  isComponentCatalogLoading,
   blueprintTitle,
   canRedo,
   canUndo,
@@ -1648,6 +1798,8 @@ function BlueprintWorkspace({
   onUpdateSetting,
   onAddSkill,
   onDeleteSkill,
+  onCreateComponent,
+  onDeleteComponent,
   onSetNodeSkill,
   onRedo,
   onReset,
@@ -1656,7 +1808,6 @@ function BlueprintWorkspace({
   onUndo,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
-  const filteredGroups = useMemo(() => filterPaletteGroups(search), [search])
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
   const [activeToolPanel, setActiveToolPanel] =
     useState<AgentToolPanel>('components')
@@ -1684,13 +1835,13 @@ function BlueprintWorkspace({
   const handleDrop = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
       event.preventDefault()
-      const kind = event.dataTransfer.getData(DRAG_NODE_TYPE) as AgentNodeKind
-      if (!kind || !NODE_META[kind]) return
+      const templateKey = event.dataTransfer.getData(DRAG_NODE_TYPE)
+      if (!templateKey) return
       const position = reactFlow.screenToFlowPosition({
         x: event.clientX,
         y: event.clientY,
       })
-      onAddNode(kind, position)
+      onAddNode(templateKey, position)
     },
     [onAddNode, reactFlow]
   )
@@ -1700,10 +1851,13 @@ function BlueprintWorkspace({
       <aside className='border-border/70 bg-muted/25 hidden w-68 shrink-0 flex-col border-r lg:flex'>
         <Palette
           activePanel={activeToolPanel}
-          groups={filteredGroups}
+          groups={paletteGroups}
+          isComponentCatalogLoading={isComponentCatalogLoading}
           managedSkills={managedSkills}
           onAddNode={onAddNode}
           onAddSkill={onAddSkill}
+          onCreateComponent={onCreateComponent}
+          onDeleteComponent={onDeleteComponent}
           onDeleteSkill={onDeleteSkill}
           onPanelChange={setActiveToolPanel}
           onSearchChange={onSearchChange}
@@ -1714,7 +1868,7 @@ function BlueprintWorkspace({
 
       <div className='relative flex min-w-0 flex-1 flex-col'>
         <div className='border-border/70 flex min-h-0 shrink-0 items-center gap-2 border-b px-3 py-2 lg:hidden'>
-          <CompactPalette groups={filteredGroups} onAddNode={onAddNode} />
+          <CompactPalette groups={paletteGroups} onAddNode={onAddNode} />
         </div>
 
         <main
@@ -1913,22 +2067,28 @@ function BlueprintWorkspace({
 
 function Palette({
   groups,
+  isComponentCatalogLoading,
   skillChoices,
   managedSkills,
   search,
   onSearchChange,
   onAddNode,
   onAddSkill,
+  onCreateComponent,
+  onDeleteComponent,
   onDeleteSkill,
 }: {
   activePanel: AgentToolPanel
-  groups: typeof PALETTE_GROUPS
+  groups: PaletteTemplateGroup[]
+  isComponentCatalogLoading: boolean
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
   search: string
   onSearchChange: (value: string) => void
-  onAddNode: (kind: AgentNodeKind) => void
+  onAddNode: (templateKey: AgentNodeKind | string) => void
   onAddSkill: (skill: SkillChoice) => void
+  onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
+  onDeleteComponent: (componentId: string) => Promise<void>
   onDeleteSkill: (skillValue: string) => void
   onPanelChange: (panel: AgentToolPanel) => void
 }) {
@@ -1983,14 +2143,23 @@ function Palette({
 
           {/* 组件列表（可滚动） */}
           <div className='min-h-0 flex-1 overflow-y-auto px-2 pb-3'>
+            <ComponentManagerPanel
+              isLoading={isComponentCatalogLoading}
+              onCreateComponent={onCreateComponent}
+            />
             {groups.map((group) => (
               <div key={group.title} className='mb-1'>
                 <div className='text-muted-foreground px-1 pt-0.5 pb-1 text-[10px] font-semibold tracking-widest uppercase'>
                   {group.title}
                 </div>
                 <div className='grid gap-0.5'>
-                  {group.kinds.map((kind) => (
-                    <PaletteItem key={kind} kind={kind} onAddNode={onAddNode} />
+                  {group.templates.map((template) => (
+                    <PaletteItem
+                      key={template.componentId ?? template.kind}
+                      template={template}
+                      onAddNode={onAddNode}
+                      onDeleteComponent={onDeleteComponent}
+                    />
                   ))}
                 </div>
               </div>
@@ -2017,33 +2186,164 @@ function Palette({
   )
 }
 
+function ComponentManagerPanel({
+  isLoading,
+  onCreateComponent,
+}: {
+  isLoading: boolean
+  onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
+}) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [group, setGroup] = useState('process')
+  const [inputs, setInputs] = useState('上游数据')
+  const [outputs, setOutputs] = useState('执行结果')
+  const [tags, setTags] = useState('')
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  const reset = () => {
+    setName('')
+    setDescription('')
+    setGroup('process')
+    setInputs('上游数据')
+    setOutputs('执行结果')
+    setTags('')
+  }
+
+  const handleSubmit = async () => {
+    if (!name.trim()) {
+      toast.error('请输入组件名称')
+      return
+    }
+    if (!description.trim()) {
+      toast.error('请输入组件描述')
+      return
+    }
+    setIsSubmitting(true)
+    try {
+      await onCreateComponent({
+        name: name.trim(),
+        description: description.trim(),
+        group,
+        inputs: splitListInput(inputs),
+        outputs: splitListInput(outputs),
+        tags: splitListInput(tags),
+      })
+      reset()
+      setOpen(false)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '创建组件失败')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  return (
+    <div className='border-border/60 mb-2 rounded-[9px] border p-2'>
+      <button
+        type='button'
+        className='flex w-full items-center justify-between gap-2 text-left'
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className='flex min-w-0 items-center gap-2'>
+          <WrenchIcon className='text-muted-foreground size-3.5 shrink-0' />
+          <span className='truncate text-[11px] font-medium'>自定义组件</span>
+          {isLoading && (
+            <span className='text-muted-foreground text-[10px]'>同步中</span>
+          )}
+        </span>
+        {open ? (
+          <ChevronUpIcon className='text-muted-foreground size-3.5' />
+        ) : (
+          <ChevronDownIcon className='text-muted-foreground size-3.5' />
+        )}
+      </button>
+      {open && (
+        <div className='mt-2 flex flex-col gap-1.5'>
+          <Input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder='组件名称'
+            className='h-7 rounded-[6px] text-xs'
+          />
+          <Textarea
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder='描述这个组件如何处理输入并产生输出'
+            className='min-h-[54px] resize-none rounded-[6px] text-xs'
+          />
+          <NativeSelect
+            value={group}
+            onChange={(event) => setGroup(event.target.value)}
+            className='h-7 rounded-[6px] text-xs'
+          >
+            <NativeSelectOption value='trigger'>触发</NativeSelectOption>
+            <NativeSelectOption value='collect'>采集</NativeSelectOption>
+            <NativeSelectOption value='process'>智能处理</NativeSelectOption>
+            <NativeSelectOption value='output'>输出</NativeSelectOption>
+          </NativeSelect>
+          <Input
+            value={inputs}
+            onChange={(event) => setInputs(event.target.value)}
+            placeholder='输入，逗号分隔'
+            className='h-7 rounded-[6px] text-xs'
+          />
+          <Input
+            value={outputs}
+            onChange={(event) => setOutputs(event.target.value)}
+            placeholder='输出，逗号分隔'
+            className='h-7 rounded-[6px] text-xs'
+          />
+          <Input
+            value={tags}
+            onChange={(event) => setTags(event.target.value)}
+            placeholder='标签，逗号分隔'
+            className='h-7 rounded-[6px] text-xs'
+          />
+          <Button
+            type='button'
+            size='sm'
+            className='h-7 rounded-[6px] text-xs'
+            disabled={isSubmitting}
+            onClick={handleSubmit}
+          >
+            创建组件
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function CompactPalette({
   groups,
   onAddNode,
 }: {
-  groups: typeof PALETTE_GROUPS
-  onAddNode: (kind: AgentNodeKind) => void
+  groups: PaletteTemplateGroup[]
+  onAddNode: (templateKey: AgentNodeKind | string) => void
 }) {
-  const kinds = groups.flatMap((group) => group.kinds)
+  const templates = groups.flatMap((group) => group.templates)
   return (
     <div className='no-scrollbar flex min-w-0 gap-1 overflow-x-auto'>
-      {kinds.map((kind) => {
-        const meta = NODE_META[kind]
+      {templates.map((template) => {
+        const meta = NODE_META[template.kind]
         const Icon = meta.icon
+        const templateKey = template.componentId ?? template.kind
         return (
           <button
-            key={kind}
+            key={templateKey}
             type='button'
             className='border-border bg-background flex h-8 shrink-0 items-center gap-1.5 rounded-[8px] border px-2 text-xs'
             draggable
-            onClick={() => onAddNode(kind)}
+            onClick={() => onAddNode(templateKey)}
             onDragStart={(event) => {
-              event.dataTransfer.setData(DRAG_NODE_TYPE, kind)
+              event.dataTransfer.setData(DRAG_NODE_TYPE, templateKey)
               event.dataTransfer.effectAllowed = 'move'
             }}
           >
             <Icon className='size-3.5' />
-            {meta.label}
+            {template.title}
           </button>
         )
       })}
@@ -2052,23 +2352,28 @@ function CompactPalette({
 }
 
 function PaletteItem({
-  kind,
+  template,
   onAddNode,
+  onDeleteComponent,
 }: {
-  kind: AgentNodeKind
-  onAddNode: (kind: AgentNodeKind) => void
+  template: NodeTemplate
+  onAddNode: (templateKey: AgentNodeKind | string) => void
+  onDeleteComponent: (componentId: string) => Promise<void>
 }) {
+  const kind = template.kind
   const meta = NODE_META[kind]
   const Icon = meta.icon
+  const templateKey = template.componentId ?? kind
+  const isCustom = template.source === 'custom'
 
   return (
     <button
       type='button'
       className='hover:bg-accent/60 group flex w-full items-start gap-2.5 rounded-[7px] px-2 py-2 text-left transition-colors'
       draggable
-      onClick={() => onAddNode(kind)}
+      onClick={() => onAddNode(templateKey)}
       onDragStart={(event) => {
-        event.dataTransfer.setData(DRAG_NODE_TYPE, kind)
+        event.dataTransfer.setData(DRAG_NODE_TYPE, templateKey)
         event.dataTransfer.effectAllowed = 'move'
       }}
     >
@@ -2081,12 +2386,44 @@ function PaletteItem({
         <Icon className='size-3.5' />
       </span>
       <span className='min-w-0 flex-1'>
-        <span className='block truncate text-xs font-medium'>{meta.label}</span>
+        <span className='flex items-center gap-1.5'>
+          <span className='block min-w-0 truncate text-xs font-medium'>
+            {template.title}
+          </span>
+          {isCustom && (
+            <span className='bg-amber-500/10 text-amber-700 rounded px-1 text-[9px]'>
+              自定义
+            </span>
+          )}
+        </span>
         <span className='text-muted-foreground line-clamp-2 block text-[10px] leading-snug break-words whitespace-normal'>
-          {meta.description}
+          {template.description}
         </span>
       </span>
-      <PlusIcon className='text-muted-foreground mt-2 size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
+      {isCustom ? (
+        <span
+          role='button'
+          tabIndex={0}
+          className='text-muted-foreground hover:text-destructive mt-1.5 shrink-0 rounded-[5px] p-1 opacity-0 transition-opacity group-hover:opacity-100'
+          onClick={(event) => {
+            event.stopPropagation()
+            if (template.componentId) {
+              void onDeleteComponent(template.componentId)
+            }
+          }}
+          onKeyDown={(event) => {
+            if ((event.key === 'Enter' || event.key === ' ') && template.componentId) {
+              event.stopPropagation()
+              void onDeleteComponent(template.componentId)
+            }
+          }}
+          title='删除自定义组件'
+        >
+          <Trash2Icon className='size-3' />
+        </span>
+      ) : (
+        <PlusIcon className='text-muted-foreground mt-2 size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
+      )}
     </button>
   )
 }
@@ -2707,6 +3044,95 @@ async function captureBrowserNodes(nodes: AgentFlowNode[]) {
   return nextNodes
 }
 
+async function executeHTTPNodes(nodes: AgentFlowNode[]) {
+  let nextNodes = nodes
+
+  for (const node of nodes) {
+    if (node.data.kind !== 'request' && node.data.kind !== 'notify') continue
+
+    const isNotify = node.data.kind === 'notify'
+    const url = (
+      isNotify
+        ? node.data.settings['Webhook'] || node.data.settings['网址']
+        : node.data.settings['网址']
+    )?.trim()
+    if (isNotify && node.data.settings['渠道'] !== 'Webhook') {
+      continue
+    }
+    if (!url) {
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [HTTP_ERROR_SETTING]: isNotify
+          ? 'Webhook 通知未配置 URL。'
+          : '网页请求节点未配置网址。',
+        [HTTP_RESPONSE_SETTING]: '',
+        [HTTP_STATUS_SETTING]: '',
+      })
+      continue
+    }
+
+    try {
+      const result = await executeAgentHTTPRequest({
+        url,
+        method: isNotify ? 'POST' : node.data.settings['方法'] || 'GET',
+        headers: parseHTTPHeaders(node.data.settings['请求头'] || ''),
+        body: isNotify
+          ? buildNotifyWebhookBody(node)
+          : node.data.settings['请求体'] || '',
+        timeout_seconds: parseDurationSeconds(node.data.settings['超时'], 30),
+      })
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [HTTP_RESPONSE_SETTING]: result.body,
+        [HTTP_STATUS_SETTING]: String(result.status_code),
+        [HTTP_ERROR_SETTING]: '',
+        'HTTP 最终网址': result.final_url,
+        'HTTP 内容类型': result.content_type || '',
+        'HTTP 耗时': `${result.duration_ms}ms`,
+      })
+    } catch (error) {
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [HTTP_RESPONSE_SETTING]: '',
+        [HTTP_STATUS_SETTING]: '',
+        [HTTP_ERROR_SETTING]:
+          error instanceof Error ? error.message : 'HTTP 请求执行失败。',
+      })
+    }
+  }
+
+  return nextNodes
+}
+
+function buildNotifyWebhookBody(node: AgentFlowNode) {
+  return JSON.stringify(
+    {
+      title: node.data.title,
+      description: node.data.description,
+      channel: node.data.settings['渠道'] || 'Webhook',
+      target: node.data.settings['通知目标'] || node.data.settings['Webhook'] || '',
+      generated_at: new Date().toISOString(),
+    },
+    null,
+    2
+  )
+}
+
+function parseHTTPHeaders(value: string) {
+  const headers: Record<string, string> = {}
+  for (const line of value.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const [key, ...rest] = trimmed.split(':')
+    if (!key || rest.length === 0) continue
+    headers[key.trim()] = rest.join(':').trim()
+  }
+  return headers
+}
+
+function parseDurationSeconds(value: string | undefined, fallback: number) {
+  const parsed = Number.parseInt(value || '', 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(60, Math.max(1, parsed))
+}
+
 function markBrowserCaptureError(nodes: AgentFlowNode[], error: unknown) {
   const message =
     error instanceof Error ? error.message : '浏览器自动采集失败。'
@@ -2723,11 +3149,16 @@ function markBrowserCaptureError(nodes: AgentFlowNode[], error: unknown) {
 
 function stripTransientNodeSettings(nodes: AgentFlowNode[]) {
   return nodes.map((node) => {
-    if (node.data.kind !== 'browser') return node
-
     const settings = { ...node.data.settings }
-    for (const key of TRANSIENT_BROWSER_SETTING_LABELS) {
-      delete settings[key]
+    if (node.data.kind === 'browser') {
+      for (const key of TRANSIENT_BROWSER_SETTING_LABELS) {
+        delete settings[key]
+      }
+    }
+    if (node.data.kind === 'request') {
+      for (const key of TRANSIENT_HTTP_SETTING_LABELS) {
+        delete settings[key]
+      }
     }
     return {
       ...node,
@@ -3030,6 +3461,7 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     webpage: 1400,
     notify: 720,
     stop: 240,
+    custom: 1000,
   }
   return baseByKind[node.data.kind] + index * 90
 }
@@ -3053,6 +3485,16 @@ function buildNodeInputSummary(
         : error
           ? `页面数据: 自动采集失败，${error}`
           : '页面数据: 等待自动浏览器采集'
+    )
+  } else if (node.data.kind === 'request') {
+    const statusCode = node.data.settings[HTTP_STATUS_SETTING]
+    const error = node.data.settings[HTTP_ERROR_SETTING]
+    summaries.push(
+      statusCode
+        ? `HTTP 响应: 状态码 ${statusCode}，${node.data.settings[HTTP_RESPONSE_SETTING]?.length ?? 0} 个字符`
+        : error
+          ? `HTTP 响应: 请求失败，${error}`
+          : 'HTTP 响应: 等待真实请求执行'
     )
   } else if (upstreamLogs.length > 0) {
     summaries.push(
@@ -3088,6 +3530,18 @@ function buildNodeOutputSummary(
             : '页面数据: 未获取可解析的真实页面数据',
           '截图证据: 当前版本先采集 DOM 文本，暂未写入截图文件',
         ]
+  }
+
+  if (node.data.kind === 'request' && status === 'completed') {
+    const statusCode = node.data.settings[HTTP_STATUS_SETTING]
+    const response = node.data.settings[HTTP_RESPONSE_SETTING] || ''
+    const error = node.data.settings[HTTP_ERROR_SETTING]
+    return [
+      statusCode
+        ? `JSON 数据: 已获取真实 HTTP 响应，状态码 ${statusCode}`
+        : `JSON 数据: 请求失败，${error || '未返回响应'}`,
+      `请求日志: ${response ? `响应体 ${response.length} 字符` : '无响应体'}`,
+    ]
   }
 
   if (
@@ -3147,13 +3601,7 @@ function buildNodeModelOutput(
     case 'browser':
       return buildBrowserNodeModelOutput(node, skillLine)
     case 'request':
-      return [
-        `模型: ${node.data.model}${skillLine}`,
-        '输出摘要:',
-        '- 已完成接口请求与响应解析。',
-        '- 已过滤空字段和重复记录。',
-        '- 原始响应已转换为结构化 JSON 数据。',
-      ].join('\n')
+      return buildRequestNodeModelOutput(node, skillLine)
     case 'transform': {
       const templateName = node.data.settings['整理模板']
       const templateOriginalName = node.data.settings['模板原文件名']
@@ -3268,13 +3716,7 @@ function buildNodeModelOutput(
       ].join('\n')
     }
     case 'notify':
-      return [
-        `模型: ${node.data.model}${skillLine}`,
-        '通知结果:',
-        '- 已生成通知摘要。',
-        `- 渠道: ${node.data.settings['渠道'] || '邮件'}`,
-        `- 确认策略: ${node.data.settings['确认'] || '发送前确认'}`,
-      ].join('\n')
+      return buildNotifyNodeModelOutput(node, skillLine)
     case 'stop':
       return [
         '本地执行结果: 流程结束节点已执行。',
@@ -3315,6 +3757,92 @@ function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
     '处理: 请确认目标页面已登录并能在浏览器中正常打开，然后重新执行。',
     '限制: 不会根据模板、标题、历史内容或模型常识补全商品排行、商品ID、商品标题。',
   ].join('\n')
+}
+
+function buildRequestNodeModelOutput(node: AgentFlowNode, skillLine: string) {
+  const response = node.data.settings[HTTP_RESPONSE_SETTING] || ''
+  const statusCode = node.data.settings[HTTP_STATUS_SETTING] || ''
+  const error = node.data.settings[HTTP_ERROR_SETTING] || ''
+  const finalUrl = node.data.settings['HTTP 最终网址'] || node.data.settings['网址'] || ''
+  const contentType = node.data.settings['HTTP 内容类型'] || ''
+  const duration = node.data.settings['HTTP 耗时'] || ''
+
+  if (error || !statusCode) {
+    return [
+      `模型: ${node.data.model}${skillLine}`,
+      'HTTP 请求失败。',
+      `目标网址: ${node.data.settings['网址'] || '未配置'}`,
+      `错误: ${error || '未返回状态码'}`,
+      '限制: 下游节点不得根据示例或模型常识补全接口数据。',
+    ].join('\n')
+  }
+
+  const parsed = parseMaybeJSON(response)
+  return [
+    `模型: ${node.data.model}${skillLine}`,
+    '数据来源: 网页请求节点执行的真实 HTTP 响应。',
+    `请求方法: ${node.data.settings['方法'] || 'GET'}`,
+    `目标网址: ${node.data.settings['网址'] || ''}`,
+    `最终网址: ${finalUrl}`,
+    `状态码: ${statusCode}`,
+    contentType ? `内容类型: ${contentType}` : '',
+    duration ? `耗时: ${duration}` : '',
+    '',
+    '响应摘要:',
+    parsed
+      ? formatJSONPreview(parsed)
+      : truncateText(response || '响应体为空。', 4000),
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function buildNotifyNodeModelOutput(node: AgentFlowNode, skillLine: string) {
+  const channel = node.data.settings['渠道'] || '邮件'
+  const confirm = node.data.settings['确认'] || '发送前确认'
+  const statusCode = node.data.settings[HTTP_STATUS_SETTING]
+  const error = node.data.settings[HTTP_ERROR_SETTING]
+
+  if (channel === 'Webhook') {
+    return [
+      `模型: ${node.data.model}${skillLine}`,
+      '通知结果:',
+      statusCode
+        ? `- Webhook 已真实请求，状态码 ${statusCode}。`
+        : `- Webhook 未发送成功: ${error || '未配置 URL'}`,
+      `- 目标: ${node.data.settings['Webhook'] || node.data.settings['网址'] || '未配置'}`,
+      `- 确认策略: ${confirm}`,
+    ].join('\n')
+  }
+
+  return [
+    `模型: ${node.data.model}${skillLine}`,
+    '通知待发送:',
+    `- 渠道: ${channel}`,
+    `- 确认策略: ${confirm}`,
+    '- 当前未配置真实外发适配器，因此只生成待发送记录，不标记为已发送。',
+  ].join('\n')
+}
+
+function parseMaybeJSON(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null
+  try {
+    return JSON.parse(trimmed) as unknown
+  } catch {
+    return null
+  }
+}
+
+function formatJSONPreview(value: unknown) {
+  return truncateText(JSON.stringify(value, null, 2), 4000)
+}
+
+function truncateText(value: string, maxLength: number) {
+  return value.length > maxLength
+    ? `${value.slice(0, maxLength)}\n...（已截断）`
+    : value
 }
 
 function buildBlockedByMissingBrowserDataOutput(node: AgentFlowNode) {
@@ -4057,11 +4585,20 @@ const TRANSIENT_BROWSER_SETTING_LABELS = new Set([
   '采集时间',
   '采集错误',
 ])
+const TRANSIENT_HTTP_SETTING_LABELS = new Set([
+  HTTP_RESPONSE_SETTING,
+  HTTP_STATUS_SETTING,
+  HTTP_ERROR_SETTING,
+  'HTTP 最终网址',
+  'HTTP 内容类型',
+  'HTTP 耗时',
+])
 const HIDDEN_SETTING_LABELS = new Set([
   '模板目录',
   '模板原文件名',
   '模板预览',
   ...TRANSIENT_BROWSER_SETTING_LABELS,
+  ...TRANSIENT_HTTP_SETTING_LABELS,
 ])
 const DEFAULT_TRANSFORM_TEMPLATE_PLACEHOLDER =
   '字段: 名称, 数值, 状态, 备注\n格式: Markdown 表格 + JSON 数组\n排序: 按数值降序\n说明: 缺失字段保留空值并标注来源'
@@ -5575,6 +6112,11 @@ function normalizeNodeSettings(
       normalized['采集等待'] = '6s'
     }
   }
+  if (kind === 'request') {
+    for (const key of TRANSIENT_HTTP_SETTING_LABELS) {
+      delete normalized[key]
+    }
+  }
   if (kind === 'stop') {
     delete normalized['归档']
     delete normalized['输出目录']
@@ -5612,12 +6154,17 @@ function formatBlueprintTime(timestamp: number) {
 function buildTemplates(
   models: ModelOption[],
   currentModel?: string,
-  currentGroup?: string
+  currentGroup?: string,
+  components: AgentComponentItem[] = []
 ) {
-  return (Object.keys(NODE_META) as AgentNodeKind[]).map((kind) => {
+  const baseTemplates = (Object.keys(NODE_META) as AgentNodeKind[])
+    .filter((kind) => kind !== 'custom')
+    .map((kind) => {
     const meta = NODE_META[kind]
     return {
       kind,
+      componentId: kind,
+      source: 'builtin' as const,
       title: meta.label,
       description: meta.description,
       group: currentGroup || 'default',
@@ -5629,6 +6176,52 @@ function buildTemplates(
       status: 'ready' as AgentNodeStatus,
     }
   })
+  if (!components.length) return baseTemplates
+
+  const dynamicTemplates = components
+    .filter((component) => component.enabled && component.source === 'custom')
+    .map((component) =>
+      componentToNodeTemplate(component, models, currentModel, currentGroup)
+    )
+  return [...baseTemplates, ...dynamicTemplates]
+}
+
+function componentToNodeTemplate(
+  component: AgentComponentItem,
+  models: ModelOption[],
+  currentModel?: string,
+  currentGroup?: string
+): NodeTemplate {
+  const kind = normalizeTemplateKind(component.kind)
+  const meta = NODE_META[kind]
+  const config = component.config ?? {}
+  const settings = {
+    ...meta.settings,
+    ...(config.settings ?? {}),
+    组件来源: component.source === 'custom' ? '自定义' : '系统内置',
+  }
+  return {
+    kind,
+    componentId: component.id,
+    source: component.source,
+    title: component.name || meta.label,
+    description: component.description || meta.description,
+    group: config.model_group || currentGroup || 'default',
+    model:
+      config.model_name ||
+      pickDefaultModel(kind, models, currentModel),
+    skill: config.skill || pickDefaultSkill(kind),
+    inputs: config.inputs?.length ? config.inputs : meta.inputs,
+    outputs: config.outputs?.length ? config.outputs : meta.outputs,
+    settings,
+    status: 'ready',
+  }
+}
+
+function normalizeTemplateKind(kind: string): AgentNodeKind {
+  return kind && NODE_META[kind as AgentNodeKind]
+    ? (kind as AgentNodeKind)
+    : 'custom'
 }
 
 function pickDefaultModel(
@@ -5860,6 +6453,7 @@ function createNodeFromTemplate(
     position,
     data: {
       kind: template.kind,
+      componentId: template.componentId,
       title: template.title,
       description: template.description,
       group: template.group,
@@ -5956,19 +6550,39 @@ function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
   } as AgentFlowEdge
 }
 
-function filterPaletteGroups(search: string) {
-  const keyword = search.trim().toLowerCase()
-  if (!keyword) return PALETTE_GROUPS
-
+function buildPaletteTemplateGroups(templates: NodeTemplate[]): PaletteTemplateGroup[] {
   return PALETTE_GROUPS.map((group) => ({
+    title: group.title,
+    templates: templates.filter((template) => {
+      const meta = NODE_META[template.kind]
+      return meta.group === group.title
+    }),
+  })).filter((group) => group.templates.length > 0)
+}
+
+function filterPaletteTemplateGroups(
+  groups: PaletteTemplateGroup[],
+  search: string
+) {
+  const keyword = search.trim().toLowerCase()
+  if (!keyword) return groups
+
+  return groups.map((group) => ({
     ...group,
-    kinds: group.kinds.filter((kind) => {
-      const meta = NODE_META[kind]
-      return `${meta.label} ${meta.group} ${meta.description}`
+    templates: group.templates.filter((template) => {
+      const meta = NODE_META[template.kind]
+      return `${template.title} ${meta.group} ${template.description}`
         .toLowerCase()
         .includes(keyword)
     }),
-  })).filter((group) => group.kinds.length > 0)
+  })).filter((group) => group.templates.length > 0)
+}
+
+function splitListInput(value: string) {
+  return value
+    .split(/[,，\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
 }
 
 function orderNodes(nodes: AgentFlowNode[], edges: AgentFlowEdge[]) {

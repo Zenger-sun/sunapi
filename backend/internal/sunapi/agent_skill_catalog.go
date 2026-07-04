@@ -1,0 +1,658 @@
+package sunapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+const maxSkillManifestBytes = 512 * 1024
+
+type skillConfigPayload struct {
+	Tags         []string `json:"tags,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Instructions []string `json:"instructions,omitempty"`
+	Inputs       []string `json:"inputs,omitempty"`
+	Outputs      []string `json:"outputs,omitempty"`
+	ModelGroup   string   `json:"model_group,omitempty"`
+	ModelName    string   `json:"model_name,omitempty"`
+	InstallMode  string   `json:"install_mode,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	EntryFile    string   `json:"entry_file,omitempty"`
+}
+
+type skillManifestPayload struct {
+	Name         string             `json:"name"`
+	Description  string             `json:"description"`
+	Version      string             `json:"version"`
+	Tags         []string           `json:"tags"`
+	Capabilities []string           `json:"capabilities"`
+	Instructions []string           `json:"instructions"`
+	Permissions  []string           `json:"permissions"`
+	Config       skillConfigPayload `json:"config"`
+}
+
+var marketplaceSkillCatalog = []AgentSkillMarketplaceItem{
+	{
+		ID:          "marketplace.web-research-brief",
+		Name:        "网页研究简报 Skill",
+		Description: "围绕网页资料收集、来源核验和引用摘要生成研究简报。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/",
+		Tags:        []string{"research", "web", "summary"},
+		Capabilities: []string{
+			"搜索计划",
+			"网页摘要",
+			"来源核验",
+		},
+		Permissions: []string{"network:read"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"research", "web", "summary"},
+			Capabilities: []string{"搜索计划", "网页摘要", "来源核验"},
+			Instructions: []string{
+				"先把问题拆成可验证检索点，再按来源可信度整理结论。",
+				"保留来源标题、URL、发布时间或访问时间，区分事实和推断。",
+				"当网页不可访问或证据不足时，返回缺口，不补造事实。",
+			},
+			Inputs:      []string{"问题", "URL", "关键词"},
+			Outputs:     []string{"研究摘要", "来源列表", "待确认点"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
+		ID:          "marketplace.browser-operator",
+		Name:        "浏览器自动化 Skill",
+		Description: "处理登录态页面读取、动态 DOM 抽取、截图证据和安全操作边界。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/",
+		Tags:        []string{"browser", "automation", "dom"},
+		Capabilities: []string{
+			"页面导航",
+			"DOM 抽取",
+			"截图证据",
+		},
+		Permissions: []string{"browser:read", "file:write"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"browser", "automation", "dom"},
+			Capabilities: []string{"页面导航", "DOM 抽取", "截图证据"},
+			Instructions: []string{
+				"只按节点给出的 URL、登录态和任务描述读取页面。",
+				"对分页、弹窗、懒加载和动态图表记录处理步骤。",
+				"默认只读；涉及提交、购买、删除、转账等动作必须暂停并请求确认。",
+			},
+			Inputs:      []string{"URL", "任务描述", "登录态"},
+			Outputs:     []string{"页面文本", "结构化数据", "截图路径"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
+		ID:          "marketplace.http-api-tool",
+		Name:        "HTTP API 调用 Skill",
+		Description: "组织 HTTP 请求、鉴权、分页、重试和 JSON/文本响应解析。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.httprequest/",
+		Tags:        []string{"api", "http", "integration"},
+		Capabilities: []string{
+			"参数校验",
+			"分页重试",
+			"响应解析",
+		},
+		Permissions: []string{"network:read"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"api", "http", "integration"},
+			Capabilities: []string{"参数校验", "分页重试", "响应解析"},
+			Instructions: []string{
+				"根据 method、URL、headers、body、timeout 和鉴权配置发起请求。",
+				"保留状态码、耗时、响应摘要和关键字段，不吞掉错误。",
+				"分页、限流、非 JSON 响应要给出处理方式和剩余限制。",
+			},
+			Inputs:      []string{"URL", "方法", "请求体", "请求头"},
+			Outputs:     []string{"响应数据", "状态码", "请求日志"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
+		ID:          "marketplace.file-transformer",
+		Name:        "文件转换与表格 Skill",
+		Description: "读取 Excel、CSV、PDF、Word、HTML、Markdown 和 TXT 并进行结构化转换。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.readwritefile/",
+		Tags:        []string{"file", "spreadsheet", "document"},
+		Capabilities: []string{
+			"多格式读取",
+			"表格整理",
+			"文件生成",
+		},
+		Permissions: []string{"file:read", "file:write"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"file", "spreadsheet", "document"},
+			Capabilities: []string{"多格式读取", "表格整理", "文件生成"},
+			Instructions: []string{
+				"优先保留模板文件的工作表、表头、格式和命名规则。",
+				"读取失败时指出具体文件、格式或字段缺口。",
+				"转换结果要写明生成文件路径和格式。",
+			},
+			Inputs:      []string{"模板文件", "源数据", "输出格式"},
+			Outputs:     []string{"转换文件", "字段映射", "处理日志"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
+		ID:          "marketplace.data-cleaning",
+		Name:        "数据清洗分析 Skill",
+		Description: "用于去重、排序、统计、字段映射、指标口径和可复现数据处理。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.code/",
+		Tags:        []string{"data", "code", "analysis"},
+		Capabilities: []string{
+			"数据清洗",
+			"指标计算",
+			"口径校验",
+		},
+		Permissions: []string{"code:execute"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"data", "code", "analysis"},
+			Capabilities: []string{"数据清洗", "指标计算", "口径校验"},
+			Instructions: []string{
+				"优先用确定性计算处理清洗、聚合、排序和转换。",
+				"输出字段映射、计算口径、异常值和数据质量提示。",
+				"禁止用模型臆测缺失数据；缺字段时返回明确缺口。",
+			},
+			Inputs:      []string{"表格", "JSON", "指标口径"},
+			Outputs:     []string{"清洗数据", "统计摘要", "异常清单"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
+		ID:          "marketplace.notification-router",
+		Name:        "通知路由 Skill",
+		Description: "把任务结果投递到邮件、Webhook、飞书、企业微信、Slack 等通道。",
+		Version:     "1.0.0",
+		SourceURL:   "https://platform.zapier.com/docs/actions",
+		Tags:        []string{"notification", "webhook", "ops"},
+		Capabilities: []string{
+			"通道选择",
+			"消息格式化",
+			"失败重试",
+		},
+		Permissions: []string{"network:write"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"notification", "webhook", "ops"},
+			Capabilities: []string{"通道选择", "消息格式化", "失败重试"},
+			Instructions: []string{
+				"根据节点配置的通道、收件人、Webhook 和确认策略发送。",
+				"保留投递状态、响应码和失败原因。",
+				"未配置目标或涉及外发敏感数据时停止并要求补充配置。",
+			},
+			Inputs:      []string{"消息", "通道", "收件人"},
+			Outputs:     []string{"投递状态", "回执", "错误信息"},
+			InstallMode: "marketplace",
+		}),
+	},
+}
+
+func mustSkillConfig(payload skillConfigPayload) json.RawMessage {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+func listMarketplaceSkills(installed []AgentSkill) []AgentSkillMarketplaceItem {
+	installedKeys := map[string]bool{}
+	for _, skill := range installed {
+		installedKeys[strings.TrimSpace(skill.SourceURL)] = true
+		if skill.Config != nil {
+			var cfg map[string]any
+			if err := json.Unmarshal(skill.Config, &cfg); err == nil {
+				if id, ok := cfg["marketplace_id"].(string); ok {
+					installedKeys[id] = true
+				}
+			}
+		}
+	}
+	out := make([]AgentSkillMarketplaceItem, 0, len(marketplaceSkillCatalog))
+	for _, item := range marketplaceSkillCatalog {
+		copied := item
+		copied.Installed = installedKeys[item.ID] || installedKeys[item.SourceURL]
+		out = append(out, copied)
+	}
+	return out
+}
+
+func prepareSkillForm(ctx context.Context, f SkillFormData) (SkillFormData, json.RawMessage, json.RawMessage, string, error) {
+	source := strings.TrimSpace(f.SourceType)
+	if source == "" {
+		source = "custom"
+	}
+	f.SourceType = source
+
+	switch source {
+	case "marketplace":
+		return prepareMarketplaceSkillForm(f)
+	case "github":
+		return prepareGitHubSkillForm(ctx, f)
+	case "custom":
+		return prepareCustomSkillForm(f)
+	case "builtin":
+		return f, nil, nil, "", errors.New("built-in skills are managed by system")
+	default:
+		return f, nil, nil, "", fmt.Errorf("unsupported skill source type %q", source)
+	}
+}
+
+func prepareMarketplaceSkillForm(f SkillFormData) (SkillFormData, json.RawMessage, json.RawMessage, string, error) {
+	id := strings.TrimSpace(f.MarketplaceID)
+	if id == "" && len(f.Config) > 0 {
+		var cfg map[string]any
+		if err := json.Unmarshal(f.Config, &cfg); err == nil {
+			if raw, ok := cfg["marketplace_id"].(string); ok {
+				id = raw
+			}
+		}
+	}
+	for _, item := range marketplaceSkillCatalog {
+		if item.ID != id {
+			continue
+		}
+		f.Name = item.Name
+		f.Description = item.Description
+		f.SourceURL = item.SourceURL
+		config := mergeSkillConfig(item.Config, map[string]any{
+			"marketplace_id": item.ID,
+			"install_mode":   "marketplace",
+			"source":         item.SourceURL,
+		})
+		permissions := marshalStringSlice(item.Permissions)
+		return f, config, permissions, item.Version, nil
+	}
+	return f, nil, nil, "", fmt.Errorf("marketplace skill %q not found", id)
+}
+
+func prepareGitHubSkillForm(ctx context.Context, f SkillFormData) (SkillFormData, json.RawMessage, json.RawMessage, string, error) {
+	sourceURL := strings.TrimSpace(f.SourceURL)
+	if sourceURL == "" {
+		return f, nil, nil, "", errors.New("GitHub URL is required")
+	}
+	manifest, entryFile, err := fetchGitHubSkillManifest(ctx, sourceURL)
+	if err != nil {
+		return f, nil, nil, "", err
+	}
+	if strings.TrimSpace(f.Name) == "" {
+		f.Name = manifest.Name
+	}
+	if strings.TrimSpace(f.Description) == "" {
+		f.Description = manifest.Description
+	}
+	if strings.TrimSpace(f.Name) == "" {
+		f.Name = repoNameFromURL(sourceURL) + " Skill"
+	}
+	if strings.TrimSpace(f.Description) == "" {
+		f.Description = "从 GitHub 仓库导入的 Skill。"
+	}
+	tags := normalizeTags(append(manifest.Tags, f.Tags...))
+	config := mergeSkillConfig(mustSkillConfig(skillConfigPayload{
+		Tags:         tags,
+		Capabilities: manifest.Capabilities,
+		Instructions: manifest.Instructions,
+		InstallMode:  "github",
+		Source:       sourceURL,
+		EntryFile:    entryFile,
+	}), map[string]any{
+		"github_url": sourceURL,
+	})
+	version := manifest.Version
+	if strings.TrimSpace(version) == "" {
+		version = "1.0.0"
+	}
+	permissions := marshalStringSlice(manifest.Permissions)
+	return f, config, permissions, version, nil
+}
+
+func prepareCustomSkillForm(f SkillFormData) (SkillFormData, json.RawMessage, json.RawMessage, string, error) {
+	if strings.TrimSpace(f.Name) == "" {
+		return f, nil, nil, "", errors.New("skill name is required")
+	}
+	if strings.TrimSpace(f.Description) == "" {
+		return f, nil, nil, "", errors.New("skill description is required")
+	}
+	tags := normalizeTags(append(f.Tags, inferSkillTags(f.Description)...))
+	capabilities := inferSkillCapabilities(f.Description)
+	instructions := buildCustomSkillInstructions(f.Description, capabilities)
+	config := mergeSkillConfig(f.Config, map[string]any{
+		"tags":         tags,
+		"capabilities": capabilities,
+		"instructions": instructions,
+		"model_group":  strings.TrimSpace(f.ModelGroup),
+		"model_name":   strings.TrimSpace(f.ModelName),
+		"install_mode": "custom",
+	})
+	return f, config, json.RawMessage(`[]`), "1.0.0", nil
+}
+
+func mergeSkillConfig(base json.RawMessage, values map[string]any) json.RawMessage {
+	cfg := map[string]any{}
+	if len(base) > 0 && string(base) != "null" {
+		_ = json.Unmarshal(base, &cfg)
+	}
+	for k, v := range values {
+		if v == nil {
+			continue
+		}
+		switch typed := v.(type) {
+		case string:
+			if strings.TrimSpace(typed) == "" {
+				continue
+			}
+		case []string:
+			if len(typed) == 0 {
+				continue
+			}
+		}
+		cfg[k] = v
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
+
+func marshalStringSlice(values []string) json.RawMessage {
+	raw, err := json.Marshal(uniqueNonEmptyStrings(values))
+	if err != nil {
+		return json.RawMessage(`[]`)
+	}
+	return raw
+}
+
+func normalizeTags(tags []string) []string {
+	out := make([]string, 0, len(tags))
+	seen := map[string]bool{}
+	for _, tag := range tags {
+		normalized := strings.ToLower(strings.TrimSpace(tag))
+		normalized = strings.ReplaceAll(normalized, " ", "-")
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func inferSkillTags(description string) []string {
+	lower := strings.ToLower(description)
+	tags := []string{"custom"}
+	keywords := map[string]string{
+		"浏览器": "browser", "网页": "web", "搜索": "research", "http": "api",
+		"api": "api", "接口": "api", "表格": "spreadsheet", "excel": "spreadsheet",
+		"csv": "spreadsheet", "文档": "document", "pdf": "document", "图片": "image",
+		"视频": "video", "数据": "data", "sql": "database", "数据库": "database",
+		"通知": "notification", "webhook": "webhook", "日报": "report", "报告": "report",
+	}
+	for keyword, tag := range keywords {
+		if strings.Contains(lower, strings.ToLower(keyword)) {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+func inferSkillCapabilities(description string) []string {
+	tagSet := map[string]bool{}
+	for _, tag := range inferSkillTags(description) {
+		tagSet[tag] = true
+	}
+	capabilities := []string{"任务拆解", "结构化输出", "结果校验"}
+	if tagSet["browser"] || tagSet["web"] {
+		capabilities = append(capabilities, "网页读取", "来源核验")
+	}
+	if tagSet["api"] {
+		capabilities = append(capabilities, "接口调用", "响应解析")
+	}
+	if tagSet["spreadsheet"] || tagSet["data"] {
+		capabilities = append(capabilities, "数据清洗", "表格生成")
+	}
+	if tagSet["document"] || tagSet["report"] {
+		capabilities = append(capabilities, "模板遵循", "文档生成")
+	}
+	if tagSet["notification"] || tagSet["webhook"] {
+		capabilities = append(capabilities, "消息投递", "失败重试")
+	}
+	return uniqueNonEmptyStrings(capabilities)
+}
+
+func buildCustomSkillInstructions(description string, capabilities []string) []string {
+	return []string{
+		"只根据当前节点输入、上游显式输出和 Skill 描述执行，不扩大业务上下文。",
+		"Skill 描述：" + strings.TrimSpace(description),
+		"核心能力：" + strings.Join(capabilities, "、"),
+		"输出必须包含执行结果、关键依据和无法完成时的缺失输入。",
+	}
+}
+
+func fetchGitHubSkillManifest(ctx context.Context, repoURL string) (skillManifestPayload, string, error) {
+	owner, repo, branch, subdir, err := parseGitHubRepoURL(repoURL)
+	if err != nil {
+		return skillManifestPayload{}, "", err
+	}
+	branches := uniqueNonEmptyStrings([]string{branch, "main", "master"})
+	candidates := []string{
+		"skill.json",
+		"SKILL.json",
+		"skill.jsonc",
+		"SKILL.md",
+		".codex/skill.json",
+		".codex/SKILL.md",
+	}
+	var lastErr error
+	for _, b := range branches {
+		for _, candidate := range candidates {
+			filePath := path.Join(subdir, candidate)
+			rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo, b, filePath)
+			body, err := fetchLimitedText(ctx, rawURL)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			manifest, err := parseSkillManifest(candidate, body)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return manifest, filePath, nil
+		}
+	}
+	if lastErr != nil {
+		return skillManifestPayload{}, "", fmt.Errorf("failed to read skill manifest: %w", lastErr)
+	}
+	return skillManifestPayload{}, "", errors.New("repository does not contain skill.json or SKILL.md")
+}
+
+func parseGitHubRepoURL(raw string) (owner, repo, branch, subdir string, err error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "", "", "", "", errors.New("invalid GitHub URL")
+	}
+	host := strings.ToLower(u.Host)
+	if host != "github.com" && host != "www.github.com" {
+		return "", "", "", "", errors.New("only github.com repositories are supported")
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return "", "", "", "", errors.New("GitHub URL must include owner and repository")
+	}
+	owner = parts[0]
+	repo = strings.TrimSuffix(parts[1], ".git")
+	branch = ""
+	if len(parts) >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
+		branch = parts[3]
+		if len(parts) > 4 {
+			subdir = path.Join(parts[4:]...)
+		}
+	}
+	return owner, repo, branch, subdir, nil
+}
+
+func fetchLimitedText(ctx context.Context, rawURL string) ([]byte, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.raw, text/plain, application/json")
+	req.Header.Set("User-Agent", "SunAPI-Skill-Installer")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s returned %d", rawURL, resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, maxSkillManifestBytes))
+}
+
+func parseSkillManifest(filename string, body []byte) (skillManifestPayload, error) {
+	if strings.HasSuffix(strings.ToLower(filename), ".md") {
+		return parseSkillMarkdown(body)
+	}
+	var manifest skillManifestPayload
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return manifest, err
+	}
+	if strings.TrimSpace(manifest.Name) == "" {
+		return manifest, errors.New("skill manifest missing name")
+	}
+	if len(manifest.Capabilities) == 0 && len(manifest.Config.Capabilities) > 0 {
+		manifest.Capabilities = manifest.Config.Capabilities
+	}
+	if len(manifest.Instructions) == 0 && len(manifest.Config.Instructions) > 0 {
+		manifest.Instructions = manifest.Config.Instructions
+	}
+	return manifest, nil
+}
+
+func parseSkillMarkdown(body []byte) (skillManifestPayload, error) {
+	text := string(body)
+	manifest := skillManifestPayload{}
+	if strings.HasPrefix(text, "---") {
+		parts := strings.SplitN(text, "---", 3)
+		if len(parts) >= 3 {
+			for _, line := range strings.Split(parts[1], "\n") {
+				key, value, ok := strings.Cut(line, ":")
+				if !ok {
+					continue
+				}
+				value = strings.Trim(strings.TrimSpace(value), `"'`)
+				switch strings.TrimSpace(strings.ToLower(key)) {
+				case "name":
+					manifest.Name = value
+				case "description":
+					manifest.Description = value
+				case "version":
+					manifest.Version = value
+				case "tags":
+					manifest.Tags = splitManifestList(value)
+				}
+			}
+			text = parts[2]
+		}
+	}
+	if strings.TrimSpace(manifest.Name) == "" {
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "# ") {
+				manifest.Name = strings.TrimSpace(strings.TrimPrefix(line, "# "))
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(manifest.Name) == "" {
+		return manifest, errors.New("SKILL.md missing name heading or frontmatter")
+	}
+	if strings.TrimSpace(manifest.Description) == "" {
+		manifest.Description = firstParagraph(text)
+	}
+	manifest.Instructions = []string{strings.TrimSpace(text)}
+	manifest.Capabilities = inferSkillCapabilities(manifest.Description + "\n" + manifest.Name)
+	manifest.Tags = normalizeTags(append(manifest.Tags, inferSkillTags(manifest.Description+"\n"+manifest.Name)...))
+	return manifest, nil
+}
+
+func splitManifestList(value string) []string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, "[]")
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.Trim(strings.TrimSpace(part), `"'`)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func firstParagraph(text string) string {
+	lines := strings.Split(text, "\n")
+	var paragraph []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "---") {
+			if len(paragraph) > 0 {
+				break
+			}
+			continue
+		}
+		paragraph = append(paragraph, line)
+		if len(strings.Join(paragraph, " ")) > 160 {
+			break
+		}
+	}
+	return strings.TrimSpace(strings.Join(paragraph, " "))
+}
+
+func repoNameFromURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "GitHub"
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) >= 2 {
+		return strings.TrimSuffix(parts[1], ".git")
+	}
+	return "GitHub"
+}
+
+var nonWordForSkillID = regexp.MustCompile(`[^a-z0-9]+`)
+
+func stableSkillInstallKey(sourceType, sourceURL, name string) string {
+	base := strings.ToLower(strings.TrimSpace(sourceURL))
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(name))
+	}
+	base = nonWordForSkillID.ReplaceAllString(base, "-")
+	base = strings.Trim(base, "-")
+	if len(base) > 52 {
+		base = base[:52]
+		base = strings.Trim(base, "-")
+	}
+	if base == "" {
+		base = "skill"
+	}
+	return "sk-" + strings.TrimSpace(sourceType) + "-" + base
+}

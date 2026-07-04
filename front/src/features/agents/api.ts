@@ -12,6 +12,7 @@ import {
   type Agent,
   type Blueprint,
   type Skill,
+  type SkillMarketplaceItem,
   type AgentFormData,
   type BlueprintFormData,
   type SkillFormData,
@@ -110,6 +111,11 @@ async function getSkills(): Promise<Skill[]> {
   return extractData<Skill[]>(resp) ?? []
 }
 
+async function getSkillMarketplace(): Promise<SkillMarketplaceItem[]> {
+  const resp = await api.get('/api/agent-skills/marketplace')
+  return extractData<SkillMarketplaceItem[]>(resp) ?? []
+}
+
 async function createSkill(data: SkillFormData): Promise<Skill> {
   const resp = await api.post('/api/agent-skills', data)
   return extractData<Skill>(resp)
@@ -142,6 +148,11 @@ export const blueprintsByAgentQueryOptions = (agentId: string) =>
 export const skillsQueryOptions = queryOptions({
   queryKey: ['skills'],
   queryFn: getSkills,
+})
+
+export const skillMarketplaceQueryOptions = queryOptions({
+  queryKey: ['skills', 'marketplace'],
+  queryFn: getSkillMarketplace,
 })
 
 // ============================================================================
@@ -241,7 +252,10 @@ export function useCreateSkillMutation() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: createSkill,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['skills'] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['skills'] })
+      queryClient.invalidateQueries({ queryKey: ['skills', 'marketplace'] })
+    },
   })
 }
 

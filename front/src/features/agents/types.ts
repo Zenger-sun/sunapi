@@ -109,8 +109,29 @@ export const skillSchema = z.object({
 export type Skill = z.infer<typeof skillSchema>
 
 export type SkillConfig = {
+  tags?: string[]
   capabilities?: string[]
   instructions?: string[]
+  inputs?: string[]
+  outputs?: string[]
+  model_group?: string
+  model_name?: string
+  install_mode?: string
+  source?: string
+  entry_file?: string
+}
+
+export interface SkillMarketplaceItem {
+  id: string
+  name: string
+  description: string
+  version: string
+  source_url?: string
+  tags?: string[]
+  capabilities?: string[]
+  permissions?: string[]
+  config?: SkillConfig
+  installed: boolean
 }
 
 // ============================================================================
@@ -233,4 +254,8 @@ export interface SkillFormData {
   source_type: SkillSourceType
   source_url?: string
   config?: Record<string, any>
+  marketplace_id?: string
+  model_group?: string
+  model_name?: string
+  tags?: string[]
 }
