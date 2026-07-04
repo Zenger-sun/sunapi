@@ -38,6 +38,7 @@ export const API_ENDPOINTS = {
   AGENT_BROWSER_CAPTURE: '/api/agents/browser-capture',
   PLAYGROUND_IMAGE_HISTORY: '/api/playground/image-history',
   PLAYGROUND_IMAGE_TASKS: '/api/playground/image-tasks',
+  PLAYGROUND_VIDEO_HISTORY: '/api/playground/video-history',
   PLAYGROUND_IMAGE_GENERATIONS: '/pg/images/generations',
   PLAYGROUND_IMAGE_EDITS: '/pg/images/edits',
   PLAYGROUND_VIDEOS: '/pg/videos',

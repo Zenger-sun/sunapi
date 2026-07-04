@@ -503,3 +503,51 @@ func (s *Store) ListExecutionLogs(ctx context.Context, blueprintID string, userI
 	}
 	return out, rows.Err()
 }
+
+func (s *Store) ListExecutionLogsPage(ctx context.Context, userID, start, end int64, filter string, page, pageSize int) ([]AgentExecutionLog, int64, error) {
+	if userID <= 0 {
+		userID = 1
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 500 {
+		pageSize = 20
+	}
+	clauses := []string{"user_id=?", "start_time>=?", "start_time<=?"}
+	args := []any{userID, start * 1000, end * 1000}
+	if filter = strings.TrimSpace(filter); filter != "" {
+		clauses = append(clauses, "(id LIKE ? OR blueprint_id LIKE ? OR agent_id LIKE ?)")
+		like := "%" + filter + "%"
+		args = append(args, like, like, like)
+	}
+	where := " WHERE " + strings.Join(clauses, " AND ")
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_execution_logs`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, pageSize, (page-1)*pageSize)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, blueprint_id, agent_id, user_id, status, start_time, end_time, duration_ms, output, error_msg, archive_path
+		FROM agent_execution_logs`+where+`
+		ORDER BY start_time DESC LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := make([]AgentExecutionLog, 0)
+	for rows.Next() {
+		var l AgentExecutionLog
+		if err := rows.Scan(&l.ID, &l.BlueprintID, &l.AgentID, &l.UserID,
+			&l.Status, &l.StartTime, &l.EndTime, &l.DurationMs,
+			&l.Output, &l.ErrorMsg, &l.ArchivePath); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, l)
+	}
+	return out, total, rows.Err()
+}

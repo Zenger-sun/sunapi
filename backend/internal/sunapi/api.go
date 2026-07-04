@@ -798,10 +798,18 @@ func RegisterRoutes(engine *gin.Engine, store *Store, writer *ConfigWriter) {
 	api.GET("/log/self/stat", func(c *gin.Context) {
 		handleCompatUsageLogStats(c, store)
 	})
-	api.GET("/mj", handleEmptyCompatLogList)
-	api.GET("/mj/self", handleEmptyCompatLogList)
-	api.GET("/task", handleEmptyCompatLogList)
-	api.GET("/task/self", handleEmptyCompatLogList)
+	api.GET("/mj", func(c *gin.Context) {
+		handleCompatPlaygroundImageLogs(c, store)
+	})
+	api.GET("/mj/self", func(c *gin.Context) {
+		handleCompatPlaygroundImageLogs(c, store)
+	})
+	api.GET("/task", func(c *gin.Context) {
+		handleCompatAgentTaskLogs(c, store)
+	})
+	api.GET("/task/self", func(c *gin.Context) {
+		handleCompatAgentTaskLogs(c, store)
+	})
 
 	api.GET("/usage-logs", func(c *gin.Context) {
 		limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
@@ -978,6 +986,28 @@ func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 		}
 		deleteStoredPlaygroundImageURLs(store.DataDir(), urls)
 		ok(c, gin.H{"id": c.Param("id")})
+	})
+	api.GET("/playground/video-history", func(c *gin.Context) {
+		page, size := pageParams(c, 50)
+		start, end := requestTimeRange(c)
+		items, total, err := store.ListPlaygroundVideoGenerationLogs(c.Request.Context(), playgroundUserID(c), start, end, strings.TrimSpace(c.Query("filter")), page, size)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, gin.H{"items": items, "total": total, "page": page, "page_size": size})
+	})
+	api.POST("/playground/video-history", func(c *gin.Context) {
+		var payload PlaygroundVideoGeneration
+		if !bindJSON(c, &payload) {
+			return
+		}
+		item, err := store.SavePlaygroundVideoGeneration(c.Request.Context(), playgroundUserID(c), payload)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		ok(c, item)
 	})
 
 	api.GET("/playground/sessions", func(c *gin.Context) {
@@ -1248,6 +1278,218 @@ func handleEmptyCompatLogList(c *gin.Context) {
 		"page":      page,
 		"page_size": pageSize,
 	})
+}
+
+func handleCompatPlaygroundImageLogs(c *gin.Context, store *Store) {
+	page, pageSize := compatLogPage(c)
+	start, end := requestTimeRange(c)
+	items, total, err := store.ListPlaygroundImageGenerationLogs(
+		c.Request.Context(),
+		playgroundUserID(c),
+		start,
+		end,
+		strings.TrimSpace(c.Query("mj_id")),
+		page,
+		pageSize,
+	)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, err)
+		return
+	}
+	rows := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, compatPlaygroundImageLogRow(item))
+	}
+	ok(c, gin.H{
+		"items":     rows,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+func handleCompatAgentTaskLogs(c *gin.Context, store *Store) {
+	page, pageSize := compatLogPage(c)
+	if strings.EqualFold(strings.TrimSpace(c.Query("action_group")), "video") {
+		start, end := requestTimeRange(c)
+		items, total, err := store.ListPlaygroundVideoGenerationLogs(
+			c.Request.Context(),
+			playgroundUserID(c),
+			start,
+			end,
+			strings.TrimSpace(c.Query("task_id")),
+			page,
+			pageSize,
+		)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		rows := make([]gin.H, 0, len(items))
+		for _, item := range items {
+			rows = append(rows, compatPlaygroundVideoTaskLogRow(item))
+		}
+		ok(c, gin.H{
+			"items":     rows,
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+		})
+		return
+	}
+	start, end := requestTimeRange(c)
+	items, total, err := store.ListExecutionLogsPage(
+		c.Request.Context(),
+		playgroundUserID(c),
+		start,
+		end,
+		strings.TrimSpace(c.Query("task_id")),
+		page,
+		pageSize,
+	)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, err)
+		return
+	}
+	rows := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, compatAgentTaskLogRow(item))
+	}
+	ok(c, gin.H{
+		"items":     rows,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+func compatLogPage(c *gin.Context) (int, int) {
+	page, _ := strconv.Atoi(c.DefaultQuery("p", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", c.DefaultQuery("size", "20")))
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 500 {
+		pageSize = 20
+	}
+	return page, pageSize
+}
+
+func compatPlaygroundImageLogRow(item PlaygroundImageGeneration) gin.H {
+	status := "SUCCESS"
+	progress := "100%"
+	if item.Status == "running" {
+		status = "IN_PROGRESS"
+		progress = "0%"
+	}
+	if item.Status == "failed" {
+		status = "FAILURE"
+		progress = "0%"
+	}
+	imageURL := ""
+	if len(item.URLs) > 0 {
+		imageURL = item.URLs[0]
+	}
+	return gin.H{
+		"id":          item.CreatedAt,
+		"user_id":     item.UserID,
+		"channel_id":  0,
+		"code":        1,
+		"mj_id":       item.ID,
+		"action":      "IMAGINE",
+		"submit_time": item.CreatedAt,
+		"finish_time": item.UpdatedAt,
+		"start_time":  item.CreatedAt,
+		"fail_reason": item.ErrorMessage,
+		"progress":    progress,
+		"prompt":      item.Prompt,
+		"prompt_en":   item.Prompt,
+		"description": "创作台绘图任务",
+		"buttons":     "",
+		"properties":  string(item.Params),
+		"image_url":   imageURL,
+		"status":      status,
+		"other":       string(item.ReferenceImages),
+		"created_at":  item.CreatedAt,
+		"updated_at":  item.UpdatedAt,
+	}
+}
+
+func compatAgentTaskLogRow(item AgentExecutionLog) gin.H {
+	status := "SUCCESS"
+	if item.Status == "running" {
+		status = "IN_PROGRESS"
+	}
+	if item.Status == "failed" || strings.TrimSpace(item.ErrorMsg) != "" {
+		status = "FAILURE"
+	}
+	if item.Status == "paused" {
+		status = "QUEUED"
+	}
+	failReason := strings.TrimSpace(item.ErrorMsg)
+	if failReason == "" {
+		failReason = strings.TrimSpace(item.ArchivePath)
+	}
+	return gin.H{
+		"id":                  item.StartTime,
+		"user_id":             item.UserID,
+		"username":            "local",
+		"platform":            "agent",
+		"task_id":             item.ID,
+		"action":              "AGENT_RUN",
+		"channel_id":          0,
+		"submit_time":         item.StartTime / 1000,
+		"finish_time":         item.EndTime / 1000,
+		"progress":            "",
+		"progress_message_en": "",
+		"data":                string(item.Output),
+		"fail_reason":         failReason,
+		"status":              status,
+		"other":               item.BlueprintID,
+		"created_at":          item.StartTime / 1000,
+		"updated_at":          item.EndTime / 1000,
+	}
+}
+
+func compatPlaygroundVideoTaskLogRow(item PlaygroundVideoGeneration) gin.H {
+	status := "SUBMITTED"
+	switch item.Status {
+	case "running":
+		status = "IN_PROGRESS"
+	case "succeeded":
+		status = "SUCCESS"
+	case "failed":
+		status = "FAILURE"
+	case "queued":
+		status = "QUEUED"
+	}
+	taskID := strings.TrimSpace(item.TaskID)
+	if taskID == "" {
+		taskID = item.ID
+	}
+	failReason := strings.TrimSpace(item.ErrorMessage)
+	if failReason == "" && item.PreviewURL != "" {
+		failReason = item.PreviewURL
+	}
+	return gin.H{
+		"id":                  item.CreatedAt,
+		"user_id":             item.UserID,
+		"username":            "local",
+		"platform":            "playground-video",
+		"task_id":             taskID,
+		"action":              "textGenerate",
+		"channel_id":          0,
+		"submit_time":         item.CreatedAt / 1000,
+		"finish_time":         item.UpdatedAt / 1000,
+		"progress":            fmt.Sprintf("%d%%", item.Progress),
+		"progress_message_en": "",
+		"data":                string(item.Params),
+		"fail_reason":         failReason,
+		"status":              status,
+		"other":               item.ID,
+		"created_at":          item.CreatedAt / 1000,
+		"updated_at":          item.UpdatedAt / 1000,
+	}
 }
 
 func buildUsageLogWhere(c *gin.Context) (string, []any) {

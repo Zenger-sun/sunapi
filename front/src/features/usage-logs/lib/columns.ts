@@ -45,6 +45,8 @@ export function useColumnsByCategory(
       return drawingColumns
     case 'task':
       return taskColumns
+    case 'video':
+      return taskColumns
     default:
       return commonColumns
   }

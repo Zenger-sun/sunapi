@@ -182,6 +182,9 @@ export const TASK_ACTIONS = {
   FIRST_TAIL_GENERATE: 'firstTailGenerate', // 首尾生视频
   REFERENCE_GENERATE: 'referenceGenerate', // 参照生视频
   REMIX_GENERATE: 'remixGenerate', // 视频 Remix
+
+  // Creator Studio agent tasks
+  AGENT_RUN: 'AGENT_RUN', // 智能体执行
 } as const
 
 /**
@@ -297,6 +300,7 @@ export const TASK_ACTION_MAPPINGS: Record<string, StatusMapping> = {
     label: 'Video Remix',
     variant: 'blue',
   },
+  [TASK_ACTIONS.AGENT_RUN]: { label: 'Agent Run', variant: 'violet' },
 }
 
 /**
@@ -316,6 +320,8 @@ export const TASK_STATUS_MAPPINGS: Record<string, StatusMapping> = {
  * Task platform mappings
  */
 export const TASK_PLATFORM_MAPPINGS: Record<string, StatusMapping> = {
+  agent: { label: 'Agent', variant: 'violet' },
+  'playground-video': { label: 'Video', variant: 'blue' },
   [TASK_PLATFORMS.SUNO]: { label: 'suno', variant: 'green' },
   [TASK_PLATFORMS.KLING]: { label: 'kling', variant: 'blue' },
   [TASK_PLATFORMS.RUNWAY]: { label: 'runway', variant: 'violet' },
@@ -334,6 +340,7 @@ export const LOG_CATEGORY_LABELS: Record<LogCategory, string> = {
   common: 'Common',
   drawing: 'Drawing',
   task: 'Task',
+  video: 'Video',
 }
 
 // ============================================================================

@@ -74,6 +74,13 @@ export function buildSearchParams(
         ...(taskFilters.taskId && { filter: taskFilters.taskId }),
       }
     }
+    case 'video': {
+      const taskFilters = filters as TaskLogFilters
+      return {
+        ...baseParams,
+        ...(taskFilters.taskId && { filter: taskFilters.taskId }),
+      }
+    }
     default:
       return baseParams
   }

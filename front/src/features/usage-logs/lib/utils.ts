@@ -273,7 +273,7 @@ export async function fetchLogsByCategory(
     return isAdmin ? await getAllLogs(params) : await getUserLogs(params)
   }
 
-  // For drawing and task logs
+  // For drawing, task, and video logs
   const baseParams = buildBaseParams({
     page,
     pageSize,
@@ -286,9 +286,10 @@ export async function fetchLogsByCategory(
     ...(logCategory === 'drawing'
       ? { mj_id: searchParams.filter as string | undefined }
       : {}),
-    ...(logCategory === 'task'
+    ...(logCategory === 'task' || logCategory === 'video'
       ? { task_id: searchParams.filter as string | undefined }
       : {}),
+    ...(logCategory === 'video' ? { action_group: 'video' } : {}),
   }
 
   if (logCategory === 'drawing') {

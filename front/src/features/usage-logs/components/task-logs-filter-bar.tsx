@@ -34,7 +34,7 @@ import {
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
 
-type TaskLikeLogCategory = Extract<LogCategory, 'drawing' | 'task'>
+type TaskLikeLogCategory = Extract<LogCategory, 'drawing' | 'task' | 'video'>
 type TaskLogsFilters = DrawingLogFilters | TaskLogFilters
 
 interface TaskLogsFilterBarProps<TData> {

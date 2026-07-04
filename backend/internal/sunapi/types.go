@@ -243,6 +243,24 @@ type PlaygroundImageGeneration struct {
 	UpdatedAt       int64           `json:"updatedAt,omitempty"`
 }
 
+type PlaygroundVideoGeneration struct {
+	ID              string          `json:"id"`
+	TaskID          string          `json:"taskId,omitempty"`
+	UserID          int64           `json:"user_id,omitempty"`
+	Prompt          string          `json:"prompt"`
+	Params          json.RawMessage `json:"params"`
+	Model           string          `json:"model"`
+	Group           string          `json:"group"`
+	ReferenceImages json.RawMessage `json:"referenceImages,omitempty"`
+	Status          string          `json:"status"`
+	Progress        int             `json:"progress,omitempty"`
+	PreviewURL      string          `json:"previewUrl,omitempty"`
+	ErrorMessage    string          `json:"errorMessage,omitempty"`
+	DurationMS      int64           `json:"durationMs,omitempty"`
+	CreatedAt       int64           `json:"createdAt"`
+	UpdatedAt       int64           `json:"updatedAt,omitempty"`
+}
+
 type UsageLog struct {
 	ID               int64   `json:"id"`
 	CreatedAt        int64   `json:"created_at"`

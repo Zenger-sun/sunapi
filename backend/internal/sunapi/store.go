@@ -226,6 +226,23 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_time INTEGER NOT NULL,
 			updated_time INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS playground_video_generations (
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL DEFAULT '',
+			user_id INTEGER NOT NULL DEFAULT 1,
+			prompt TEXT NOT NULL DEFAULT '',
+			params TEXT NOT NULL DEFAULT '{}',
+			model TEXT NOT NULL DEFAULT '',
+			group_name TEXT NOT NULL DEFAULT '',
+			reference_images TEXT NOT NULL DEFAULT '[]',
+			status TEXT NOT NULL DEFAULT 'queued',
+			progress INTEGER NOT NULL DEFAULT 0,
+			preview_url TEXT NOT NULL DEFAULT '',
+			error_message TEXT NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_time INTEGER NOT NULL,
+			updated_time INTEGER NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_channel_id ON usage_logs(channel_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name)`,
@@ -234,6 +251,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_playground_conversation_messages_user_updated ON playground_conversation_messages(user_id, updated_time)`,
 		`CREATE INDEX IF NOT EXISTS idx_playground_attachments_user_created ON playground_attachments(user_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_playground_image_generations_user_created ON playground_image_generations(user_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_playground_video_generations_user_created ON playground_video_generations(user_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_playground_video_generations_task_id ON playground_video_generations(task_id)`,
 		// ── 智能体相关表 ──────────────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS agents (
 			id TEXT PRIMARY KEY,
@@ -2004,6 +2023,52 @@ func (s *Store) ListPlaygroundImageGenerations(ctx context.Context, userID int64
 	return items, rows.Err()
 }
 
+func (s *Store) ListPlaygroundImageGenerationLogs(ctx context.Context, userID, start, end int64, filter string, page, pageSize int) ([]PlaygroundImageGeneration, int64, error) {
+	if userID <= 0 {
+		userID = 1
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 500 {
+		pageSize = 20
+	}
+	clauses := []string{"user_id = ?", "created_time >= ?", "created_time <= ?"}
+	args := []any{userID, start * 1000, end * 1000}
+	if filter = strings.TrimSpace(filter); filter != "" {
+		clauses = append(clauses, "id LIKE ?")
+		args = append(args, "%"+filter+"%")
+	}
+	where := " WHERE " + strings.Join(clauses, " AND ")
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM playground_image_generations`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, pageSize, (page-1)*pageSize)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, user_id, prompt, negative_prompt, params, model, group_name,
+		reference_images, image_urls, status, error_message, duration_ms, created_time, updated_time
+		FROM playground_image_generations`+where+`
+		ORDER BY created_time DESC, updated_time DESC
+		LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := make([]PlaygroundImageGeneration, 0)
+	for rows.Next() {
+		item, err := scanPlaygroundImageGeneration(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	return items, total, rows.Err()
+}
+
 func (s *Store) SavePlaygroundImageGeneration(ctx context.Context, userID int64, item PlaygroundImageGeneration) (PlaygroundImageGeneration, error) {
 	if userID <= 0 {
 		userID = 1
@@ -2104,6 +2169,122 @@ func (s *Store) DeletePlaygroundImageGeneration(ctx context.Context, userID int6
 	return cleanStringList(urls, 16, 2048), nil
 }
 
+func (s *Store) ListPlaygroundVideoGenerationLogs(ctx context.Context, userID, start, end int64, filter string, page, pageSize int) ([]PlaygroundVideoGeneration, int64, error) {
+	if userID <= 0 {
+		userID = 1
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 500 {
+		pageSize = 20
+	}
+	clauses := []string{"user_id = ?", "created_time >= ?", "created_time <= ?"}
+	args := []any{userID, start * 1000, end * 1000}
+	if filter = strings.TrimSpace(filter); filter != "" {
+		clauses = append(clauses, "(id LIKE ? OR task_id LIKE ?)")
+		like := "%" + filter + "%"
+		args = append(args, like, like)
+	}
+	where := " WHERE " + strings.Join(clauses, " AND ")
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM playground_video_generations`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, pageSize, (page-1)*pageSize)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, user_id, prompt, params, model, group_name,
+		reference_images, status, progress, preview_url, error_message, duration_ms, created_time, updated_time
+		FROM playground_video_generations`+where+`
+		ORDER BY created_time DESC, updated_time DESC
+		LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	items := make([]PlaygroundVideoGeneration, 0)
+	for rows.Next() {
+		item, err := scanPlaygroundVideoGeneration(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	return items, total, rows.Err()
+}
+
+func (s *Store) SavePlaygroundVideoGeneration(ctx context.Context, userID int64, item PlaygroundVideoGeneration) (PlaygroundVideoGeneration, error) {
+	if userID <= 0 {
+		userID = 1
+	}
+	item.ID = strings.TrimSpace(item.ID)
+	if item.ID == "" {
+		return PlaygroundVideoGeneration{}, errors.New("video generation id is required")
+	}
+	item.TaskID = truncateRunes(strings.TrimSpace(item.TaskID), 255)
+	item.Prompt = truncateRunes(strings.TrimSpace(item.Prompt), 4000)
+	item.Model = truncateRunes(strings.TrimSpace(item.Model), 255)
+	item.Group = truncateRunes(strings.TrimSpace(item.Group), 255)
+	item.Status = normalizeVideoGenerationStatus(item.Status)
+	item.Progress = maxInt(0, minInt(item.Progress, 100))
+	item.PreviewURL = truncateRunes(strings.TrimSpace(item.PreviewURL), 2048)
+	item.ErrorMessage = truncateRunes(strings.TrimSpace(item.ErrorMessage), 2000)
+	item.Params = normalizeRawJSON(item.Params, "{}")
+	item.ReferenceImages = normalizeRawJSON(item.ReferenceImages, "[]")
+	if item.DurationMS < 0 {
+		item.DurationMS = 0
+	}
+	now := time.Now().UnixMilli()
+	if item.CreatedAt <= 0 {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+
+	_, err := s.db.ExecContext(ctx, `INSERT INTO playground_video_generations
+		(id, task_id, user_id, prompt, params, model, group_name, reference_images, status,
+			progress, preview_url, error_message, duration_ms, created_time, updated_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			task_id = excluded.task_id,
+			user_id = excluded.user_id,
+			prompt = excluded.prompt,
+			params = excluded.params,
+			model = excluded.model,
+			group_name = excluded.group_name,
+			reference_images = excluded.reference_images,
+			status = excluded.status,
+			progress = excluded.progress,
+			preview_url = excluded.preview_url,
+			error_message = excluded.error_message,
+			duration_ms = excluded.duration_ms,
+			created_time = excluded.created_time,
+			updated_time = excluded.updated_time`,
+		item.ID,
+		item.TaskID,
+		userID,
+		item.Prompt,
+		string(item.Params),
+		item.Model,
+		item.Group,
+		string(item.ReferenceImages),
+		item.Status,
+		item.Progress,
+		item.PreviewURL,
+		item.ErrorMessage,
+		item.DurationMS,
+		item.CreatedAt,
+		item.UpdatedAt,
+	)
+	if err != nil {
+		return PlaygroundVideoGeneration{}, err
+	}
+	item.UserID = userID
+	return item, nil
+}
+
 func generatePlaygroundAttachmentID() (string, error) {
 	buf := make([]byte, 18)
 	if _, err := rand.Read(buf); err != nil {
@@ -2147,6 +2328,38 @@ func scanPlaygroundImageGeneration(scanner interface {
 	return item, nil
 }
 
+func scanPlaygroundVideoGeneration(scanner interface {
+	Scan(...any) error
+}) (PlaygroundVideoGeneration, error) {
+	var item PlaygroundVideoGeneration
+	var params string
+	var referenceImages string
+	if err := scanner.Scan(
+		&item.ID,
+		&item.TaskID,
+		&item.UserID,
+		&item.Prompt,
+		&params,
+		&item.Model,
+		&item.Group,
+		&referenceImages,
+		&item.Status,
+		&item.Progress,
+		&item.PreviewURL,
+		&item.ErrorMessage,
+		&item.DurationMS,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+	); err != nil {
+		return PlaygroundVideoGeneration{}, err
+	}
+	item.Params = normalizeRawJSON(json.RawMessage(params), "{}")
+	item.ReferenceImages = normalizeRawJSON(json.RawMessage(referenceImages), "[]")
+	item.Status = normalizeVideoGenerationStatus(item.Status)
+	item.Progress = maxInt(0, minInt(item.Progress, 100))
+	return item, nil
+}
+
 func normalizeRawJSON(raw json.RawMessage, fallback string) json.RawMessage {
 	if len(raw) > 0 && json.Valid(raw) {
 		return raw
@@ -2160,6 +2373,15 @@ func normalizeImageGenerationStatus(status string) string {
 		return strings.ToLower(strings.TrimSpace(status))
 	default:
 		return "succeeded"
+	}
+}
+
+func normalizeVideoGenerationStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "queued", "running", "succeeded", "failed":
+		return strings.ToLower(strings.TrimSpace(status))
+	default:
+		return "queued"
 	}
 }
 
@@ -2186,6 +2408,13 @@ func cleanStringList(values []string, maxItems, maxLen int) []string {
 
 func minInt(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b

@@ -60,8 +60,10 @@ import {
   ImageIcon,
   MonitorIcon,
   NetworkIcon,
+  PauseIcon,
   PlayIcon,
   PlusIcon,
+  Redo2Icon,
   RotateCcwIcon,
   SaveIcon,
   SearchIcon,
@@ -70,6 +72,7 @@ import {
   StopCircleIcon,
   Table2Icon,
   Trash2Icon,
+  Undo2Icon,
   XIcon,
   ZapIcon,
   type LucideIcon,
@@ -237,8 +240,17 @@ type SavedAgentBlueprint = {
   executionLog?: AgentExecutionLogMap
 }
 
+type AgentBlueprintHistorySnapshot = {
+  title: string
+  nodes: AgentFlowNode[]
+  edges: AgentFlowEdge[]
+  executionLog: AgentExecutionLogMap
+  selectedNodeId: string
+}
+
 const DRAG_NODE_TYPE = 'application/sunapi-agent-node'
 const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
+const MAX_BLUEPRINT_HISTORY = 50
 
 const NO_SKILL_VALUE = ''
 const NO_SKILL_CHOICE: SkillChoice = {
@@ -250,7 +262,7 @@ const NO_SKILL_CHOICE: SkillChoice = {
 
 const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
   {
-    label: 'Web Research Skill',
+    label: '网页研究 Skill',
     value: 'skill.web-research',
     description: '检索、网页阅读和事实核验，适合资料收集与趋势调研。',
     source: 'built-in',
@@ -263,7 +275,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'File & Document Skill',
+    label: '文件文档 Skill',
     value: 'skill.file-document',
     description: '读取整理 Excel、CSV、PDF、Word、Markdown、HTML、TXT 等文件。',
     source: 'built-in',
@@ -276,7 +288,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'Browser Automation Skill',
+    label: '浏览器自动化 Skill',
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
@@ -289,7 +301,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'Code Interpreter Skill',
+    label: '代码解释器 Skill',
     value: 'skill.code-interpreter',
     description: '用于数据清洗、计算、图表、文件转换和可复现脚本化分析。',
     source: 'built-in',
@@ -302,7 +314,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'API & Function Skill',
+    label: 'API 函数 Skill',
     value: 'skill.api-function',
     description: '组织 HTTP/API 调用、函数参数、重试策略和结构化响应解析。',
     source: 'built-in',
@@ -315,7 +327,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'RAG & File Search Skill',
+    label: '知识检索 Skill',
     value: 'skill.rag-file-search',
     description: '知识库、文档检索、片段引用和问答总结的检索增强能力。',
     source: 'built-in',
@@ -328,7 +340,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'Database & SQL Skill',
+    label: '数据库 SQL Skill',
     value: 'skill.database-sql',
     description: '结构化数据查询、SQL 生成、指标口径和结果解释。',
     source: 'built-in',
@@ -341,7 +353,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     ],
   },
   {
-    label: 'MCP & Workflow Skill',
+    label: 'MCP 工作流 Skill',
     value: 'skill.mcp-workflow',
     description:
       '适配 MCP/GitHub/文件系统等工具编排，强调权限边界和可追踪步骤。',
@@ -862,6 +874,9 @@ export function AgentWorkspace({
   const lastSeedPromptRef = useRef<string | null>(null)
   const previewRunIdRef = useRef(0)
   const previewTimerRefs = useRef<number[]>([])
+  const undoStackRef = useRef<AgentBlueprintHistorySnapshot[]>([])
+  const redoStackRef = useRef<AgentBlueprintHistorySnapshot[]>([])
+  const [, setHistoryVersion] = useState(0)
 
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -880,6 +895,9 @@ export function AgentWorkspace({
       ),
     [blueprints, currentBlueprintId, nodes]
   )
+  const hasScheduledBlueprint = useMemo(() => hasScheduleNode(nodes), [nodes])
+  const canUndoBlueprint = undoStackRef.current.length > 0
+  const canRedoBlueprint = redoStackRef.current.length > 0
   const clearPreviewTimers = useCallback(() => {
     previewTimerRefs.current.forEach((timer) => window.clearTimeout(timer))
     previewTimerRefs.current = []
@@ -888,6 +906,53 @@ export function AgentWorkspace({
     previewRunIdRef.current += 1
     clearPreviewTimers()
   }, [clearPreviewTimers])
+  const createHistorySnapshot = useCallback(
+    (): AgentBlueprintHistorySnapshot => ({
+      title: blueprintTitle,
+      nodes,
+      edges,
+      executionLog,
+      selectedNodeId,
+    }),
+    [blueprintTitle, edges, executionLog, nodes, selectedNodeId]
+  )
+  const bumpHistoryVersion = useCallback(
+    () => setHistoryVersion((version) => version + 1),
+    []
+  )
+  const recordHistorySnapshot = useCallback(() => {
+    undoStackRef.current.push(createHistorySnapshot())
+    if (undoStackRef.current.length > MAX_BLUEPRINT_HISTORY) {
+      undoStackRef.current.shift()
+    }
+    redoStackRef.current = []
+    bumpHistoryVersion()
+  }, [bumpHistoryVersion, createHistorySnapshot])
+  const restoreHistorySnapshot = useCallback(
+    (snapshot: AgentBlueprintHistorySnapshot) => {
+      cancelPreviewRun()
+      setBlueprintTitle(snapshot.title)
+      setNodes(snapshot.nodes)
+      setEdges(snapshot.edges)
+      setExecutionLog(snapshot.executionLog)
+      setSelectedNodeId(snapshot.selectedNodeId)
+    },
+    [cancelPreviewRun]
+  )
+  const handleUndoBlueprint = useCallback(() => {
+    const snapshot = undoStackRef.current.pop()
+    if (!snapshot) return
+    redoStackRef.current.push(createHistorySnapshot())
+    restoreHistorySnapshot(snapshot)
+    bumpHistoryVersion()
+  }, [bumpHistoryVersion, createHistorySnapshot, restoreHistorySnapshot])
+  const handleRedoBlueprint = useCallback(() => {
+    const snapshot = redoStackRef.current.pop()
+    if (!snapshot) return
+    undoStackRef.current.push(createHistorySnapshot())
+    restoreHistorySnapshot(snapshot)
+    bumpHistoryVersion()
+  }, [bumpHistoryVersion, createHistorySnapshot, restoreHistorySnapshot])
   const persistCurrentBlueprintSnapshot = useCallback(
     (
       nextNodes: AgentFlowNode[],
@@ -926,42 +991,60 @@ export function AgentWorkspace({
     }
   }, [cancelPreviewRun])
 
-  const onNodesChange = useCallback((changes: NodeChange<AgentFlowNode>[]) => {
-    const removedIds = new Set(
-      changes
-        .filter((change) => change.type === 'remove')
-        .map((change) => change.id)
-    )
-    setNodes((current) => applyNodeChanges(changes, current))
-    if (removedIds.size > 0) {
-      setEdges((current) =>
-        current.filter(
-          (edge) => !removedIds.has(edge.source) && !removedIds.has(edge.target)
-        )
+  const onNodesChange = useCallback(
+    (changes: NodeChange<AgentFlowNode>[]) => {
+      const removedIds = new Set(
+        changes
+          .filter((change) => change.type === 'remove')
+          .map((change) => change.id)
       )
-      setExecutionLog((current) => {
-        const next = { ...current }
-        removedIds.forEach((id) => {
-          delete next[id]
+      if (removedIds.size > 0) {
+        recordHistorySnapshot()
+      }
+      setNodes((current) => applyNodeChanges(changes, current))
+      if (removedIds.size > 0) {
+        setEdges((current) =>
+          current.filter(
+            (edge) =>
+              !removedIds.has(edge.source) && !removedIds.has(edge.target)
+          )
+        )
+        setExecutionLog((current) => {
+          const next = { ...current }
+          removedIds.forEach((id) => {
+            delete next[id]
+          })
+          return next
         })
-        return next
-      })
-      setSelectedNodeId((current) => (removedIds.has(current) ? '' : current))
-    }
-  }, [])
+        setSelectedNodeId((current) => (removedIds.has(current) ? '' : current))
+      }
+    },
+    [recordHistorySnapshot]
+  )
 
-  const onEdgesChange = useCallback((changes: EdgeChange<AgentFlowEdge>[]) => {
-    setEdges((current) => applyEdgeChanges(changes, current))
-  }, [])
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange<AgentFlowEdge>[]) => {
+      if (changes.some((change) => change.type === 'remove')) {
+        recordHistorySnapshot()
+      }
+      setEdges((current) => applyEdgeChanges(changes, current))
+    },
+    [recordHistorySnapshot]
+  )
 
-  const onConnect = useCallback((connection: Connection) => {
-    setEdges((current) =>
-      addEdge(decorateEdge({ ...connection, id: `e-${Date.now()}` }), current)
-    )
-  }, [])
+  const onConnect = useCallback(
+    (connection: Connection) => {
+      recordHistorySnapshot()
+      setEdges((current) =>
+        addEdge(decorateEdge({ ...connection, id: `e-${Date.now()}` }), current)
+      )
+    },
+    [recordHistorySnapshot]
+  )
 
   const handleDeleteNode = useCallback(
     (nodeId: string) => {
+      recordHistorySnapshot()
       const fallbackNodeId = nodes.find((node) => node.id !== nodeId)?.id ?? ''
       setNodes((current) => current.filter((node) => node.id !== nodeId))
       setEdges((current) =>
@@ -979,23 +1062,31 @@ export function AgentWorkspace({
         current === nodeId ? fallbackNodeId : current
       )
     },
-    [nodes]
+    [nodes, recordHistorySnapshot]
   )
 
-  const handleDeleteEdge = useCallback((edgeId: string) => {
-    setEdges((current) => current.filter((edge) => edge.id !== edgeId))
-  }, [])
+  const handleDeleteEdge = useCallback(
+    (edgeId: string) => {
+      recordHistorySnapshot()
+      setEdges((current) => current.filter((edge) => edge.id !== edgeId))
+    },
+    [recordHistorySnapshot]
+  )
 
   const handleReset = useCallback(() => {
     cancelPreviewRun()
-    setNodes(createInitialNodes(templates))
-    setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
+    recordHistorySnapshot()
+    setNodes([])
+    setEdges([])
     setExecutionLog({})
-    setSelectedNodeId('browser')
-  }, [cancelPreviewRun, templates])
+    setSelectedNodeId('')
+  }, [cancelPreviewRun, recordHistorySnapshot])
 
   const handleNewBlueprint = useCallback(() => {
     cancelPreviewRun()
+    undoStackRef.current = []
+    redoStackRef.current = []
+    bumpHistoryVersion()
     setBlueprintTitle('新的智能体蓝图')
     setCurrentBlueprintId(null)
     setLastSavedAt(null)
@@ -1003,7 +1094,7 @@ export function AgentWorkspace({
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
     setExecutionLog({})
     setSelectedNodeId('browser')
-  }, [cancelPreviewRun, templates])
+  }, [bumpHistoryVersion, cancelPreviewRun, templates])
 
   const handleSaveBlueprint = useCallback(() => {
     const now = Date.now()
@@ -1048,6 +1139,9 @@ export function AgentWorkspace({
         blueprint.status
       )
       cancelPreviewRun()
+      undoStackRef.current = []
+      redoStackRef.current = []
+      bumpHistoryVersion()
       setCurrentBlueprintId(blueprint.id)
       setBlueprintTitle(blueprint.title)
       setLastSavedAt(blueprint.updatedAt)
@@ -1056,7 +1150,7 @@ export function AgentWorkspace({
       setExecutionLog(blueprint.executionLog ?? {})
       setSelectedNodeId(normalizedNodes[0]?.id ?? '')
     },
-    [cancelPreviewRun]
+    [bumpHistoryVersion, cancelPreviewRun]
   )
 
   const handleDeleteBlueprint = useCallback(
@@ -1305,6 +1399,7 @@ export function AgentWorkspace({
     (kind: AgentNodeKind, position?: { x: number; y: number }) => {
       const template = templateByKind.get(kind)
       if (!template) return
+      recordHistorySnapshot()
       addCounterRef.current += 1
       const id = `${kind}-${Date.now()}-${addCounterRef.current}`
       const node = createNodeFromTemplate(template, id, {
@@ -1314,12 +1409,13 @@ export function AgentWorkspace({
       setNodes((current) => [...current, node])
       setSelectedNodeId(id)
     },
-    [templateByKind]
+    [recordHistorySnapshot, templateByKind]
   )
 
   const handleUpdateNode = useCallback(
     (patch: Partial<AgentNodeData>) => {
       if (!selectedNode) return
+      recordHistorySnapshot()
       setNodes((current) =>
         current.map((node) =>
           node.id === selectedNode.id
@@ -1328,12 +1424,13 @@ export function AgentWorkspace({
         )
       )
     },
-    [selectedNode]
+    [recordHistorySnapshot, selectedNode]
   )
 
   const handleUpdateSetting = useCallback(
     (key: string, value: string) => {
       if (!selectedNodeId) return
+      recordHistorySnapshot()
       setNodes((current) =>
         current.map((node) =>
           node.id === selectedNodeId
@@ -1342,16 +1439,28 @@ export function AgentWorkspace({
         )
       )
     },
-    [selectedNodeId]
+    [recordHistorySnapshot, selectedNodeId]
   )
 
-  const handleSetNodeSkill = useCallback((nodeId: string, skill: string) => {
-    setNodes((current) =>
-      current.map((node) =>
-        node.id === nodeId ? { ...node, data: { ...node.data, skill } } : node
+  const handleSetNodeSkill = useCallback(
+    (nodeId: string, skill: string) => {
+      recordHistorySnapshot()
+      setNodes((current) =>
+        current.map((node) =>
+          node.id === nodeId ? { ...node, data: { ...node.data, skill } } : node
+        )
       )
-    )
-  }, [])
+    },
+    [recordHistorySnapshot]
+  )
+
+  const handleTitleChange = useCallback(
+    (title: string) => {
+      recordHistorySnapshot()
+      setBlueprintTitle(title)
+    },
+    [recordHistorySnapshot]
+  )
 
   useEffect(() => {
     if (!seedPrompt || seedPrompt === lastSeedPromptRef.current) return
@@ -1426,6 +1535,8 @@ export function AgentWorkspace({
     <ReactFlowProvider>
       <BlueprintWorkspace
         blueprintTitle={blueprintTitle}
+        canRedo={canRedoBlueprint}
+        canUndo={canUndoBlueprint}
         currentBlueprintStatus={currentBlueprintStatus}
         currentGroup={currentGroup}
         edges={edges}
@@ -1445,6 +1556,7 @@ export function AgentWorkspace({
         onDeleteSkill={handleDeleteSkill}
         onEdgesChange={onEdgesChange}
         onNodesChange={onNodesChange}
+        onRedo={handleRedoBlueprint}
         onReset={handleReset}
         onRunPreview={handleRunPreview}
         onStopPreview={handleStopPreview}
@@ -1452,11 +1564,13 @@ export function AgentWorkspace({
         onSearchChange={setSearch}
         onSelectNode={setSelectedNodeId}
         onSetNodeSkill={handleSetNodeSkill}
-        onTitleChange={setBlueprintTitle}
+        onTitleChange={handleTitleChange}
+        onUndo={handleUndoBlueprint}
         onUpdateNode={handleUpdateNode}
         onUpdateSetting={handleUpdateSetting}
         search={search}
         selectedNode={selectedNode}
+        hasScheduledBlueprint={hasScheduledBlueprint}
       />
     </ReactFlowProvider>
   )
@@ -1473,8 +1587,11 @@ type BlueprintWorkspaceProps = {
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
   blueprintTitle: string
+  canRedo: boolean
+  canUndo: boolean
   currentBlueprintStatus: AgentBlueprintStatus
   currentGroup?: string
+  hasScheduledBlueprint: boolean
   lastSavedAt: number | null
   search: string
   onSearchChange: (value: string) => void
@@ -1492,9 +1609,11 @@ type BlueprintWorkspaceProps = {
   onAddSkill: (skill: SkillChoice) => void
   onDeleteSkill: (skillValue: string) => void
   onSetNodeSkill: (nodeId: string, skill: string) => void
+  onRedo: () => void
   onReset: () => void
   onRunPreview: () => void
   onStopPreview: () => void
+  onUndo: () => void
 }
 
 function BlueprintWorkspace({
@@ -1508,8 +1627,11 @@ function BlueprintWorkspace({
   skillChoices,
   managedSkills,
   blueprintTitle,
+  canRedo,
+  canUndo,
   currentBlueprintStatus,
   currentGroup,
+  hasScheduledBlueprint,
   lastSavedAt,
   search,
   onSearchChange,
@@ -1527,9 +1649,11 @@ function BlueprintWorkspace({
   onAddSkill,
   onDeleteSkill,
   onSetNodeSkill,
+  onRedo,
   onReset,
   onRunPreview,
   onStopPreview,
+  onUndo,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
   const filteredGroups = useMemo(() => filterPaletteGroups(search), [search])
@@ -1639,6 +1763,28 @@ function BlueprintWorkspace({
                 size='sm'
                 variant='ghost'
                 className='h-8 gap-1.5 rounded-[6px] px-2'
+                disabled={!canUndo}
+                onClick={onUndo}
+              >
+                <Undo2Icon className='size-3.5' />
+                前一步
+              </Button>
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                className='h-8 gap-1.5 rounded-[6px] px-2'
+                disabled={!canRedo}
+                onClick={onRedo}
+              >
+                <Redo2Icon className='size-3.5' />
+                后一步
+              </Button>
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                className='h-8 gap-1.5 rounded-[6px] px-2'
                 onClick={onSaveBlueprint}
               >
                 <SaveIcon className='size-3.5' />
@@ -1652,8 +1798,12 @@ function BlueprintWorkspace({
                   className='h-8 gap-1.5 rounded-[6px] px-2'
                   onClick={onStopPreview}
                 >
-                  <StopCircleIcon className='size-3.5' />
-                  停止
+                  {hasScheduledBlueprint ? (
+                    <PauseIcon className='size-3.5' />
+                  ) : (
+                    <StopCircleIcon className='size-3.5' />
+                  )}
+                  {hasScheduledBlueprint ? '暂停' : '停止'}
                 </Button>
               ) : (
                 <Button
@@ -4967,11 +5117,11 @@ function SkillManagerPanel({
               return (
                 <div
                   key={skill.value}
-                  className='hover:bg-accent/50 group flex items-center gap-2.5 rounded-[8px] px-2 py-2 transition-colors'
+                  className='hover:bg-accent/50 group flex items-start gap-2.5 rounded-[8px] px-2 py-2 transition-colors'
                 >
                   <div
                     className={cn(
-                      'flex size-7 shrink-0 items-center justify-center rounded-[7px]',
+                      'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-[7px]',
                       accent
                     )}
                   >
@@ -5192,6 +5342,7 @@ function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
 
 function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
   if (nodes.some((node) => node.data.status === 'running')) return 'running'
+  if (hasScheduleNode(nodes)) return 'running'
   if (nodes.length > 0 && nodes.every((node) => node.data.status === 'done')) {
     return 'ended'
   }
@@ -5218,6 +5369,7 @@ function normalizeSavedBlueprintStatus(
   savedStatus?: AgentBlueprintStatus
 ): AgentBlueprintStatus {
   if (savedStatus === 'paused') return 'paused'
+  if (hasScheduleNode(nodes)) return 'running'
   if (
     savedStatus === 'running' &&
     nodes.some((node) => node.data.status === 'running')
@@ -5228,7 +5380,7 @@ function normalizeSavedBlueprintStatus(
     savedStatus === 'ended' &&
     nodes.some((node) => node.data.kind === 'schedule')
   ) {
-    return 'pending'
+    return 'running'
   }
   return savedStatus ?? getBlueprintStatus(nodes)
 }
@@ -5239,7 +5391,12 @@ function getCurrentBlueprintStatus(
 ): AgentBlueprintStatus {
   if (nodes.some((node) => node.data.status === 'running')) return 'running'
   if (savedStatus === 'paused') return 'paused'
+  if (hasScheduleNode(nodes)) return 'running'
   return getBlueprintStatus(nodes)
+}
+
+function hasScheduleNode(nodes: AgentFlowNode[]) {
+  return nodes.some((node) => node.data.kind === 'schedule')
 }
 
 function getRunPreviewButtonLabel(status: AgentBlueprintStatus) {

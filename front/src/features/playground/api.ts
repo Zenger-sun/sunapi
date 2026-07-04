@@ -29,6 +29,7 @@ import type {
   PlaygroundAttachment,
   PlaygroundSession,
   PlaygroundSessionPayload,
+  VideoGenerationItem,
   VideoGenerationParams,
 } from './types'
 
@@ -663,4 +664,29 @@ export async function fetchVideoTask(
     skipErrorHandler: true,
   })
   return normalizeVideoTaskResponse(res.data)
+}
+
+export async function saveVideoHistoryItem(
+  item: VideoGenerationItem
+): Promise<VideoGenerationItem> {
+  const res = await api.post(
+    API_ENDPOINTS.PLAYGROUND_VIDEO_HISTORY,
+    {
+      id: item.id,
+      taskId: item.taskId,
+      prompt: item.prompt,
+      params: item.params,
+      model: item.model,
+      group: item.group,
+      referenceImages: item.referenceImages ?? [],
+      status: item.status,
+      progress: item.progress ?? 0,
+      previewUrl: item.previewUrl,
+      errorMessage: item.errorMessage,
+      durationMs: item.durationMs,
+      createdAt: item.createdAt,
+    },
+    { skipErrorHandler: true }
+  )
+  return res.data.data as VideoGenerationItem
 }

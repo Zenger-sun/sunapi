@@ -372,7 +372,9 @@ export function UsageLogsMobileList<TData>({
             )}
           >
             {logCategory === 'common' && <CommonLogsCard cells={cells} />}
-            {logCategory === 'task' && <TaskLogsCard cells={cells} />}
+            {(logCategory === 'task' || logCategory === 'video') && (
+              <TaskLogsCard cells={cells} />
+            )}
             {logCategory === 'drawing' && <DrawingLogsCard cells={cells} />}
           </div>
         )

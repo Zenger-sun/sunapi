@@ -301,7 +301,7 @@ var builtinAgentSkillOrder = []string{
 
 var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 	"skill.web-research": {
-		Label:        "Web Research Skill",
+		Label:        "网页研究 Skill",
 		Description:  "面向检索、网页阅读和事实核验的通用研究能力，适合多数资料收集任务。",
 		Capabilities: []string{"关键词规划", "来源交叉验证", "引用摘要"},
 		Instructions: []string{
@@ -311,7 +311,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.file-document": {
-		Label:        "File & Document Skill",
+		Label:        "文件文档 Skill",
 		Description:  "读取和整理 Excel、CSV、PDF、Word、Markdown、HTML、TXT 等常见文件。",
 		Capabilities: []string{"多格式解析", "模板遵循", "结构保真"},
 		Instructions: []string{
@@ -321,7 +321,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.browser-automation": {
-		Label:        "Browser Automation Skill",
+		Label:        "浏览器自动化 Skill",
 		Description:  "面向登录态页面、表单、动态网页和截图证据的浏览器自动化能力。",
 		Capabilities: []string{"页面导航", "DOM 抽取", "操作安全"},
 		Instructions: []string{
@@ -331,7 +331,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.code-interpreter": {
-		Label:        "Code Interpreter Skill",
+		Label:        "代码解释器 Skill",
 		Description:  "用于数据清洗、计算、图表、文件转换和可复现脚本化分析。",
 		Capabilities: []string{"数据清洗", "计算分析", "文件生成"},
 		Instructions: []string{
@@ -341,7 +341,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.api-function": {
-		Label:        "API & Function Skill",
+		Label:        "API 函数 Skill",
 		Description:  "组织 HTTP/API 调用、函数参数、重试策略和结构化响应解析。",
 		Capabilities: []string{"参数校验", "JSON 解析", "错误恢复"},
 		Instructions: []string{
@@ -351,7 +351,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.rag-file-search": {
-		Label:        "RAG & File Search Skill",
+		Label:        "知识检索 Skill",
 		Description:  "面向知识库、文档检索、片段引用和问答总结的常用检索增强能力。",
 		Capabilities: []string{"语义检索", "片段引用", "答案合成"},
 		Instructions: []string{
@@ -361,7 +361,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.database-sql": {
-		Label:        "Database & SQL Skill",
+		Label:        "数据库 SQL Skill",
 		Description:  "面向结构化数据查询、SQL 生成、指标口径和结果解释的能力。",
 		Capabilities: []string{"Schema 理解", "SQL 生成", "结果校验"},
 		Instructions: []string{
@@ -371,7 +371,7 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 		},
 	},
 	"skill.mcp-workflow": {
-		Label:        "MCP & Workflow Skill",
+		Label:        "MCP 工作流 Skill",
 		Description:  "适配 MCP/GitHub/文件系统等外部工具编排，强调权限边界和可追踪步骤。",
 		Capabilities: []string{"工具选择", "权限边界", "步骤追踪"},
 		Instructions: []string{

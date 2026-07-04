@@ -162,7 +162,13 @@ function normalizeBlueprintStatus(
       (node as StoredAgentNode).data?.kind === 'schedule'
   )
 
-  if (status === 'pending' || status === 'running' || status === 'paused') {
+  if (status === 'paused') {
+    return 'paused'
+  }
+  if (hasScheduleNode) {
+    return 'running'
+  }
+  if (status === 'pending' || status === 'running') {
     return status
   }
 
@@ -178,13 +184,13 @@ function normalizeBlueprintStatus(
     return 'running'
   }
   if (status === 'ended') {
-    return hasScheduleNode ? 'pending' : 'ended'
+    return hasScheduleNode ? 'running' : 'ended'
   }
   if (
     nodeStatuses.length > 0 &&
     nodeStatuses.every((nodeStatus) => nodeStatus === 'done')
   ) {
-    return hasScheduleNode ? 'pending' : 'ended'
+    return hasScheduleNode ? 'running' : 'ended'
   }
   return 'pending'
 }

@@ -69,6 +69,7 @@ import {
 } from '@/components/ai-elements/prompt-input'
 import {
   fetchVideoTask,
+  saveVideoHistoryItem,
   submitVideoTask,
   uploadPlaygroundAttachment,
 } from '../api'
@@ -263,6 +264,11 @@ export function VideoWorkspace({
     setSubmittingCount((count) => count + 1)
     return true
   }
+  const persistVideoItem = useCallback((item: VideoGenerationItem) => {
+    void saveVideoHistoryItem(item).catch(() => {
+      // 历史写入失败不应中断前台生成流程。
+    })
+  }, [])
 
   useEffect(() => {
     onGeneratingChange?.(activeTaskCount > 0)
@@ -283,37 +289,34 @@ export function VideoWorkspace({
           `/openai/v1/videos/${taskId}/content`
 
         setItems((prev) =>
-          prev.map((item) =>
-            item.id === localId
-              ? {
-                  ...item,
-                  status: nextStatus,
-                  progress:
-                    nextStatus === 'succeeded'
-                      ? 100
-                      : (progress ?? item.progress),
-                  previewUrl:
-                    nextStatus === 'succeeded'
-                      ? previewUrl
-                      : previewUrl || item.previewUrl,
-                  errorMessage:
-                    nextStatus === 'failed'
-                      ? result.error?.message || t('Video generation failed')
-                      : item.errorMessage,
-                  durationMs:
-                    nextStatus === 'succeeded' || nextStatus === 'failed'
-                      ? Math.max(0, Date.now() - startedAt)
-                      : item.durationMs,
-                  updatedAt: Date.now(),
-                }
-              : item
-          )
+          prev.map((item) => {
+            if (item.id !== localId) return item
+            const nextItem: VideoGenerationItem = {
+              ...item,
+              status: nextStatus,
+              progress:
+                nextStatus === 'succeeded' ? 100 : (progress ?? item.progress),
+              previewUrl:
+                nextStatus === 'succeeded' ? previewUrl : previewUrl || item.previewUrl,
+              errorMessage:
+                nextStatus === 'failed'
+                  ? result.error?.message || t('Video generation failed')
+                  : item.errorMessage,
+              durationMs:
+                nextStatus === 'succeeded' || nextStatus === 'failed'
+                  ? Math.max(0, Date.now() - startedAt)
+                  : item.durationMs,
+              updatedAt: Date.now(),
+            }
+            persistVideoItem(nextItem)
+            return nextItem
+          })
         )
       } catch {
         // Keep polling. Short network hiccups should not mark a long render failed.
       }
     },
-    [t]
+    [persistVideoItem, t]
   )
 
   useEffect(() => {
@@ -366,27 +369,44 @@ export function VideoWorkspace({
         response.result_url ||
         response.content_url ||
         response.video?.url
+      const progress =
+        nextStatus === 'succeeded'
+          ? 100
+          : (clampProgress(response.progress) ?? 0)
+      const updatedItem: Partial<VideoGenerationItem> = {
+        taskId,
+        status: nextStatus,
+        progress,
+        previewUrl:
+          nextStatus === 'succeeded'
+            ? previewUrl || `/openai/v1/videos/${taskId}/content`
+            : previewUrl,
+        durationMs:
+          nextStatus === 'succeeded' || nextStatus === 'failed'
+            ? Math.max(0, Date.now() - createdAt)
+            : undefined,
+        updatedAt: Date.now(),
+      }
+      persistVideoItem({
+        id: itemId,
+        prompt: text,
+        params: generationParams,
+        model: targetModel,
+        group: targetGroup,
+        referenceImages,
+        createdAt,
+        ...updatedItem,
+      } as VideoGenerationItem)
 
       setItems((prev) =>
         prev.map((item) =>
           item.id === itemId
             ? {
                 ...item,
-                taskId,
-                status: nextStatus,
-                progress:
-                  nextStatus === 'succeeded'
-                    ? 100
-                    : (clampProgress(response.progress) ?? item.progress),
-                previewUrl:
-                  nextStatus === 'succeeded'
-                    ? previewUrl || `/openai/v1/videos/${taskId}/content`
-                    : previewUrl || item.previewUrl,
-                durationMs:
-                  nextStatus === 'succeeded' || nextStatus === 'failed'
-                    ? Math.max(0, Date.now() - createdAt)
-                    : item.durationMs,
-                updatedAt: Date.now(),
+                ...updatedItem,
+                progress: updatedItem.progress ?? item.progress,
+                previewUrl: updatedItem.previewUrl || item.previewUrl,
+                durationMs: updatedItem.durationMs ?? item.durationMs,
               }
             : item
         )
@@ -397,6 +417,20 @@ export function VideoWorkspace({
       }
     } catch (error) {
       const message = getVideoErrorMessage(error, t('Video generation failed'))
+      persistVideoItem({
+        id: itemId,
+        prompt: text,
+        params: generationParams,
+        model: targetModel,
+        group: targetGroup,
+        referenceImages,
+        status: 'failed',
+        progress: 0,
+        errorMessage: message,
+        durationMs: Math.max(0, Date.now() - createdAt),
+        createdAt,
+        updatedAt: Date.now(),
+      })
       setItems((prev) =>
         prev.map((item) =>
           item.id === itemId
@@ -485,6 +519,7 @@ export function VideoWorkspace({
         createdAt,
         updatedAt: createdAt,
       }
+      persistVideoItem(newItem)
       setItems((prev) => [newItem, ...prev])
       setSelectedId(itemId)
       slotTransferredToTask = true
