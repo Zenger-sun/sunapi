@@ -2,6 +2,7 @@ package sunapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 const (
 	agentBrowserProfileDir       = "agent-browser-profile"
 	agentBrowserPortFile         = "agent-browser-devtools-port"
+	agentBrowserCaptureDir       = "agent-browser-captures"
 	agentBrowserCaptureMaxRunes  = 200000
 	agentBrowserCaptureMaxWait   = 30
 	agentBrowserCaptureMinWait   = 1
@@ -36,12 +38,14 @@ type AgentBrowserCaptureRequest struct {
 }
 
 type AgentBrowserCaptureResult struct {
-	URL        string `json:"url"`
-	FinalURL   string `json:"final_url"`
-	Title      string `json:"title"`
-	Text       string `json:"text"`
-	CapturedAt int64  `json:"captured_at"`
-	ElapsedMS  int64  `json:"elapsed_ms"`
+	URL             string `json:"url"`
+	FinalURL        string `json:"final_url"`
+	Title           string `json:"title"`
+	Text            string `json:"text"`
+	ScreenshotPath  string `json:"screenshot_path,omitempty"`
+	ScreenshotError string `json:"screenshot_error,omitempty"`
+	CapturedAt      int64  `json:"captured_at"`
+	ElapsedMS       int64  `json:"elapsed_ms"`
 }
 
 type agentBrowserTarget struct {
@@ -125,13 +129,30 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		return AgentBrowserCaptureResult{}, errors.New("浏览器已打开页面，但页面正文为空；请确认页面已登录并完成加载")
 	}
 
+	capturedAt := time.Now()
+	finalURL := strings.TrimSpace(payload.URL)
+	if finalURL == "" {
+		finalURL = targetURL
+	}
+	screenshotPath := ""
+	screenshotError := ""
+	if screenshotData, err := captureAgentBrowserScreenshot(ctx, conn, 5); err != nil {
+		screenshotError = err.Error()
+	} else if path, err := writeAgentBrowserScreenshot(dataDir, finalURL, capturedAt, screenshotData); err != nil {
+		screenshotError = err.Error()
+	} else {
+		screenshotPath = path
+	}
+
 	return AgentBrowserCaptureResult{
-		URL:        targetURL,
-		FinalURL:   payload.URL,
-		Title:      payload.Title,
-		Text:       text,
-		CapturedAt: time.Now().Unix(),
-		ElapsedMS:  time.Since(started).Milliseconds(),
+		URL:             targetURL,
+		FinalURL:        finalURL,
+		Title:           payload.Title,
+		Text:            text,
+		ScreenshotPath:  screenshotPath,
+		ScreenshotError: screenshotError,
+		CapturedAt:      capturedAt.Unix(),
+		ElapsedMS:       time.Since(started).Milliseconds(),
 	}, nil
 }
 
@@ -413,6 +434,87 @@ func evaluateAgentBrowserText(ctx context.Context, conn *websocket.Conn, id int)
 		return agentBrowserTextPayload{}, err
 	}
 	return payload, nil
+}
+
+func captureAgentBrowserScreenshot(ctx context.Context, conn *websocket.Conn, id int) (string, error) {
+	raw, err := agentBrowserCDPCall(ctx, conn, id, "Page.captureScreenshot", map[string]any{
+		"format":                "png",
+		"fromSurface":           true,
+		"captureBeyondViewport": true,
+	})
+	if err != nil {
+		raw, err = agentBrowserCDPCall(ctx, conn, id+1, "Page.captureScreenshot", map[string]any{
+			"format":      "png",
+			"fromSurface": true,
+		})
+	}
+	if err != nil {
+		return "", err
+	}
+	var response struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(response.Data) == "" {
+		return "", errors.New("浏览器未返回截图数据")
+	}
+	return response.Data, nil
+}
+
+func writeAgentBrowserScreenshot(dataDir, targetURL string, capturedAt time.Time, encoded string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded))
+	if err != nil {
+		return "", fmt.Errorf("解析浏览器截图失败: %w", err)
+	}
+	if len(data) == 0 {
+		return "", errors.New("浏览器截图为空")
+	}
+	host := "page"
+	if parsed, err := url.Parse(targetURL); err == nil && strings.TrimSpace(parsed.Hostname()) != "" {
+		host = parsed.Hostname()
+	}
+	filename := fmt.Sprintf(
+		"%s-%s.png",
+		sanitizeAgentBrowserFilenamePart(host),
+		capturedAt.UTC().Format("20060102-150405-000000000"),
+	)
+	relPath := filepath.Join(agentBrowserCaptureDir, filename)
+	absPath := filepath.Join(dataDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(absPath, data, 0644); err != nil {
+		return "", err
+	}
+	return "data/" + filepath.ToSlash(relPath), nil
+}
+
+func sanitizeAgentBrowserFilenamePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if valid {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	result := strings.Trim(builder.String(), "-")
+	if len(result) > 60 {
+		result = strings.Trim(result[:60], "-")
+	}
+	if result == "" {
+		return "page"
+	}
+	return result
 }
 
 func normalizeAgentBrowserWaitSeconds(value int) int {

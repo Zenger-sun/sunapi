@@ -1,0 +1,73 @@
+package sunapi
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+)
+
+func TestPrepareAndCreateCustomComponentPersistsModelSkillTags(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	prepared, config, err := prepareComponentForm(ComponentFormData{
+		Name:        "库存分支循环",
+		Description: "按条件分支循环处理库存数据，去重排序后输出异常商品。",
+		Group:       "process",
+		ModelGroup:  "ops",
+		ModelName:   "gpt-4.1-mini",
+		Skill:       "skill.mcp-workflow",
+		Inputs:      []string{"库存数据"},
+		Outputs:     []string{"异常商品"},
+		Settings:    json.RawMessage(`{"条件":"stock<3","排序字段":"stock"}`),
+		Tags:        []string{"inventory"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	component, err := store.CreateComponent(context.Background(), 1, prepared, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if component.Source != "custom" || component.Kind != "custom" || component.Group != "process" {
+		t.Fatalf("unexpected component routing fields: %#v", component)
+	}
+
+	var cfg componentConfigPayload
+	if err := json.Unmarshal(component.Config, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelGroup != "ops" || cfg.ModelName != "gpt-4.1-mini" {
+		t.Fatalf("model config missing: %#v", cfg)
+	}
+	if cfg.Skill != "skill.mcp-workflow" {
+		t.Fatalf("skill=%q want skill.mcp-workflow", cfg.Skill)
+	}
+	if cfg.Settings["条件"] != "stock<3" || cfg.Settings["排序字段"] != "stock" {
+		t.Fatalf("settings not persisted: %#v", cfg.Settings)
+	}
+	for _, tag := range []string{"custom-component", "inventory", "workflow", "dedupe", "sort"} {
+		if !stringSliceContains(cfg.Tags, tag) {
+			t.Fatalf("expected tag %q in %#v", tag, cfg.Tags)
+		}
+	}
+	for _, capability := range []string{"流程控制", "集合处理", "数据处理"} {
+		if !stringSliceContains(cfg.Capabilities, capability) {
+			t.Fatalf("expected capability %q in %#v", capability, cfg.Capabilities)
+		}
+	}
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}

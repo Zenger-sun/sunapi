@@ -28,9 +28,14 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.browser", "浏览器取数", "打开当前设备浏览器页面，读取登录态下的后台数据。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "任务描述"}, []string{"页面数据", "截图证据"}, map[string]string{"网址": "https://www.goofish.com/", "登录态": "使用当前设备浏览器", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "data"}),
 	builtinComponent("component.request", "网页请求", "发起 HTTP 请求，获取接口或页面的结构化原始数据。", "request", "collect", "gpt-4.1-mini", "skill.api-function", []string{"任务描述"}, []string{"JSON 数据", "请求日志"}, map[string]string{"网址": "https://example.com/api", "方法": "GET", "超时": "30s", "重试": "1 次"}, []string{"http", "api"}),
 	builtinComponent("component.webhook", "Webhook 触发", "接收外部系统回调并把请求体作为蓝图输入。", "custom", "trigger", "system.runner", "skill.api-function", []string{"Webhook 请求"}, []string{"请求体", "请求头"}, map[string]string{"路径": "/api/agent-webhooks/{blueprint_id}", "方法": "POST", "鉴权": "可选密钥", "密钥": ""}, []string{"webhook", "trigger"}),
+	builtinComponent("component.branch", "条件分支", "根据上游数据和条件表达式输出是/否分支结果。", "custom", "process", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "条件"}, []string{"分支结果", "命中数据"}, map[string]string{"条件": "status=ok", "真分支": "通过", "假分支": "未通过"}, []string{"branch", "condition", "control"}),
+	builtinComponent("component.wait", "等待延迟", "按配置等待一段时间后继续传递上游数据。", "custom", "process", "system.runner", "skill.mcp-workflow", []string{"上游数据"}, []string{"等待结果", "上游数据"}, map[string]string{"等待时间": "5s", "最大等待": "60s"}, []string{"wait", "delay", "control"}),
+	builtinComponent("component.loop", "列表循环", "把上游数组、表格或对象展开为可迭代条目。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"列表数据"}, []string{"迭代条目", "条目数量"}, map[string]string{"最大条目": "100", "输出字段": "items"}, []string{"loop", "iteration", "data"}),
 	builtinComponent("component.filter", "条件过滤", "按字段、表达式或状态筛选上游数据。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"上游数据", "过滤条件"}, []string{"命中数据", "过滤日志"}, map[string]string{"条件": "字段存在", "未命中处理": "跳过"}, []string{"filter", "data"}),
 	builtinComponent("component.merge", "合并数据", "把多个上游分支按索引、字段或追加方式合并。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"数据 A", "数据 B"}, []string{"合并数据", "冲突记录"}, map[string]string{"合并方式": "按字段", "冲突处理": "保留最新"}, []string{"merge", "data"}),
+	builtinComponent("component.dedupe_sort", "去重排序", "按字段对上游行数据去重、排序和限制数量。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"行数据"}, []string{"处理后数据", "处理日志"}, map[string]string{"去重字段": "id", "排序字段": "updated_at", "排序方向": "降序", "限制": "100"}, []string{"dedupe", "sort", "data"}),
 	builtinComponent("component.code", "代码处理", "用脚本完成数据清洗、计算、转换和可复现处理。", "transform", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"原始数据", "处理规则"}, []string{"处理结果", "运行日志"}, map[string]string{"数据类型": "自动识别", "输出格式": "JSON 数组", "脚本": "select *\nlimit 100"}, []string{"code", "transform"}),
+	builtinComponent("component.database", "数据库查询", "对 SQLite 数据库执行只读 SQL 查询并输出结构化结果。", "custom", "collect", "gpt-4.1-mini", "skill.database-sql", []string{"SQL"}, []string{"查询结果", "查询日志"}, map[string]string{"数据库": "当前 SunAPI 数据库", "SQL": "select name from sqlite_master where type='table' order by name", "限制": "100"}, []string{"database", "sql", "data"}),
 	builtinComponent("component.file", "读写文件", "读取或生成 Excel、CSV、Markdown、HTML、TXT 等文件。", "custom", "process", "gpt-4.1-mini", "skill.file-document", []string{"文件路径", "文件内容"}, []string{"文件内容", "保存路径"}, map[string]string{"模式": "读取", "格式": "自动识别"}, []string{"file", "document"}),
 	builtinComponent("component.image", "生成图片", "根据数据和提示词生成封面图、趋势图或运营图片。", "image", "process", "gpt-image-1", "skill.code-interpreter", []string{"提示词", "参考图"}, []string{"图片 URL"}, map[string]string{"尺寸": "16:9", "风格": "清爽数据看板", "数量": "1"}, []string{"image"}),
 	builtinComponent("component.report", "生成日报", "按上游数据、当前描述和模板生成日报文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 日报", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 日报、CSV 表格"}, []string{"report", "document"}),
@@ -149,6 +154,8 @@ func inferComponentTags(description string) []string {
 		"合并": "merge", "代码": "code", "脚本": "code", "文件": "file", "excel": "spreadsheet",
 		"csv": "spreadsheet", "图片": "image", "报告": "report", "日报": "report",
 		"通知": "notification", "数据库": "database", "sql": "database",
+		"流程": "workflow", "分支": "workflow", "循环": "workflow", "等待": "workflow",
+		"去重": "dedupe", "排序": "sort",
 	}
 	for keyword, tag := range keywords {
 		if strings.Contains(lower, strings.ToLower(keyword)) {
@@ -175,6 +182,12 @@ func inferComponentCapabilities(description string) []string {
 	}
 	if strings.Contains(lower, "通知") || strings.Contains(lower, "webhook") {
 		caps = append(caps, "结果投递")
+	}
+	if strings.Contains(lower, "流程") || strings.Contains(lower, "分支") || strings.Contains(lower, "循环") || strings.Contains(lower, "等待") {
+		caps = append(caps, "流程控制")
+	}
+	if strings.Contains(lower, "去重") || strings.Contains(lower, "排序") {
+		caps = append(caps, "集合处理")
 	}
 	out := uniqueNonEmptyStrings(caps)
 	sort.Strings(out)

@@ -246,6 +246,8 @@ export interface AgentBrowserCaptureResult {
   final_url: string
   title: string
   text: string
+  screenshot_path?: string
+  screenshot_error?: string
   captured_at: number
   elapsed_ms: number
 }

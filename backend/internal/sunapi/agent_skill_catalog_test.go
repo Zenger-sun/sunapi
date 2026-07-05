@@ -72,7 +72,7 @@ func TestBuildBlueprintSkillPromptContextIncludesInstalledSkill(t *testing.T) {
 func TestPrepareCustomSkillFormIncludesModelAndTags(t *testing.T) {
 	_, config, _, _, err := prepareCustomSkillForm(SkillFormData{
 		Name:        "财务日报",
-		Description: "读取 Excel 数据，生成日报并发送通知。",
+		Description: "读取 Excel 数据，按条件分支循环处理，生成日报并发送通知。",
 		ModelGroup:  "finance",
 		ModelName:   "gpt-4.1",
 		Tags:        []string{"finance"},
@@ -91,4 +91,113 @@ func TestPrepareCustomSkillFormIncludesModelAndTags(t *testing.T) {
 	if len(tags) == 0 {
 		t.Fatalf("expected tags in config: %#v", cfg)
 	}
+	for _, tag := range []string{"finance", "spreadsheet", "report", "notification", "workflow"} {
+		if !jsonStringSliceContains(tags, tag) {
+			t.Fatalf("expected tag %q in %#v", tag, tags)
+		}
+	}
+	caps, _ := cfg["capabilities"].([]any)
+	if !jsonStringSliceContains(caps, "流程控制") {
+		t.Fatalf("expected workflow capability in %#v", caps)
+	}
+}
+
+func TestCreateMarketplaceSkillUsesStableInstallAndInstalledFlag(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	form, config, permissions, version, err := prepareSkillForm(context.Background(), SkillFormData{
+		SourceType:    "marketplace",
+		MarketplaceID: "marketplace.workflow-control",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.CreateSkill(context.Background(), 1, form, config, permissions, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateSkill(context.Background(), 1, form, config, permissions, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("expected stable marketplace install id, got %q and %q", first.ID, second.ID)
+	}
+	skills, err := store.ListSkills(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("len(skills)=%d want 1", len(skills))
+	}
+	marketplace := listMarketplaceSkills(skills)
+	var found bool
+	for _, item := range marketplace {
+		if item.ID == "marketplace.workflow-control" {
+			found = true
+			if !item.Installed {
+				t.Fatalf("workflow-control marketplace item should be installed")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("workflow-control marketplace item missing")
+	}
+}
+
+func TestCreateCustomSkillPersistsModelTagsAndInstructions(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	form, config, permissions, version, err := prepareSkillForm(context.Background(), SkillFormData{
+		Name:        "库存循环检查",
+		Description: "按条件分支循环处理库存数据，输出异常商品列表。",
+		SourceType:  "custom",
+		ModelGroup:  "ops",
+		ModelName:   "gpt-4.1-mini",
+		Tags:        []string{"inventory"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	skill, err := store.CreateSkill(context.Background(), 1, form, config, permissions, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skill.Source != "custom" {
+		t.Fatalf("source=%q want custom", skill.Source)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(skill.Config, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["model_group"] != "ops" || cfg["model_name"] != "gpt-4.1-mini" {
+		t.Fatalf("model config missing: %#v", cfg)
+	}
+	tags, _ := cfg["tags"].([]any)
+	for _, tag := range []string{"inventory", "workflow", "data"} {
+		if !jsonStringSliceContains(tags, tag) {
+			t.Fatalf("expected tag %q in %#v", tag, tags)
+		}
+	}
+	instructions, _ := cfg["instructions"].([]any)
+	if len(instructions) == 0 {
+		t.Fatalf("expected generated instructions: %#v", cfg)
+	}
+}
+
+func jsonStringSliceContains(values []any, target string) bool {
+	for _, value := range values {
+		if text, ok := value.(string); ok && text == target {
+			return true
+		}
+	}
+	return false
 }

@@ -76,7 +76,7 @@ export const LOG_TYPE_ALL_VALUE = '0' as const
 export const TIME_RANGE_PRESETS = [
   { days: 1, label: '24 Hours' },
   { days: 7, label: '7 Days' },
-  { days: 14, label: '14 Days' },
+  { days: 15, label: '15 Days' },
   { days: 30, label: '30 Days' },
 ] as const
 

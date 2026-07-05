@@ -173,6 +173,32 @@ var marketplaceSkillCatalog = []AgentSkillMarketplaceItem{
 		}),
 	},
 	{
+		ID:          "marketplace.workflow-control",
+		Name:        "流程控制 Skill",
+		Description: "处理条件分支、等待延迟、列表循环、批处理和控制流记录。",
+		Version:     "1.0.0",
+		SourceURL:   "https://docs.n8n.io/integrations/builtin/core-nodes/",
+		Tags:        []string{"workflow", "control", "branch", "loop"},
+		Capabilities: []string{
+			"条件分支",
+			"等待延迟",
+			"列表循环",
+		},
+		Permissions: []string{"workflow:execute"},
+		Config: mustSkillConfig(skillConfigPayload{
+			Tags:         []string{"workflow", "control", "branch", "loop"},
+			Capabilities: []string{"条件分支", "等待延迟", "列表循环"},
+			Instructions: []string{
+				"只根据当前节点条件、等待时间、循环数量和上游输出决定控制结果。",
+				"条件表达式必须输出命中分支、命中数据和未命中原因。",
+				"循环和等待必须保留限制、截断、耗时和取消状态，避免无限执行。",
+			},
+			Inputs:      []string{"上游输出", "条件表达式", "循环列表"},
+			Outputs:     []string{"控制结果", "命中数据", "执行日志"},
+			InstallMode: "marketplace",
+		}),
+	},
+	{
 		ID:          "marketplace.notification-router",
 		Name:        "通知路由 Skill",
 		Description: "把任务结果投递到邮件、Webhook、飞书、企业微信、Slack 等通道。",
@@ -557,6 +583,7 @@ func inferSkillTags(description string) []string {
 		"csv": "spreadsheet", "文档": "document", "pdf": "document", "图片": "image",
 		"视频": "video", "数据": "data", "sql": "database", "数据库": "database",
 		"通知": "notification", "webhook": "webhook", "日报": "report", "报告": "report",
+		"流程": "workflow", "条件": "workflow", "分支": "workflow", "循环": "workflow",
 	}
 	for keyword, tag := range keywords {
 		if strings.Contains(lower, strings.ToLower(keyword)) {
@@ -586,6 +613,9 @@ func inferSkillCapabilities(description string) []string {
 	}
 	if tagSet["notification"] || tagSet["webhook"] {
 		capabilities = append(capabilities, "消息投递", "失败重试")
+	}
+	if tagSet["workflow"] {
+		capabilities = append(capabilities, "流程控制", "分支循环")
 	}
 	return uniqueNonEmptyStrings(capabilities)
 }

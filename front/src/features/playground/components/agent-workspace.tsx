@@ -255,6 +255,7 @@ type NodeTemplate = {
   source?: 'builtin' | 'custom'
   title: string
   description: string
+  paletteGroup?: '触发' | '采集' | '智能处理' | '输出'
   group?: string
   model: string
   skill: string
@@ -401,12 +402,13 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     label: 'MCP 工作流 Skill',
     value: 'skill.mcp-workflow',
     description:
-      '适配 MCP/GitHub/文件系统等工具编排，强调权限边界和可追踪步骤。',
+      '适配 MCP/GitHub/文件系统等工具编排和本地流程控制，强调权限边界和可追踪步骤。',
     source: 'built-in',
-    appliesTo: ['start', 'schedule', 'notify', 'stop'],
-    capabilities: ['工具选择', '权限边界', '步骤追踪'],
+    appliesTo: ['start', 'schedule', 'custom', 'notify', 'stop'],
+    capabilities: ['工具选择', '流程控制', '分支循环', '步骤追踪'],
     instructions: [
       '根据任务选择最少必要工具，说明每一步输入、输出和失败补偿方案。',
+      '处理条件分支、等待延迟、列表循环和批处理时，必须保留条件、限制、截断、耗时和取消状态。',
       '严格遵守工具权限边界，不越权读取、写入或调用未配置的外部系统。',
       '对 GitHub、文件系统、任务管理等工具操作保留可审计摘要。',
     ],
@@ -501,6 +503,8 @@ const REPORT_OUTPUT_FORMAT_SETTING = '输出格式'
 const REPORT_OUTPUT_PATH_LABEL = '归档路径'
 const BROWSER_PAGE_DATA_SETTING = '页面数据'
 const BROWSER_CAPTURE_TEXT_SETTING = '采集文本'
+const BROWSER_SCREENSHOT_SETTING = '采集截图'
+const BROWSER_SCREENSHOT_ERROR_SETTING = '采集截图错误'
 const BROWSER_DATA_MISSING_MARKER = 'browser_data_missing'
 const HTTP_RESPONSE_SETTING = 'HTTP 响应'
 const HTTP_STATUS_SETTING = 'HTTP 状态码'
@@ -2449,7 +2453,9 @@ function Palette({
           {/* 组件列表（可滚动） */}
           <div className='min-h-0 flex-1 overflow-y-auto px-2 pb-3'>
             <ComponentManagerPanel
+              groupChoices={groupChoices}
               isLoading={isComponentCatalogLoading}
+              modelChoices={modelChoices}
               onCreateComponent={onCreateComponent}
             />
             {groups.map((group) => (
@@ -2496,25 +2502,46 @@ function Palette({
 }
 
 function ComponentManagerPanel({
+  groupChoices,
   isLoading,
+  modelChoices,
   onCreateComponent,
 }: {
+  groupChoices: GroupOption[]
   isLoading: boolean
+  modelChoices: ModelChoice[]
   onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
 }) {
   const [open, setOpen] = useState(false)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [group, setGroup] = useState('process')
+  const [modelGroup, setModelGroup] = useState(
+    groupChoices[0]?.value ?? 'default'
+  )
+  const [modelName, setModelName] = useState(modelChoices[0]?.value ?? '')
   const [inputs, setInputs] = useState('上游数据')
   const [outputs, setOutputs] = useState('执行结果')
   const [tags, setTags] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
 
+  useEffect(() => {
+    if (!groupChoices.some((option) => option.value === modelGroup)) {
+      setModelGroup(groupChoices[0]?.value ?? 'default')
+    }
+  }, [groupChoices, modelGroup])
+
+  useEffect(() => {
+    if (modelName) return
+    setModelName(modelChoices[0]?.value ?? '')
+  }, [modelChoices, modelName])
+
   const reset = () => {
     setName('')
     setDescription('')
     setGroup('process')
+    setModelGroup(groupChoices[0]?.value ?? 'default')
+    setModelName(modelChoices[0]?.value ?? '')
     setInputs('上游数据')
     setOutputs('执行结果')
     setTags('')
@@ -2535,6 +2562,8 @@ function ComponentManagerPanel({
         name: name.trim(),
         description: description.trim(),
         group,
+        model_group: modelGroup,
+        model_name: modelName,
         inputs: splitListInput(inputs),
         outputs: splitListInput(outputs),
         tags: splitListInput(tags),
@@ -2592,6 +2621,30 @@ function ComponentManagerPanel({
             <NativeSelectOption value='process'>智能处理</NativeSelectOption>
             <NativeSelectOption value='output'>输出</NativeSelectOption>
           </NativeSelect>
+          <div className='grid grid-cols-2 gap-1.5'>
+            <NativeSelect
+              value={modelGroup}
+              onChange={(event) => setModelGroup(event.target.value)}
+              className='h-7 rounded-[6px] text-xs'
+            >
+              {groupChoices.map((option) => (
+                <NativeSelectOption key={option.value} value={option.value}>
+                  {option.label}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <NativeSelect
+              value={modelName}
+              onChange={(event) => setModelName(event.target.value)}
+              className='h-7 rounded-[6px] text-xs'
+            >
+              {modelChoices.map((option) => (
+                <NativeSelectOption key={option.value} value={option.value}>
+                  {option.label}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+          </div>
           <Input
             value={inputs}
             onChange={(event) => setInputs(event.target.value)}
@@ -3283,15 +3336,27 @@ function parseBrowserCaptureWaitSeconds(value: string | undefined) {
 }
 
 function browserCapturedText(node: AgentFlowNode) {
-  return (
-    node.data.settings[BROWSER_CAPTURE_TEXT_SETTING] ||
-    node.data.settings[BROWSER_PAGE_DATA_SETTING] ||
-    ''
-  ).trim()
+  return (node.data.settings[BROWSER_CAPTURE_TEXT_SETTING] || '').trim()
 }
 
 function browserCaptureError(node: AgentFlowNode) {
   return node.data.settings['采集错误']?.trim() || ''
+}
+
+function browserScreenshotPath(node: AgentFlowNode) {
+  return (node.data.settings[BROWSER_SCREENSHOT_SETTING] || '').trim()
+}
+
+function browserScreenshotError(node: AgentFlowNode) {
+  return (node.data.settings[BROWSER_SCREENSHOT_ERROR_SETTING] || '').trim()
+}
+
+function browserScreenshotSummary(node: AgentFlowNode) {
+  const path = browserScreenshotPath(node)
+  if (path) return `截图证据: ${path}`
+  const error = browserScreenshotError(node)
+  if (error) return `截图证据: 截图失败，${error}`
+  return '截图证据: 未返回截图文件'
 }
 
 function updateNodeRuntimeSettings(
@@ -3337,7 +3402,9 @@ async function captureBrowserNodes(nodes: AgentFlowNode[]) {
       const text = result.text.trim()
       nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
         [BROWSER_CAPTURE_TEXT_SETTING]: text,
-        [BROWSER_PAGE_DATA_SETTING]: text,
+        [BROWSER_PAGE_DATA_SETTING]: '',
+        [BROWSER_SCREENSHOT_SETTING]: result.screenshot_path || '',
+        [BROWSER_SCREENSHOT_ERROR_SETTING]: result.screenshot_error || '',
         采集标题: result.title,
         采集网址: result.final_url || result.url,
         采集时间: String(result.captured_at),
@@ -3347,6 +3414,8 @@ async function captureBrowserNodes(nodes: AgentFlowNode[]) {
       nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
         [BROWSER_CAPTURE_TEXT_SETTING]: '',
         [BROWSER_PAGE_DATA_SETTING]: '',
+        [BROWSER_SCREENSHOT_SETTING]: '',
+        [BROWSER_SCREENSHOT_ERROR_SETTING]: '',
         采集错误:
           error instanceof Error ? error.message : '浏览器自动采集失败。',
       })
@@ -3611,6 +3680,8 @@ function markBrowserCaptureError(nodes: AgentFlowNode[], error: unknown) {
       ? updateNodeRuntimeSettings([node], node.id, {
           [BROWSER_CAPTURE_TEXT_SETTING]: '',
           [BROWSER_PAGE_DATA_SETTING]: '',
+          [BROWSER_SCREENSHOT_SETTING]: '',
+          [BROWSER_SCREENSHOT_ERROR_SETTING]: '',
           采集错误: message,
         })[0]
       : node
@@ -3997,13 +4068,13 @@ function buildNodeOutputSummary(
     return metrics.length > 0
       ? [
           `页面数据: 已解析 ${metrics.length} 个闲鱼数据总览指标`,
-          '截图证据: 当前版本先采集 DOM 文本，暂未写入截图文件',
+          browserScreenshotSummary(node),
         ]
       : [
           error
             ? `页面数据: 自动采集失败，${error}`
             : '页面数据: 未获取可解析的真实页面数据',
-          '截图证据: 当前版本先采集 DOM 文本，暂未写入截图文件',
+          browserScreenshotSummary(node),
         ]
   }
 
@@ -4243,6 +4314,7 @@ function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
       `模型: ${node.data.model}${skillLine}`,
       '数据来源: 浏览器节点自动采集的真实页面文本。',
       `采集网址: ${node.data.settings['采集网址'] || node.data.settings['网址'] || '未记录'}`,
+      browserScreenshotSummary(node),
       `${XIANYU_OVERVIEW_METRICS_MARKER}:`,
       JSON.stringify(metrics, null, 2),
       '',
@@ -4259,6 +4331,7 @@ function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
     '未拿到真实浏览器页面数据。',
     `原因: ${captureError || '浏览器自动采集未返回可解析的页面文本。'}`,
     `目标网址: ${node.data.settings['网址'] || '未配置'}`,
+    browserScreenshotSummary(node),
     '处理: 请确认目标页面已登录并能在浏览器中正常打开，然后重新执行。',
     '限制: 不会根据模板、标题、历史内容或模型常识补全商品排行、商品ID、商品标题。',
   ].join('\n')
@@ -5264,6 +5337,8 @@ const TEMPLATE_FILE_ACCEPT =
 const TRANSIENT_BROWSER_SETTING_LABELS = new Set([
   BROWSER_PAGE_DATA_SETTING,
   BROWSER_CAPTURE_TEXT_SETTING,
+  BROWSER_SCREENSHOT_SETTING,
+  BROWSER_SCREENSHOT_ERROR_SETTING,
   '采集标题',
   '采集网址',
   '采集时间',
@@ -7178,6 +7253,7 @@ function buildTemplates(
       source: 'builtin' as const,
       title: meta.label,
       description: meta.description,
+      paletteGroup: meta.group,
       group: currentGroup || 'default',
       model: pickDefaultModel(kind, models, currentModel),
       skill: pickDefaultSkill(kind),
@@ -7224,6 +7300,7 @@ function componentToNodeTemplate(
     source: component.source,
     title: component.name || meta.label,
     description: component.description || meta.description,
+    paletteGroup: componentPaletteGroup(component.group, meta.group),
     group: config.model_group || currentGroup || 'default',
     model:
       config.model_name ||
@@ -7240,6 +7317,34 @@ function normalizeTemplateKind(kind: string): AgentNodeKind {
   return kind && NODE_META[kind as AgentNodeKind]
     ? (kind as AgentNodeKind)
     : 'custom'
+}
+
+function componentPaletteGroup(
+  group: string | undefined,
+  fallback: '触发' | '采集' | '智能处理' | '输出'
+) {
+  switch ((group ?? '').trim().toLowerCase()) {
+    case 'trigger':
+    case '触发':
+      return '触发'
+    case 'collect':
+    case 'collection':
+    case 'source':
+    case '采集':
+      return '采集'
+    case 'output':
+    case 'sink':
+    case '输出':
+      return '输出'
+    case 'process':
+    case 'processor':
+    case 'transform':
+    case '处理':
+    case '智能处理':
+      return '智能处理'
+    default:
+      return fallback
+  }
 }
 
 function pickDefaultModel(
@@ -7573,7 +7678,7 @@ function buildPaletteTemplateGroups(templates: NodeTemplate[]): PaletteTemplateG
     title: group.title,
     templates: templates.filter((template) => {
       const meta = NODE_META[template.kind]
-      return meta.group === group.title
+      return (template.paletteGroup ?? meta.group) === group.title
     }),
   })).filter((group) => group.templates.length > 0)
 }
@@ -7589,7 +7694,7 @@ function filterPaletteTemplateGroups(
     ...group,
     templates: group.templates.filter((template) => {
       const meta = NODE_META[template.kind]
-      return `${template.title} ${meta.group} ${template.description}`
+      return `${template.title} ${template.paletteGroup ?? meta.group} ${template.description}`
         .toLowerCase()
         .includes(keyword)
     }),

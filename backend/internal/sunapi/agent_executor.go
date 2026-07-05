@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -468,7 +469,7 @@ func executeAgentBlueprintNode(
 		if handled, handledResult := executeAgentBuiltinCustomComponent(ctx, store, bp, node, upstream, inputVars, result); handled {
 			return handledResult
 		}
-		result = executeAgentCustomGraphNode(node, upstream, result)
+		result = executeAgentCustomGraphNode(ctx, store, bp, node, upstream, inputVars, result)
 	}
 	return result
 }
@@ -579,13 +580,15 @@ func executeAgentBrowserGraphNode(
 	}
 	result.Message = fmt.Sprintf("浏览器真实采集完成，获取 %d 个字符。", len([]rune(captured.Text)))
 	result.Output = map[string]interface{}{
-		"url":         captured.URL,
-		"final_url":   captured.FinalURL,
-		"title":       captured.Title,
-		"text":        captured.Text,
-		"text_length": len([]rune(captured.Text)),
-		"captured_at": captured.CapturedAt,
-		"elapsed_ms":  captured.ElapsedMS,
+		"url":              captured.URL,
+		"final_url":        captured.FinalURL,
+		"title":            captured.Title,
+		"text":             captured.Text,
+		"text_length":      len([]rune(captured.Text)),
+		"screenshot_path":  captured.ScreenshotPath,
+		"screenshot_error": captured.ScreenshotError,
+		"captured_at":      captured.CapturedAt,
+		"elapsed_ms":       captured.ElapsedMS,
 	}
 	return result
 }
@@ -1456,8 +1459,12 @@ func buildAgentNotificationText(title, description string, upstream map[string]i
 }
 
 func executeAgentCustomGraphNode(
+	ctx context.Context,
+	store *Store,
+	bp *AgentBlueprint,
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
+	inputVars map[string]interface{},
 	result agentBlueprintNodeResult,
 ) agentBlueprintNodeResult {
 	if len(upstream) == 0 {
@@ -1467,9 +1474,27 @@ func executeAgentCustomGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	result.Message = "自定义组件已基于上游真实输出生成确定性结果。"
+	if store == nil || bp == nil {
+		result.Status = "failed"
+		result.Message = "自定义组件缺少模型执行环境。"
+		result.Error = "model execution context is required"
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	output, err := callLLMForAgentNode(ctx, store, bp, node, upstream, inputVars)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "自定义组件模型执行失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "summary": agentSummarizeUpstream(upstream, 4000)}
+		return result
+	}
+	result.Message = "自定义组件已按当前描述和上游真实输出完成模型执行。"
 	result.Output = map[string]interface{}{
 		"description": node.Data.Description,
+		"model":       firstNonEmpty(node.Data.Model, bp.ModelName),
+		"model_group": firstNonEmpty(node.Data.Group, bp.ModelGroup),
+		"result":      output,
 		"summary":     agentSummarizeUpstream(upstream, 4000),
 	}
 	return result
@@ -1493,10 +1518,20 @@ func executeAgentBuiltinCustomComponent(
 			"raw":     inputVars,
 		}
 		return true, result
+	case "component.branch":
+		return true, executeAgentBranchGraphNode(node, upstream, result)
+	case "component.wait":
+		return true, executeAgentWaitGraphNode(ctx, node, upstream, result)
+	case "component.loop":
+		return true, executeAgentLoopGraphNode(node, upstream, result)
 	case "component.filter":
 		return true, executeAgentFilterGraphNode(node, upstream, result)
 	case "component.merge":
 		return true, executeAgentMergeGraphNode(node, upstream, result)
+	case "component.dedupe_sort":
+		return true, executeAgentDedupeSortGraphNode(node, upstream, result)
+	case "component.database":
+		return true, executeAgentDatabaseGraphNode(ctx, store, node, result)
 	case "component.file":
 		return true, executeAgentFileGraphNode(store, node, upstream, result)
 	default:
@@ -1504,6 +1539,120 @@ func executeAgentBuiltinCustomComponent(
 		_ = bp
 		return false, result
 	}
+}
+
+func executeAgentBranchGraphNode(
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	if len(upstream) == 0 {
+		result.Status = "failed"
+		result.Message = "条件分支节点没有收到上游真实输出。"
+		result.Error = "upstream data is required"
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	condition := strings.TrimSpace(firstNonEmpty(node.Data.Settings["条件"], node.Data.Settings["表达式"]))
+	var matched []map[string]interface{}
+	var err error
+	if condition == "" {
+		for key, value := range filterNonEmptyUpstream(upstream) {
+			matched = append(matched, map[string]interface{}{"source_node": key, "value": value})
+		}
+	} else {
+		matched, err = filterAgentUpstreamRows(upstream, condition)
+	}
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "条件分支判断失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "condition": condition}
+		return result
+	}
+	passed := len(matched) > 0
+	branch := firstNonEmpty(node.Data.Settings["假分支"], "否")
+	if passed {
+		branch = firstNonEmpty(node.Data.Settings["真分支"], "是")
+	}
+	result.Message = fmt.Sprintf("条件分支完成：%s，命中 %d 行。", branch, len(matched))
+	result.Output = map[string]interface{}{
+		"passed":        passed,
+		"branch":        branch,
+		"condition":     condition,
+		"matched":       matched,
+		"matched_count": len(matched),
+		"upstream":      upstream,
+	}
+	return result
+}
+
+func executeAgentWaitGraphNode(
+	ctx context.Context,
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	seconds := parseAgentDurationSeconds(firstNonEmpty(node.Data.Settings["等待时间"], node.Data.Settings["延迟"]), 1)
+	maxSeconds := parseAgentDurationSeconds(firstNonEmpty(node.Data.Settings["最大等待"], "60s"), 60)
+	if seconds > maxSeconds {
+		seconds = maxSeconds
+	}
+	timer := time.NewTimer(time.Duration(seconds) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		result.Status = "failed"
+		result.Message = "等待延迟被取消。"
+		result.Error = ctx.Err().Error()
+		result.Output = map[string]interface{}{"error": result.Error, "wait_seconds": seconds}
+		return result
+	case <-timer.C:
+	}
+	result.Message = fmt.Sprintf("等待延迟完成，实际等待 %d 秒。", seconds)
+	result.Output = map[string]interface{}{
+		"wait_seconds": seconds,
+		"upstream":     upstream,
+	}
+	return result
+}
+
+func executeAgentLoopGraphNode(
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	rows := flattenAgentUpstreamRows(upstream)
+	if len(rows) == 0 {
+		result.Status = "failed"
+		result.Message = "列表循环节点没有收到可迭代的上游数据。"
+		result.Error = "iterable upstream data is required"
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	limit := parseAgentPositiveSetting(firstNonEmpty(node.Data.Settings["最大条目"], node.Data.Settings["限制"]), 100, 10000)
+	truncated := false
+	if len(rows) > limit {
+		rows = rows[:limit]
+		truncated = true
+	}
+	items := make([]map[string]interface{}, 0, len(rows))
+	for index, row := range rows {
+		next := copyAgentRow(row)
+		next["loop_index"] = index
+		items = append(items, next)
+	}
+	outputField := firstNonEmpty(node.Data.Settings["输出字段"], "items")
+	result.Message = fmt.Sprintf("列表循环展开完成：输出 %d 个条目。", len(items))
+	result.Output = map[string]interface{}{
+		outputField:      items,
+		"items":          items,
+		"count":          len(items),
+		"limit":          limit,
+		"truncated":      truncated,
+		"source_summary": agentSummarizeUpstream(upstream, 2000),
+	}
+	return result
 }
 
 func executeAgentFilterGraphNode(
@@ -1581,6 +1730,125 @@ func executeAgentMergeGraphNode(
 		"field":          field,
 		"conflict_count": conflicts,
 		"summary":        agentSummarizeUpstream(upstream, 4000),
+	}
+	return result
+}
+
+func executeAgentDedupeSortGraphNode(
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	rows := flattenAgentUpstreamRows(upstream)
+	if len(rows) == 0 {
+		result.Status = "failed"
+		result.Message = "去重排序节点没有收到可处理的上游行数据。"
+		result.Error = "row upstream data is required"
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	dedupeField := strings.TrimSpace(firstNonEmpty(node.Data.Settings["去重字段"], node.Data.Settings["字段"]))
+	deduped := rows
+	removed := 0
+	if dedupeField != "" && dedupeField != "*" {
+		seen := map[string]bool{}
+		deduped = make([]map[string]interface{}, 0, len(rows))
+		for _, row := range rows {
+			key := strings.TrimSpace(fmt.Sprint(agentCodeLookup(row, dedupeField)))
+			if key == "" || key == "<nil>" {
+				key = "__missing__" + fmt.Sprint(len(deduped)+removed)
+			}
+			if seen[key] {
+				removed++
+				continue
+			}
+			seen[key] = true
+			deduped = append(deduped, copyAgentRow(row))
+		}
+	}
+	sortField := strings.TrimSpace(firstNonEmpty(node.Data.Settings["排序字段"], node.Data.Settings["排序"]))
+	sortDirection := strings.TrimSpace(firstNonEmpty(node.Data.Settings["排序方向"], "升序"))
+	desc := strings.Contains(sortDirection, "降") || strings.EqualFold(sortDirection, "desc")
+	if sortField != "" {
+		sort.SliceStable(deduped, func(i, j int) bool {
+			cmp := compareAgentCodeValues(agentCodeLookup(deduped[i], sortField), agentCodeLookup(deduped[j], sortField))
+			if desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		})
+	}
+	limit := parseAgentPositiveSetting(firstNonEmpty(node.Data.Settings["限制"], node.Data.Settings["最大条目"]), len(deduped), 10000)
+	truncated := false
+	if len(deduped) > limit {
+		deduped = deduped[:limit]
+		truncated = true
+	}
+	result.Message = fmt.Sprintf("去重排序完成：输出 %d 行，去重移除 %d 行。", len(deduped), removed)
+	result.Output = map[string]interface{}{
+		"rows":           deduped,
+		"count":          len(deduped),
+		"dedupe_field":   dedupeField,
+		"sort_field":     sortField,
+		"sort_direction": sortDirection,
+		"removed_count":  removed,
+		"truncated":      truncated,
+	}
+	return result
+}
+
+func executeAgentDatabaseGraphNode(
+	ctx context.Context,
+	store *Store,
+	node agentBlueprintGraphNode,
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	query, err := normalizeAgentReadOnlySQL(firstNonEmpty(node.Data.Settings["SQL"], node.Data.Settings["查询"]))
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "数据库查询 SQL 不合法。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	db, cleanup, databaseLabel, err := agentDatabaseForNode(store, firstNonEmpty(node.Data.Settings["数据库路径"], node.Data.Settings["数据库"]))
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "数据库查询无法打开数据库。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "数据库只读查询执行失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "sql": query, "database": databaseLabel}
+		return result
+	}
+	defer rows.Close()
+	limit := parseAgentPositiveSetting(firstNonEmpty(node.Data.Settings["限制"], node.Data.Settings["最大行数"]), 100, 10000)
+	items, columns, truncated, err := scanAgentSQLRows(rows, limit)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "数据库查询结果读取失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "sql": query, "database": databaseLabel}
+		return result
+	}
+	result.Message = fmt.Sprintf("数据库只读查询完成：返回 %d 行。", len(items))
+	result.Output = map[string]interface{}{
+		"database":  databaseLabel,
+		"sql":       query,
+		"columns":   columns,
+		"rows":      items,
+		"row_count": len(items),
+		"limit":     limit,
+		"truncated": truncated,
 	}
 	return result
 }
@@ -1814,6 +2082,115 @@ func copyAgentRow(row map[string]interface{}) map[string]interface{} {
 		out[key] = value
 	}
 	return out
+}
+
+func parseAgentPositiveSetting(value string, fallback int, maxValue int) int {
+	value = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(value, "条"), "行"))
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed <= 0 {
+		parsed = fallback
+	}
+	if parsed <= 0 {
+		parsed = 1
+	}
+	if maxValue > 0 && parsed > maxValue {
+		return maxValue
+	}
+	return parsed
+}
+
+func normalizeAgentReadOnlySQL(query string) (string, error) {
+	query = strings.TrimSpace(query)
+	query = strings.TrimSuffix(query, ";")
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", errors.New("SQL is required")
+	}
+	if strings.Contains(query, ";") {
+		return "", errors.New("only one SQL statement is allowed")
+	}
+	lower := strings.ToLower(strings.TrimSpace(query))
+	allowed := strings.HasPrefix(lower, "select ") ||
+		strings.HasPrefix(lower, "with ") ||
+		strings.HasPrefix(lower, "pragma ")
+	if !allowed {
+		return "", errors.New("only read-only SELECT/WITH/PRAGMA statements are allowed")
+	}
+	blockedKeywords := []string{" insert ", " update ", " delete ", " drop ", " alter ", " create ", " replace ", " attach ", " detach ", " vacuum "}
+	padded := " " + lower + " "
+	for _, keyword := range blockedKeywords {
+		if strings.Contains(padded, keyword) {
+			return "", fmt.Errorf("read-only SQL cannot contain %s", strings.TrimSpace(keyword))
+		}
+	}
+	return query, nil
+}
+
+func agentDatabaseForNode(store *Store, databaseSetting string) (*sql.DB, func(), string, error) {
+	databaseSetting = strings.TrimSpace(databaseSetting)
+	if databaseSetting == "" || strings.Contains(databaseSetting, "当前") || strings.Contains(strings.ToLower(databaseSetting), "sunapi") {
+		if store == nil || store.db == nil {
+			return nil, nil, "", errors.New("current SunAPI database is unavailable")
+		}
+		return store.db, nil, "当前 SunAPI 数据库", nil
+	}
+	if store == nil || strings.TrimSpace(store.DataDir()) == "" {
+		return nil, nil, "", errors.New("data directory is not configured")
+	}
+	pathValue := strings.Trim(strings.TrimSpace(filepath.ToSlash(databaseSetting)), "/")
+	if strings.HasPrefix(pathValue, "data/") {
+		pathValue = strings.TrimPrefix(pathValue, "data/")
+	}
+	if pathValue == "" || strings.Contains(pathValue, "..") {
+		return nil, nil, "", errors.New("invalid database path")
+	}
+	fullPath := filepath.Clean(filepath.Join(store.DataDir(), filepath.FromSlash(pathValue)))
+	root := filepath.Clean(store.DataDir())
+	if fullPath != root && !strings.HasPrefix(fullPath, root+string(filepath.Separator)) {
+		return nil, nil, "", errors.New("database path must stay inside data directory")
+	}
+	db, err := sql.Open("sqlite", fullPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	cleanup := func() { _ = db.Close() }
+	return db, cleanup, "data/" + filepath.ToSlash(pathValue), nil
+}
+
+func scanAgentSQLRows(rows *sql.Rows, limit int) ([]map[string]interface{}, []string, bool, error) {
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	items := make([]map[string]interface{}, 0, limit)
+	truncated := false
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		scanTargets := make([]interface{}, len(columns))
+		for i := range values {
+			scanTargets[i] = &values[i]
+		}
+		if err := rows.Scan(scanTargets...); err != nil {
+			return nil, nil, false, err
+		}
+		if len(items) >= limit {
+			truncated = true
+			continue
+		}
+		item := make(map[string]interface{}, len(columns))
+		for i, column := range columns {
+			value := values[i]
+			if bytesValue, ok := value.([]byte); ok {
+				value = string(bytesValue)
+			}
+			item[column] = value
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, err
+	}
+	return items, columns, truncated, nil
 }
 
 func agentCodeInt(value interface{}) (int, bool) {
@@ -2644,6 +3021,97 @@ func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, 
 	return chatResp.Choices[0].Message.Content, nil
 }
 
+func callLLMForAgentNode(
+	ctx context.Context,
+	store *Store,
+	bp *AgentBlueprint,
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	inputVars map[string]interface{},
+) (string, error) {
+	if store == nil || bp == nil {
+		return "", errors.New("agent node model context is required")
+	}
+	type chatMsg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	model := firstNonEmpty(node.Data.Model, bp.ModelName)
+	if model == "" {
+		return "", errors.New("model name is required")
+	}
+	reqBody := map[string]interface{}{
+		"model": model,
+		"messages": []chatMsg{
+			{Role: "system", Content: buildAgentNodeSystemPrompt(ctx, store, bp, node)},
+			{Role: "user", Content: buildAgentNodeUserPrompt(node, upstream, inputVars)},
+		},
+		"stream": false,
+	}
+	if group := firstNonEmpty(node.Data.Group, bp.ModelGroup); group != "" {
+		reqBody["group"] = group
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+	apiKey, err := store.getInternalAPIKey(ctx)
+	if err != nil {
+		return "", fmt.Errorf("no available api key: %w", err)
+	}
+	settings, err := store.Settings(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to read settings: %w", err)
+	}
+	host := settings.ListenHost
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	port := settings.ListenPort
+	if port <= 0 {
+		port = 3000
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		reqCtx,
+		http.MethodPost,
+		fmt.Sprintf("http://%s:%d/v1/chat/completions", host, port),
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("llm api returned %d: %s", resp.StatusCode, string(respBody))
+	}
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &chatResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(chatResp.Choices) == 0 {
+		return "", errors.New("empty response from model")
+	}
+	return chatResp.Choices[0].Message.Content, nil
+}
+
 // getInternalAPIKey 获取一个可用的内部 API Key（状态为启用且额度足够）
 func (s *Store) getInternalAPIKey(ctx context.Context) (string, error) {
 	var key string
@@ -2689,6 +3157,41 @@ func buildBlueprintUserPrompt(bp *AgentBlueprint, inputVars map[string]interface
 		return bp.Description
 	}
 	return "请根据显式输入执行当前模块任务；若缺少任务描述，请返回需要补充的输入。"
+}
+
+func buildAgentNodeSystemPrompt(ctx context.Context, store *Store, bp *AgentBlueprint, node agentBlueprintGraphNode) string {
+	var sb strings.Builder
+	sb.WriteString("你是自动化蓝图中的一个独立自定义组件。\n")
+	sb.WriteString("只根据当前节点描述、当前节点配置、上游节点输出和显式输入变量执行；不要引用蓝图标题、历史样例或未提供的业务背景。\n")
+	sb.WriteString("如果输入不足，请输出缺失项和可执行的最小处理结果，不要编造数据。\n")
+	sb.WriteString("输出必须可被下游节点继续使用，优先给出结构化 JSON 或清晰字段列表。\n")
+	if skillContext := buildAgentNodeSkillPromptContext(ctx, store, bp, node); strings.TrimSpace(skillContext) != "" {
+		sb.WriteString(skillContext)
+	}
+	sb.WriteString("当前节点：\n")
+	sb.WriteString(fmt.Sprintf("  - 名称: %s\n", firstNonEmpty(node.Data.Title, node.ID)))
+	sb.WriteString(fmt.Sprintf("  - 描述: %s\n", firstNonEmpty(node.Data.Description, "未填写描述")))
+	if len(node.Data.Inputs) > 0 {
+		sb.WriteString("  - 输入字段: " + strings.Join(node.Data.Inputs, "、") + "\n")
+	}
+	if len(node.Data.Outputs) > 0 {
+		sb.WriteString("  - 输出字段: " + strings.Join(node.Data.Outputs, "、") + "\n")
+	}
+	return sb.String()
+}
+
+func buildAgentNodeUserPrompt(node agentBlueprintGraphNode, upstream map[string]interface{}, inputVars map[string]interface{}) string {
+	payload := map[string]interface{}{
+		"node_description": node.Data.Description,
+		"node_settings":    node.Data.Settings,
+		"upstream":         upstream,
+		"input_vars":       inputVars,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return firstNonEmpty(node.Data.Description, "请根据当前节点输入执行任务。")
+	}
+	return "请执行当前自定义组件。输入如下：\n```json\n" + string(data) + "\n```"
 }
 
 type builtinAgentSkillDefinition struct {
@@ -2782,10 +3285,11 @@ var builtinAgentSkillDefinitions = map[string]builtinAgentSkillDefinition{
 	},
 	"skill.mcp-workflow": {
 		Label:        "MCP 工作流 Skill",
-		Description:  "适配 MCP/GitHub/文件系统等外部工具编排，强调权限边界和可追踪步骤。",
-		Capabilities: []string{"工具选择", "权限边界", "步骤追踪"},
+		Description:  "适配 MCP/GitHub/文件系统等外部工具编排和本地流程控制，强调权限边界和可追踪步骤。",
+		Capabilities: []string{"工具选择", "流程控制", "分支循环", "步骤追踪"},
 		Instructions: []string{
 			"根据任务选择最少必要工具，说明每一步输入、输出和失败补偿方案。",
+			"处理条件分支、等待延迟、列表循环和批处理时，必须保留条件、限制、截断、耗时和取消状态。",
 			"严格遵守工具权限边界，不越权读取、写入或调用未配置的外部系统。",
 			"对 GitHub、文件系统、任务管理等工具操作保留可审计摘要。",
 		},
@@ -2868,13 +3372,30 @@ func normalizeBuiltinAgentSkillID(id string) string {
 
 func buildBlueprintSkillPromptContext(ctx context.Context, store *Store, bp *AgentBlueprint) string {
 	skillIDs := extractBlueprintSkillIDs(bp)
+	userID := int64(0)
+	if bp != nil {
+		userID = bp.UserID
+	}
+	return buildAgentSkillPromptContextForIDs(ctx, store, userID, skillIDs)
+}
+
+func buildAgentNodeSkillPromptContext(ctx context.Context, store *Store, bp *AgentBlueprint, node agentBlueprintGraphNode) string {
+	userID := int64(0)
+	if bp != nil {
+		userID = bp.UserID
+	}
+	return buildAgentSkillPromptContextForIDs(ctx, store, userID, []string{node.Data.Skill})
+}
+
+func buildAgentSkillPromptContextForIDs(ctx context.Context, store *Store, userID int64, skillIDs []string) string {
+	skillIDs = uniqueNonEmptyStrings(skillIDs)
 	if len(skillIDs) == 0 {
 		return ""
 	}
 
 	installedSkills := map[string]AgentSkill{}
-	if store != nil && bp != nil && bp.UserID > 0 {
-		if skills, err := store.ListSkills(ctx, bp.UserID); err == nil {
+	if store != nil && userID > 0 {
+		if skills, err := store.ListSkills(ctx, userID); err == nil {
 			for _, skill := range skills {
 				if skill.Enabled {
 					installedSkills[skill.ID] = skill
