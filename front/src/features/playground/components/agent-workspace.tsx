@@ -105,19 +105,15 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
-  captureAgentBrowserPage,
   createAgentComponent,
   createAgentSkill,
   deleteAgentComponent,
   deleteAgentSkill,
-  executeAgentHTTPRequest,
   listAgentSkillMarketplace,
   listAgentSkills,
   listAgentFiles,
   listAgentComponents,
-  startImageGenerationTask,
   uploadAgentFile,
-  writeAgentReport,
 } from '../api'
 import type {
   AgentSkillItem,
@@ -140,11 +136,7 @@ import type {
   AgentFileUploadPurpose,
   AgentComponentItem,
   AgentComponentFormData,
-  AgentReportOutputFile,
-  AgentReportWrittenFile,
   GroupOption,
-  ImageAspectRatio,
-  ImageGenerationParams,
   ModelOption,
 } from '../types'
 
@@ -161,8 +153,13 @@ type AgentNodeKind =
   | 'stop'
   | 'custom'
 
-type AgentNodeStatus = 'ready' | 'waiting' | 'running' | 'done'
-type AgentNodeLogStatus = 'pending' | 'running' | 'completed' | 'stopped'
+type AgentNodeStatus = 'ready' | 'waiting' | 'running' | 'done' | 'failed'
+type AgentNodeLogStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'stopped'
+  | 'failed'
 
 type ModelRole = 'system' | 'browser' | 'fast' | 'reasoning' | 'image'
 
@@ -203,6 +200,28 @@ type AgentEdgeDraft = Partial<AgentFlowEdge> & {
   target?: string | null
 }
 
+type BackendAgentNodeResult = {
+  node_id?: string
+  kind?: string
+  title?: string
+  status?: string
+  message?: string
+  input?: unknown
+  output?: unknown
+  started_at?: number
+  ended_at?: number
+  duration_ms?: number
+  error?: string
+  archive_path?: string
+}
+
+type BackendAgentGraphOutput = {
+  mode?: string
+  nodes?: BackendAgentNodeResult[]
+  final_output?: unknown
+  warnings?: string[]
+}
+
 type ModelChoice = {
   label: string
   value: string
@@ -240,13 +259,6 @@ type TemplateBinding = {
   originalName: string
   preview?: string
   hash?: string
-}
-
-type XianyuOverviewMetric = {
-  label: string
-  current: string
-  previous: string
-  change: string
 }
 
 type NodeTemplate = {
@@ -514,7 +526,6 @@ const IMAGE_TASK_STATUS_SETTING = '图片任务状态'
 const IMAGE_TASK_URLS_SETTING = '图片 URL'
 const IMAGE_TASK_ERROR_SETTING = '图片错误'
 const IMAGE_TASK_PROMPT_SETTING = '图片任务提示词'
-const XIANYU_OVERVIEW_METRICS_MARKER = 'xianyu_overview_metrics'
 const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 日报', 'CSV 表格']
 const REPORT_OUTPUT_FORMAT_PRESETS = [
   'Markdown 日报',
@@ -525,18 +536,6 @@ const REPORT_OUTPUT_FORMAT_PRESETS = [
   'HTML 网页',
   'TXT 文本',
   'JSON 数据',
-]
-const XIANYU_OVERVIEW_METRIC_LABELS = [
-  '商品访问次数',
-  '商品访问人数',
-  '商品曝光次数',
-  '商品曝光人数',
-  '商品浏览次数',
-  '商品浏览人数',
-  '支付笔数',
-  '支付金额（元）',
-  '发起退款笔数',
-  '发起退款金额（元）',
 ]
 const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   触发方式: ['手动', '定时', 'Webhook', '对话触发'],
@@ -962,7 +961,6 @@ export function AgentWorkspace({
   const addCounterRef = useRef(0)
   const lastSeedPromptRef = useRef<string | null>(null)
   const previewRunIdRef = useRef(0)
-  const previewTimerRefs = useRef<number[]>([])
   const undoStackRef = useRef<AgentBlueprintHistorySnapshot[]>([])
   const redoStackRef = useRef<AgentBlueprintHistorySnapshot[]>([])
   const [, setHistoryVersion] = useState(0)
@@ -995,14 +993,9 @@ export function AgentWorkspace({
   )
   const canUndoBlueprint = undoStackRef.current.length > 0
   const canRedoBlueprint = redoStackRef.current.length > 0
-  const clearPreviewTimers = useCallback(() => {
-    previewTimerRefs.current.forEach((timer) => window.clearTimeout(timer))
-    previewTimerRefs.current = []
-  }, [])
   const cancelPreviewRun = useCallback(() => {
     previewRunIdRef.current += 1
-    clearPreviewTimers()
-  }, [clearPreviewTimers])
+  }, [])
   const createHistorySnapshot = useCallback(
     (): AgentBlueprintHistorySnapshot => ({
       title: blueprintTitle,
@@ -1106,6 +1099,43 @@ export function AgentWorkspace({
       })
     },
     [currentBlueprintId]
+  )
+
+  const applyBackendExecutionLogToPreview = useCallback(
+    (
+      log: AgentExecutionLog,
+      activeNodes: AgentFlowNode[],
+      activeEdges: AgentFlowEdge[]
+    ) => {
+      const preview = buildBackendExecutionPreview(log, activeNodes, activeEdges)
+      if (!preview) return
+
+      setExecutionLog(preview.executionLog)
+      setNodes((current) => {
+        const statusById = preview.statusById
+        const activeById = new Map(activeNodes.map((node) => [node.id, node]))
+        const nextNodes = current.map((node) => {
+          const activeNode = activeById.get(node.id)
+          const status = statusById.get(node.id)
+          if (!activeNode && !status) return node
+          return {
+            ...(activeNode ?? node),
+            data: {
+              ...(activeNode?.data ?? node.data),
+              status: status ?? activeNode?.data.status ?? node.data.status,
+            },
+          }
+        })
+        persistCurrentBlueprintSnapshot(
+          stripTransientNodeSettings(nextNodes),
+          preview.executionLog,
+          preview.blueprintStatus,
+          activeEdges
+        )
+        return nextNodes
+      })
+    },
+    [persistCurrentBlueprintSnapshot]
   )
 
   useEffect(() => {
@@ -1449,7 +1479,6 @@ export function AgentWorkspace({
 
     cancelPreviewRun()
     const runId = previewRunIdRef.current
-    const timers: number[] = []
 
     if (prepared.changed) {
       setEdges(prepared.edges)
@@ -1473,8 +1502,9 @@ export function AgentWorkspace({
       )?.backendBlueprintId,
     }
     void runSavedBlueprintOnBackend(backendBlueprint)
-      .then((synced) => {
+      .then(async (synced) => {
         if (!synced) return
+        if (previewRunIdRef.current !== runId) return
         setBlueprints((current) => {
           const exists = current.some((item) => item.id === synced.id)
           const next = exists
@@ -1493,13 +1523,68 @@ export function AgentWorkspace({
           return next
         })
         if (synced.backendAgentId && synced.backendBlueprintId) {
-          void pollBackendExecutionLogs(
-            synced.backendAgentId,
-            synced.backendBlueprintId
-          ).catch(() => undefined)
+          try {
+            const logs = await pollBackendExecutionLogs(
+              synced.backendAgentId,
+              synced.backendBlueprintId
+            )
+            const latestLog = logs[0]
+            if (previewRunIdRef.current !== runId) return
+            if (latestLog) {
+              applyBackendExecutionLogToPreview(
+                latestLog,
+                runExecutionNodes,
+                prepared.edges
+              )
+            }
+          } catch (error) {
+            toast.error(
+              error instanceof Error
+                ? `后端执行日志同步失败: ${error.message}`
+                : '后端执行日志同步失败'
+            )
+          }
         }
       })
       .catch((error) => {
+        if (previewRunIdRef.current !== runId) return
+        const message =
+          error instanceof Error ? error.message : '后端正式运行触发失败'
+        const statusById = new Map<string, AgentNodeStatus>()
+        runExecutionNodes.forEach((node, index) => {
+          statusById.set(node.id, index === 0 ? 'failed' : 'waiting')
+        })
+        const failedLog = buildPreviewExecutionLog(
+          runExecutionNodes,
+          statusById,
+          skillChoices,
+          prepared.edges
+        )
+        const firstNode = runExecutionNodes[0]
+        if (firstNode) {
+          failedLog[firstNode.id] = {
+            ...failedLog[firstNode.id],
+            status: 'failed',
+            message: '后端正式运行触发失败。',
+            error: message,
+          }
+        }
+        setExecutionLog(failedLog)
+        setNodes((current) =>
+          current.map((node) => ({
+            ...node,
+            data: {
+              ...node.data,
+              status: statusById.get(node.id) ?? node.data.status,
+            },
+          }))
+        )
+        persistCurrentBlueprintSnapshot(
+          stripTransientNodeSettings(runExecutionNodes),
+          failedLog,
+          'failed',
+          prepared.edges
+        )
         toast.error(
           error instanceof Error
             ? `后端正式运行触发失败: ${error.message}`
@@ -1507,161 +1592,51 @@ export function AgentWorkspace({
         )
       })
 
-    const commitPreviewStateForNodes = (
-      activeNodes: AgentFlowNode[],
-      statusById: Map<string, AgentNodeStatus>,
-      finalizeTriggers = false
-    ) => {
-      const displayStatusById = finalizeTriggers
-        ? finalizeTriggerNodeStatuses(activeNodes, statusById)
-        : statusById
-      const nextExecutionLog = buildPreviewExecutionLog(
-        activeNodes,
-        statusById,
-        skillChoices,
+    const initialStatusById = buildPreviewStatusMap(runExecutionNodes, -1)
+    const initialExecutionLog = buildPreviewExecutionLog(
+      runExecutionNodes,
+      initialStatusById,
+      skillChoices,
+      prepared.edges
+    )
+    setExecutionLog(initialExecutionLog)
+    setNodes((current) => {
+      const activeNodeById = new Map(
+        runExecutionNodes.map((node) => [node.id, node])
+      )
+      const currentById = new Map(current.map((node) => [node.id, node]))
+      const nextNodes = current.map((node) => {
+        const activeNode = activeNodeById.get(node.id)
+        const status = initialStatusById.get(node.id)
+        if (!activeNode && !status) return node
+        return {
+          ...(activeNode ?? node),
+          data: {
+            ...(activeNode?.data ?? node.data),
+            status: status ?? activeNode?.data.status ?? node.data.status,
+          },
+        }
+      })
+      runExecutionNodes.forEach((activeNode) => {
+        if (currentById.has(activeNode.id)) return
+        nextNodes.push({
+          ...activeNode,
+          data: {
+            ...activeNode.data,
+            status: initialStatusById.get(activeNode.id) ?? activeNode.data.status,
+          },
+        })
+      })
+      persistCurrentBlueprintSnapshot(
+        stripTransientNodeSettings(nextNodes),
+        initialExecutionLog,
+        'running',
         prepared.edges
       )
-
-      setExecutionLog(nextExecutionLog)
-      setNodes((current) => {
-        const activeNodeById = new Map(
-          activeNodes.map((node) => [node.id, node])
-        )
-        const currentById = new Map(current.map((node) => [node.id, node]))
-        const nextNodes = current.map((node) => {
-          const activeNode = activeNodeById.get(node.id)
-          const status = displayStatusById.get(node.id)
-          if (!activeNode && !status) return node
-          return {
-            ...(activeNode ?? node),
-            data: {
-              ...(activeNode?.data ?? node.data),
-              status: status ?? activeNode?.data.status ?? node.data.status,
-            },
-          }
-        })
-        activeNodes.forEach((activeNode) => {
-          if (currentById.has(activeNode.id)) return
-          const status =
-            displayStatusById.get(activeNode.id) ?? activeNode.data.status
-          nextNodes.push({
-            ...activeNode,
-            data: { ...activeNode.data, status },
-          })
-        })
-        persistCurrentBlueprintSnapshot(
-          stripTransientNodeSettings(nextNodes),
-          nextExecutionLog,
-          finalizeTriggers ? undefined : 'running',
-          prepared.edges
-        )
-        return nextNodes
-      })
-    }
-
-    const appendReportOutputLogs = (
-      outputsByNodeId: Record<
-        string,
-        { files: AgentReportWrittenFile[]; outputDirectory: string }
-      >
-    ) => {
-      if (Object.keys(outputsByNodeId).length === 0) return
-      setExecutionLog((current) => {
-        const next = { ...current }
-        for (const [nodeId, output] of Object.entries(outputsByNodeId)) {
-          const log = next[nodeId]
-          if (!log) continue
-          next[nodeId] = {
-            ...log,
-            message: '日报文件已写入生成日报节点配置的输出目录。',
-            outputSummary: [
-              ...log.outputSummary.filter(
-                (item) =>
-                  !item.startsWith('实际文件:') && !item.startsWith('归档目录:')
-              ),
-              `归档目录: ${output.outputDirectory}`,
-              ...output.files.map(
-                (file) => `实际文件: ${file.label} -> ${file.path}`
-              ),
-            ],
-            steps: [
-              ...log.steps,
-              ...output.files.map((file) => `写入 ${file.label}: ${file.path}`),
-            ],
-          }
-        }
-        setNodes((currentNodes) => {
-          persistCurrentBlueprintSnapshot(
-            stripTransientNodeSettings(currentNodes),
-            next,
-            undefined,
-            prepared.edges
-          )
-          return currentNodes
-        })
-        return next
-      })
-    }
-
-    const startTimedPreview = (capturedNodes: AgentFlowNode[]) => {
-      capturedNodes.forEach((_, index) => {
-        const timer = window.setTimeout(
-          () => {
-            if (previewRunIdRef.current !== runId) return
-
-            const isFinalStep = index === capturedNodes.length - 1
-            const statusById = buildPreviewStatusMap(capturedNodes, index)
-            commitPreviewStateForNodes(capturedNodes, statusById, isFinalStep)
-
-            if (isFinalStep) {
-              previewTimerRefs.current = []
-              const completedLog = buildPreviewExecutionLog(
-                capturedNodes,
-                statusById,
-                skillChoices,
-                prepared.edges
-              )
-              void writeCompletedReportOutputs(capturedNodes, completedLog)
-                .then((outputsByNodeId) => {
-                  if (previewRunIdRef.current !== runId) return
-                  appendReportOutputLogs(outputsByNodeId)
-                })
-                .catch((error) => {
-                  toast.error(
-                    error instanceof Error ? error.message : '日报文件写入失败'
-                  )
-                })
-            }
-          },
-          480 * (index + 1)
-        )
-        timers.push(timer)
-      })
-      previewTimerRefs.current = timers
-    }
-
-    commitPreviewStateForNodes(
-      runExecutionNodes,
-      buildPreviewStatusMap(runExecutionNodes, -1)
-    )
-
-    void captureBrowserNodes(runExecutionNodes)
-      .then((capturedNodes) => executeHTTPNodes(capturedNodes))
-      .then((capturedNodes) =>
-        executeImageNodes(capturedNodes, prepared.edges, skillChoices)
-      )
-      .then((capturedNodes) => {
-        if (previewRunIdRef.current !== runId) return
-        startTimedPreview(capturedNodes)
-      })
-      .catch((error) => {
-        if (previewRunIdRef.current !== runId) return
-        toast.error(
-          error instanceof Error ? error.message : '浏览器自动采集失败'
-        )
-        startTimedPreview(markBrowserCaptureError(runExecutionNodes, error))
-      })
+      return nextNodes
+    })
   }, [
+    applyBackendExecutionLogToPreview,
     blueprintTitle,
     blueprints,
     cancelPreviewRun,
@@ -2952,6 +2927,7 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
     waiting: '等待',
     running: '运行',
     done: '完成',
+    failed: '失败',
   }
   return (
     <span
@@ -2960,7 +2936,8 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
         status === 'ready' && 'bg-muted text-muted-foreground',
         status === 'waiting' && 'bg-amber-500/12 text-amber-700',
         status === 'running' && 'bg-blue-500/12 text-blue-700',
-        status === 'done' && 'bg-emerald-500/12 text-emerald-700'
+        status === 'done' && 'bg-emerald-500/12 text-emerald-700',
+        status === 'failed' && 'bg-destructive/10 text-destructive'
       )}
     >
       <span
@@ -2969,7 +2946,8 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
           status === 'ready' && 'bg-muted-foreground',
           status === 'waiting' && 'bg-amber-500',
           status === 'running' && 'bg-blue-500',
-          status === 'done' && 'bg-emerald-500'
+          status === 'done' && 'bg-emerald-500',
+          status === 'failed' && 'bg-destructive'
         )}
       />
       {labelMap[status]}
@@ -3165,6 +3143,7 @@ function ExecutionLogPanel({
               'rounded-[8px] border p-2.5',
               status === 'running' && 'border-blue-500/30 bg-blue-500/5',
               status === 'done' && 'border-emerald-500/30 bg-emerald-500/5',
+              status === 'failed' && 'border-destructive/30 bg-destructive/5',
               status === 'waiting' && 'border-border/50 bg-muted/10',
               status === 'ready' && 'border-border/50 bg-muted/10'
             )}
@@ -3198,7 +3177,8 @@ function ExecutionLogPanel({
                     logStatus === 'completed' &&
                       'bg-emerald-500/12 text-emerald-700',
                     logStatus === 'pending' && 'bg-amber-500/12 text-amber-700',
-                    logStatus === 'stopped' && 'bg-slate-500/12 text-slate-700'
+                    logStatus === 'stopped' && 'bg-slate-500/12 text-slate-700',
+                    logStatus === 'failed' && 'bg-destructive/10 text-destructive'
                   )}
                 >
                   {formatLogStatus(logStatus)}
@@ -3305,6 +3285,7 @@ function formatLogStatus(status: AgentNodeLogStatus) {
     running: '执行中',
     completed: '完成',
     stopped: '已停止',
+    failed: '执行失败',
   }
   return labels[status]
 }
@@ -3312,6 +3293,7 @@ function formatLogStatus(status: AgentNodeLogStatus) {
 function statusToLogStatus(status: AgentNodeStatus): AgentNodeLogStatus {
   if (status === 'running') return 'running'
   if (status === 'done') return 'completed'
+  if (status === 'failed') return 'failed'
   return 'pending'
 }
 
@@ -3357,335 +3339,6 @@ function browserScreenshotSummary(node: AgentFlowNode) {
   const error = browserScreenshotError(node)
   if (error) return `截图证据: 截图失败，${error}`
   return '截图证据: 未返回截图文件'
-}
-
-function updateNodeRuntimeSettings(
-  nodes: AgentFlowNode[],
-  nodeId: string,
-  patch: Record<string, string>
-) {
-  return nodes.map((node) =>
-    node.id === nodeId
-      ? {
-          ...node,
-          data: {
-            ...node.data,
-            settings: { ...node.data.settings, ...patch },
-          },
-        }
-      : node
-  )
-}
-
-async function captureBrowserNodes(nodes: AgentFlowNode[]) {
-  let nextNodes = nodes
-
-  for (const node of nodes) {
-    if (node.data.kind !== 'browser') continue
-
-    const url = node.data.settings['网址']?.trim()
-    if (!url) {
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        采集错误: '浏览器取数节点未配置网址。',
-      })
-      continue
-    }
-
-    try {
-      const result = await captureAgentBrowserPage({
-        url,
-        login_state: node.data.settings['登录态'] || '',
-        wait_seconds: parseBrowserCaptureWaitSeconds(
-          node.data.settings['采集等待']
-        ),
-      })
-      const text = result.text.trim()
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [BROWSER_CAPTURE_TEXT_SETTING]: text,
-        [BROWSER_PAGE_DATA_SETTING]: '',
-        [BROWSER_SCREENSHOT_SETTING]: result.screenshot_path || '',
-        [BROWSER_SCREENSHOT_ERROR_SETTING]: result.screenshot_error || '',
-        采集标题: result.title,
-        采集网址: result.final_url || result.url,
-        采集时间: String(result.captured_at),
-        采集错误: text ? '' : '浏览器已打开页面，但未返回可解析的页面文本。',
-      })
-    } catch (error) {
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [BROWSER_CAPTURE_TEXT_SETTING]: '',
-        [BROWSER_PAGE_DATA_SETTING]: '',
-        [BROWSER_SCREENSHOT_SETTING]: '',
-        [BROWSER_SCREENSHOT_ERROR_SETTING]: '',
-        采集错误:
-          error instanceof Error ? error.message : '浏览器自动采集失败。',
-      })
-    }
-  }
-
-  return nextNodes
-}
-
-async function executeHTTPNodes(nodes: AgentFlowNode[]) {
-  let nextNodes = nodes
-
-  for (const node of nodes) {
-    if (node.data.kind !== 'request' && node.data.kind !== 'notify') continue
-
-    const isNotify = node.data.kind === 'notify'
-    const url = (
-      isNotify
-        ? node.data.settings['Webhook'] ||
-          node.data.settings['通知目标'] ||
-          node.data.settings['网址']
-        : node.data.settings['网址'] || node.data.settings['请求URL']
-    )?.trim()
-    if (!url) {
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [HTTP_ERROR_SETTING]: isNotify
-          ? `${node.data.settings['渠道'] || 'Webhook'} 通知未配置目标 URL。`
-          : '网页请求节点未配置网址。',
-        [HTTP_RESPONSE_SETTING]: '',
-        [HTTP_STATUS_SETTING]: '',
-      })
-      continue
-    }
-
-    try {
-      const result = await executeAgentHTTPRequest({
-        url,
-        method: isNotify ? 'POST' : node.data.settings['方法'] || 'GET',
-        headers: parseHTTPHeaders(node.data.settings['请求头'] || ''),
-        body: isNotify
-          ? buildNotifyWebhookBody(node)
-          : node.data.settings['请求体'] || '',
-        timeout_seconds: parseDurationSeconds(node.data.settings['超时'], 30),
-      })
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [HTTP_RESPONSE_SETTING]: result.body,
-        [HTTP_STATUS_SETTING]: String(result.status_code),
-        [HTTP_ERROR_SETTING]: '',
-        'HTTP 最终网址': result.final_url,
-        'HTTP 内容类型': result.content_type || '',
-        'HTTP 耗时': `${result.duration_ms}ms`,
-      })
-    } catch (error) {
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [HTTP_RESPONSE_SETTING]: '',
-        [HTTP_STATUS_SETTING]: '',
-        [HTTP_ERROR_SETTING]:
-          error instanceof Error ? error.message : 'HTTP 请求执行失败。',
-      })
-    }
-  }
-
-  return nextNodes
-}
-
-async function executeImageNodes(
-  nodes: AgentFlowNode[],
-  edges: AgentFlowEdge[],
-  skillChoices: SkillChoice[]
-) {
-  let nextNodes = nodes
-
-  for (const node of nodes) {
-    if (node.data.kind !== 'image') continue
-
-    const priorLogs = buildCompletedLogsBeforeNode(
-      nextNodes,
-      edges,
-      node.id,
-      skillChoices
-    )
-    const upstreamLogs = directUpstreamLogs(node, priorLogs, edges)
-    const prompt = buildImageNodePrompt(node, upstreamLogs)
-    const params = buildImageNodeParams(node)
-    const createdAt = Date.now()
-    const taskId = `agent-image-${node.id}-${createdAt}`
-
-    try {
-      const saved = await startImageGenerationTask({
-        id: taskId,
-        prompt,
-        negativePrompt: params.negativePrompt || undefined,
-        params,
-        model: node.data.model || 'gpt-image-1',
-        group: node.data.group || 'default',
-        referenceImages: [],
-        urls: [],
-        status: 'running',
-        errorMessage: undefined,
-        durationMs: undefined,
-        createdAt,
-        updatedAt: createdAt,
-      })
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [IMAGE_TASK_ID_SETTING]: saved.id,
-        [IMAGE_TASK_STATUS_SETTING]: saved.status,
-        [IMAGE_TASK_URLS_SETTING]: saved.urls?.join('\n') || '',
-        [IMAGE_TASK_ERROR_SETTING]: saved.errorMessage || '',
-        [IMAGE_TASK_PROMPT_SETTING]: prompt,
-      })
-    } catch (error) {
-      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
-        [IMAGE_TASK_ID_SETTING]: taskId,
-        [IMAGE_TASK_STATUS_SETTING]: 'failed',
-        [IMAGE_TASK_URLS_SETTING]: '',
-        [IMAGE_TASK_ERROR_SETTING]:
-          error instanceof Error ? error.message : '图片任务提交失败。',
-        [IMAGE_TASK_PROMPT_SETTING]: prompt,
-      })
-    }
-  }
-
-  return nextNodes
-}
-
-function buildCompletedLogsBeforeNode(
-  nodes: AgentFlowNode[],
-  edges: AgentFlowEdge[],
-  nodeId: string,
-  skillChoices: SkillChoice[]
-) {
-  const nodeIndex = nodes.findIndex((node) => node.id === nodeId)
-  const beforeNodes = nodeIndex >= 0 ? nodes.slice(0, nodeIndex) : []
-  const statusById = new Map<string, AgentNodeStatus>()
-  beforeNodes.forEach((node) => statusById.set(node.id, 'done'))
-  return buildPreviewExecutionLog(beforeNodes, statusById, skillChoices, edges)
-}
-
-function buildImageNodePrompt(
-  node: AgentFlowNode,
-  upstreamLogs: AgentNodeExecutionLog[]
-) {
-  const explicitPrompt = node.data.settings['图片提示词']?.trim()
-  const upstreamSummary = summarizeUpstreamLogs(upstreamLogs, 2400)
-  return [
-    node.data.description.trim(),
-    explicitPrompt ? `图片提示词: ${explicitPrompt}` : '',
-    `风格: ${node.data.settings['风格'] || 'auto'}`,
-    upstreamSummary
-      ? `上游真实输入:\n${upstreamSummary}`
-      : '上游真实输入: 未提供，按当前节点描述生成通用图片。',
-    '要求: 只依据上游真实输入和当前节点描述生成，不使用演示图片或内置样例。',
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-}
-
-function buildImageNodeParams(node: AgentFlowNode): ImageGenerationParams {
-  const aspectRatio = normalizeImageAspectRatio(node.data.settings['尺寸'])
-  return {
-    resolution: 'auto',
-    aspectRatio,
-    quality: 'auto',
-    style: imageStyleForSetting(node.data.settings['风格']),
-    n: normalizeImageCount(node.data.settings['数量']),
-    seed: null,
-    negativePrompt: node.data.settings['负面提示词'] || '',
-  }
-}
-
-function normalizeImageAspectRatio(value?: string): ImageAspectRatio {
-  const allowed = new Set<ImageAspectRatio>([
-    'auto',
-    '1:1',
-    '16:9',
-    '9:16',
-    '4:3',
-    '3:4',
-    '3:2',
-    '2:3',
-  ])
-  return allowed.has(value as ImageAspectRatio)
-    ? (value as ImageAspectRatio)
-    : 'auto'
-}
-
-function imageStyleForSetting(value?: string): ImageGenerationParams['style'] {
-  if (!value || value === 'auto') return 'auto'
-  if (/自然|写实|natural/i.test(value)) return 'natural'
-  if (/鲜明|营销|vivid/i.test(value)) return 'vivid'
-  return 'auto'
-}
-
-function normalizeImageCount(value?: string) {
-  const parsed = Number.parseInt(value || '1', 10)
-  if (!Number.isFinite(parsed)) return 1
-  return Math.min(4, Math.max(1, parsed))
-}
-
-function buildNotifyWebhookBody(node: AgentFlowNode) {
-  const channel = node.data.settings['渠道'] || 'Webhook'
-  const text = [
-    node.data.title,
-    node.data.description,
-    `生成时间: ${new Date().toISOString()}`,
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-  if (/slack/i.test(channel)) {
-    return JSON.stringify({ text }, null, 2)
-  }
-  if (/飞书|feishu|lark/i.test(channel)) {
-    return JSON.stringify(
-      { msg_type: 'text', content: { text } },
-      null,
-      2
-    )
-  }
-  if (/企业微信|wecom|wechat-work|钉钉|dingtalk/i.test(channel)) {
-    return JSON.stringify(
-      { msgtype: 'text', text: { content: text } },
-      null,
-      2
-    )
-  }
-  return JSON.stringify(
-    {
-      title: node.data.title,
-      description: node.data.description,
-      channel,
-      target: node.data.settings['通知目标'] || node.data.settings['Webhook'] || '',
-      generated_at: new Date().toISOString(),
-    },
-    null,
-    2
-  )
-}
-
-function parseHTTPHeaders(value: string) {
-  const headers: Record<string, string> = {}
-  for (const line of value.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    const [key, ...rest] = trimmed.split(':')
-    if (!key || rest.length === 0) continue
-    headers[key.trim()] = rest.join(':').trim()
-  }
-  return headers
-}
-
-function parseDurationSeconds(value: string | undefined, fallback: number) {
-  const parsed = Number.parseInt(value || '', 10)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.min(60, Math.max(1, parsed))
-}
-
-function markBrowserCaptureError(nodes: AgentFlowNode[], error: unknown) {
-  const message =
-    error instanceof Error ? error.message : '浏览器自动采集失败。'
-  return nodes.map((node) =>
-    node.data.kind === 'browser'
-      ? updateNodeRuntimeSettings([node], node.id, {
-          [BROWSER_CAPTURE_TEXT_SETTING]: '',
-          [BROWSER_PAGE_DATA_SETTING]: '',
-          [BROWSER_SCREENSHOT_SETTING]: '',
-          [BROWSER_SCREENSHOT_ERROR_SETTING]: '',
-          采集错误: message,
-        })[0]
-      : node
-  )
 }
 
 function stripTransientNodeSettings(nodes: AgentFlowNode[]) {
@@ -3758,20 +3411,6 @@ function buildPreviewStatusMap(
   return statusById
 }
 
-function finalizeTriggerNodeStatuses(
-  executionNodes: AgentFlowNode[],
-  statusById: Map<string, AgentNodeStatus>
-): Map<string, AgentNodeStatus> {
-  const next = new Map(statusById)
-  executionNodes.forEach((node) => {
-    if (statusById.get(node.id) !== 'done') return
-    if (node.data.kind === 'schedule') {
-      next.set(node.id, 'waiting')
-    }
-  })
-  return next
-}
-
 function buildPreviewExecutionLog(
   executionNodes: AgentFlowNode[],
   statusById: Map<string, AgentNodeStatus>,
@@ -3825,6 +3464,238 @@ function buildPreviewExecutionLog(
   }, {})
 }
 
+function buildBackendExecutionPreview(
+  log: AgentExecutionLog,
+  executionNodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+):
+  | {
+      executionLog: AgentExecutionLogMap
+      statusById: Map<string, AgentNodeStatus>
+      blueprintStatus: AgentBlueprintStatus
+    }
+  | null {
+  const graph = parseBackendGraphOutput(log.output)
+  if (!graph || !Array.isArray(graph.nodes)) return null
+
+  const resultById = new Map(
+    graph.nodes
+      .filter((result) => typeof result.node_id === 'string')
+      .map((result) => [result.node_id as string, result])
+  )
+  const executionLog: AgentExecutionLogMap = {}
+  const statusById = new Map<string, AgentNodeStatus>()
+
+  for (const node of executionNodes) {
+    const result = resultById.get(node.id)
+    if (!result) {
+      statusById.set(node.id, 'waiting')
+      continue
+    }
+    const nodeStatus = backendNodeStatus(result.status)
+    statusById.set(node.id, nodeStatus)
+    executionLog[node.id] = buildBackendNodeExecutionLog(
+      node,
+      result,
+      graph,
+      edges,
+      executionLog
+    )
+  }
+
+  return {
+    executionLog,
+    statusById,
+    blueprintStatus: backendBlueprintStatus(log.status, statusById),
+  }
+}
+
+function parseBackendGraphOutput(value: unknown): BackendAgentGraphOutput | null {
+  const parsed =
+    typeof value === 'string'
+      ? parseMaybeJSON(value)
+      : value && typeof value === 'object'
+        ? value
+        : null
+  if (!parsed || typeof parsed !== 'object') return null
+  const graph = parsed as BackendAgentGraphOutput
+  if (!Array.isArray(graph.nodes)) return null
+  return graph
+}
+
+function buildBackendNodeExecutionLog(
+  node: AgentFlowNode,
+  result: BackendAgentNodeResult,
+  graph: BackendAgentGraphOutput,
+  edges: AgentFlowEdge[],
+  currentLogs: AgentExecutionLogMap
+): AgentNodeExecutionLog {
+  const logStatus = backendNodeLogStatus(result.status)
+  const upstreamLogs = directUpstreamLogs(node, currentLogs, edges)
+  const steps = [
+    '后端真实执行节点。',
+    result.message || backendNodeStatusText(logStatus),
+    result.archive_path ? `归档路径: ${result.archive_path}` : '',
+    ...(graph.warnings ?? [])
+      .filter((warning) => warning.includes(result.node_id ?? ''))
+      .map((warning) => `警告: ${warning}`),
+  ].filter(Boolean)
+
+  return {
+    nodeId: result.node_id || node.id,
+    status: logStatus,
+    startedAt: result.started_at,
+    endedAt: result.ended_at,
+    durationMs: result.duration_ms,
+    message: result.message || backendNodeStatusText(logStatus),
+    inputSummary: backendInputSummary(result.input, upstreamLogs),
+    outputSummary: backendOutputSummary(result),
+    modelOutput: backendNodeModelOutput(result),
+    steps,
+    error: result.error,
+  }
+}
+
+function backendNodeStatus(value?: string): AgentNodeStatus {
+  switch (value) {
+    case 'completed':
+      return 'done'
+    case 'running':
+      return 'running'
+    case 'failed':
+      return 'failed'
+    default:
+      return 'waiting'
+  }
+}
+
+function backendNodeLogStatus(value?: string): AgentNodeLogStatus {
+  switch (value) {
+    case 'completed':
+      return 'completed'
+    case 'running':
+      return 'running'
+    case 'failed':
+      return 'failed'
+    case 'stopped':
+      return 'stopped'
+    default:
+      return 'pending'
+  }
+}
+
+function backendBlueprintStatus(
+  status: string,
+  statusById: Map<string, AgentNodeStatus>
+): AgentBlueprintStatus {
+  if (status === 'failed' || [...statusById.values()].includes('failed')) {
+    return 'failed'
+  }
+  if (status === 'running' || status === 'pending') return 'running'
+  if (status === 'paused') return 'paused'
+  return 'ended'
+}
+
+function backendNodeStatusText(status: AgentNodeLogStatus) {
+  if (status === 'failed') return '后端节点执行失败。'
+  if (status === 'completed') return '后端节点执行完成。'
+  if (status === 'running') return '后端节点正在执行。'
+  if (status === 'stopped') return '后端节点已停止。'
+  return '后端节点等待执行。'
+}
+
+function backendInputSummary(
+  input: unknown,
+  upstreamLogs: AgentNodeExecutionLog[]
+) {
+  const record = asPlainRecord(input)
+  const summaries: string[] = []
+  if (record) {
+    const settings = asPlainRecord(record.settings)
+    if (settings && Object.keys(settings).length > 0) {
+      summaries.push(`配置字段: ${Object.keys(settings).join('、')}`)
+    }
+    const upstream = asPlainRecord(record.upstream)
+    if (upstream && Object.keys(upstream).length > 0) {
+      summaries.push(`上游节点: ${Object.keys(upstream).join('、')}`)
+    }
+  }
+  if (summaries.length === 0 && upstreamLogs.length > 0) {
+    summaries.push(`上游日志: ${upstreamLogs.map((log) => log.nodeId).join('、')}`)
+  }
+  if (summaries.length === 0 && input !== undefined && input !== null) {
+    summaries.push(truncateText(formatBackendValue(input), 180))
+  }
+  return summaries.length > 0 ? summaries : ['无显式输入']
+}
+
+function backendOutputSummary(result: BackendAgentNodeResult) {
+  if (result.error) return [`执行失败: ${result.error}`]
+  const output = asPlainRecord(result.output)
+  if (!output) {
+    return result.output === undefined || result.output === null
+      ? ['无显式输出']
+      : [truncateText(formatBackendValue(result.output), 180)]
+  }
+
+  const summaries: string[] = []
+  const files = Array.isArray(output.files) ? output.files : []
+  for (const file of files) {
+    const fileRecord = asPlainRecord(file)
+    if (!fileRecord) continue
+    summaries.push(
+      `实际文件: ${String(fileRecord.label ?? '文件')} -> ${String(fileRecord.path ?? '')}`
+    )
+  }
+  if (typeof output.output_directory === 'string') {
+    summaries.push(`归档目录: ${output.output_directory}`)
+  }
+  if (typeof output.screenshot_path === 'string' && output.screenshot_path) {
+    summaries.push(`截图证据: ${output.screenshot_path}`)
+  }
+  if (typeof output.text_length === 'number') {
+    summaries.push(`页面文本: ${output.text_length} 字符`)
+  }
+  if (typeof output.row_count === 'number') {
+    summaries.push(`行数: ${output.row_count}`)
+  } else if (typeof output.count === 'number') {
+    summaries.push(`数量: ${output.count}`)
+  }
+  if (typeof output.status === 'string') {
+    summaries.push(`状态: ${output.status}`)
+  }
+  if (summaries.length === 0) {
+    const keys = Object.keys(output)
+    summaries.push(keys.length > 0 ? `输出字段: ${keys.join('、')}` : '无显式输出')
+  }
+  return summaries
+}
+
+function backendNodeModelOutput(result: BackendAgentNodeResult) {
+  const output = asPlainRecord(result.output)
+  if (output && typeof output.result === 'string') {
+    return truncateText(output.result, 6000)
+  }
+  if (output && typeof output.content === 'string') {
+    return truncateText(output.content, 6000)
+  }
+  return truncateText(formatBackendValue(result.output ?? result), 6000)
+}
+
+function formatBackendValue(value: unknown) {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function asPlainRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
 function directUpstreamLogs(
   node: AgentFlowNode,
   logs: AgentExecutionLogMap,
@@ -3834,165 +3705,6 @@ function directUpstreamLogs(
     .filter((edge) => edge.target === node.id)
     .map((edge) => logs[edge.source])
     .filter((log): log is AgentNodeExecutionLog => Boolean(log))
-}
-
-async function writeCompletedReportOutputs(
-  executionNodes: AgentFlowNode[],
-  executionLog: AgentExecutionLogMap
-) {
-  const results: Record<
-    string,
-    { files: AgentReportWrittenFile[]; outputDirectory: string }
-  > = {}
-
-  for (const node of executionNodes) {
-    if (node.data.kind !== 'report') continue
-    const log = executionLog[node.id]
-    if (!log || log.status !== 'completed') continue
-    const files = buildReportArtifactFiles(node, log)
-    if (files.length === 0) continue
-
-    const outputDir =
-      node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
-    const result = await writeAgentReport({
-      title: node.data.title,
-      output_directory: outputDir,
-      files,
-    })
-    results[node.id] = {
-      files: result.files,
-      outputDirectory: result.output_directory,
-    }
-  }
-
-  return results
-}
-
-function buildReportArtifactFiles(
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-): AgentReportOutputFile[] {
-  const templateFiles = buildReportArtifactFilesFromTemplates(node, log)
-  if (templateFiles.length > 0) return templateFiles
-
-  return reportFileOutputLabels(node).map((label) => {
-    const extension = reportExtensionForLabel(label)
-    const template = findReportTemplateForExtension(node, extension)
-    return {
-      label,
-      extension,
-      content: buildReportArtifactContent(label, extension, node, log),
-      template_path: template?.path,
-      template_original_name: template?.originalName,
-    }
-  })
-}
-
-function buildReportArtifactFilesFromTemplates(
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-): AgentReportOutputFile[] {
-  const bindings = parseTemplateBindings(
-    node.data.settings['模板文件'] || '',
-    node.data.settings
-  )
-  return bindings
-    .map<AgentReportOutputFile | null>((binding) => {
-      const label = reportOutputFormatForTemplatePath(binding.path)
-      if (!label) return null
-      const extension = reportExtensionForLabel(label)
-      return {
-        label,
-        extension,
-        content: buildReportArtifactContent(label, extension, node, log),
-        template_path: binding.path,
-        template_original_name: binding.originalName,
-      }
-    })
-    .filter((file): file is AgentReportOutputFile => Boolean(file))
-}
-
-function buildReportArtifactContent(
-  label: string,
-  extension: string,
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-) {
-  if (extension === 'csv') return buildReportCsvContent(label, node, log)
-  if (extension === 'json') return buildReportJsonContent(label, node, log)
-  if (extension === 'html') return buildReportHtmlContent(label, node, log)
-  if (extension === 'txt') return log.modelOutput
-  return log.modelOutput
-}
-
-function buildReportCsvContent(
-  label: string,
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-) {
-  const rows = [
-    ['类型', '内容'],
-    ['节点', node.data.title],
-    ['输出格式', label],
-    ['节点描述', node.data.description],
-    ...log.inputSummary.map((item) => ['输入', item]),
-    ['生成内容', log.modelOutput],
-  ]
-  return rows.map((row) => row.map(csvCell).join(',')).join('\n')
-}
-
-function buildReportJsonContent(
-  label: string,
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-) {
-  return JSON.stringify(
-    {
-      node: node.data.title,
-      output_format: label,
-      description: node.data.description,
-      input_summary: log.inputSummary,
-      output_summary: log.outputSummary,
-      content: log.modelOutput,
-    },
-    null,
-    2
-  )
-}
-
-function buildReportHtmlContent(
-  label: string,
-  node: AgentFlowNode,
-  log: AgentNodeExecutionLog
-) {
-  return [
-    '<!doctype html>',
-    '<html lang="zh-CN">',
-    '<head>',
-    '<meta charset="utf-8" />',
-    `<title>${escapeHtml(node.data.title)}</title>`,
-    '</head>',
-    '<body>',
-    `<h1>${escapeHtml(node.data.title)}</h1>`,
-    `<p><strong>输出格式:</strong> ${escapeHtml(label)}</p>`,
-    `<p>${escapeHtml(node.data.description)}</p>`,
-    `<pre>${escapeHtml(log.modelOutput)}</pre>`,
-    '</body>',
-    '</html>',
-  ].join('\n')
-}
-
-function csvCell(value: string) {
-  return `"${value.replace(/"/g, '""')}"`
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
 }
 
 function estimateNodeDuration(node: AgentFlowNode, index: number) {
@@ -4063,19 +3775,16 @@ function buildNodeOutputSummary(
   if (node.data.outputs.length === 0) return ['无显式输出']
 
   if (node.data.kind === 'browser' && status === 'completed') {
-    const metrics = parseXianyuOverviewMetrics(browserCapturedText(node))
+    const capturedText = browserCapturedText(node)
     const error = browserCaptureError(node)
-    return metrics.length > 0
-      ? [
-          `页面数据: 已解析 ${metrics.length} 个闲鱼数据总览指标`,
-          browserScreenshotSummary(node),
-        ]
-      : [
-          error
-            ? `页面数据: 自动采集失败，${error}`
-            : '页面数据: 未获取可解析的真实页面数据',
-          browserScreenshotSummary(node),
-        ]
+    return [
+      error
+        ? `页面数据: 自动采集失败，${error}`
+        : capturedText
+          ? `页面数据: 已采集真实页面文本 ${capturedText.length} 字符`
+          : '页面数据: 未获取可解析的真实页面数据',
+      browserScreenshotSummary(node),
+    ]
   }
 
   if (node.data.kind === 'request' && status === 'completed') {
@@ -4170,20 +3879,6 @@ function buildNodeModelOutput(
     case 'transform': {
       const templateName = node.data.settings['整理模板']
       const templateOriginalName = node.data.settings['模板原文件名']
-      const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
-      if (metrics.length > 0) {
-        return [
-          `模型: ${node.data.model}${skillLine}`,
-          '整理结果: 仅使用上一节点提供的闲鱼数据总览。',
-          '',
-          formatXianyuMetricsMarkdown(metrics),
-          '',
-          '限制: 上游未提供商品排行明细，后续节点不得生成商品ID、商品标题或TOP排行。',
-          templateName && templateName !== '未上传模板'
-            ? `已按当前模板文件「${templateOriginalName || templateName}」整理字段。`
-            : '未上传模板，已按上一节点数据结构自动归并。',
-        ].join('\n')
-      }
       if (hasMissingBrowserData(upstreamLogs)) {
         return buildBlockedByMissingBrowserDataOutput(node)
       }
@@ -4226,31 +3921,6 @@ function buildNodeModelOutput(
         node.data.settings['模板文件'] || '',
         node.data.settings
       )
-      const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
-      if (metrics.length > 0) {
-        return [
-          `模型: ${node.data.model}${skillLine}`,
-          '# 日报预览',
-          '',
-          '## 数据来源',
-          '- 仅使用上一节点提供的闲鱼数据总览和当前节点描述。',
-          '- 未使用标题、模板旧内容或其他隐含上下文补全数据。',
-          '',
-          '## 数据总览',
-          formatXianyuMetricsMarkdown(metrics),
-          '',
-          '## 结论',
-          ...buildXianyuMetricInsightLines(metrics),
-          '',
-          '## 后续处理',
-          `1. 按当前节点输出格式生成: ${outputFormats.join('、')}。`,
-          '2. 上游未提供商品排行明细，不生成商品ID、商品标题或TOP排行。',
-          '3. 正式执行时输出到当前节点配置的归档目录。',
-          '',
-          `预览输出目录: ${outputDir}`,
-          ...previewPaths.map((path) => `预览文件: ${path}`),
-        ].join('\n')
-      }
       if (hasMissingBrowserData(upstreamLogs)) {
         return buildBlockedByMissingBrowserDataOutput(node)
       }
@@ -4307,21 +3977,18 @@ function buildNodeModelOutput(
 function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
   const capturedText = browserCapturedText(node)
   const captureError = browserCaptureError(node)
-  const metrics = parseXianyuOverviewMetrics(capturedText)
 
-  if (metrics.length > 0) {
+  if (capturedText) {
     return [
       `模型: ${node.data.model}${skillLine}`,
       '数据来源: 浏览器节点自动采集的真实页面文本。',
       `采集网址: ${node.data.settings['采集网址'] || node.data.settings['网址'] || '未记录'}`,
       browserScreenshotSummary(node),
-      `${XIANYU_OVERVIEW_METRICS_MARKER}:`,
-      JSON.stringify(metrics, null, 2),
       '',
-      '数据总览:',
-      formatXianyuMetricsMarkdown(metrics),
+      '页面文本摘录:',
+      truncateText(capturedText, 4000),
       '',
-      '限制: 当前数据仅包含数据总览；未获取商品排行明细。下游不得生成商品ID、商品标题或TOP排行。',
+      '限制: 仅向下游传递当前页面实际采集文本、截图路径和节点配置，不使用模板、标题或历史内容补全业务数据。',
     ].join('\n')
   }
 
@@ -4333,7 +4000,7 @@ function buildBrowserNodeModelOutput(node: AgentFlowNode, skillLine: string) {
     `目标网址: ${node.data.settings['网址'] || '未配置'}`,
     browserScreenshotSummary(node),
     '处理: 请确认目标页面已登录并能在浏览器中正常打开，然后重新执行。',
-    '限制: 不会根据模板、标题、历史内容或模型常识补全商品排行、商品ID、商品标题。',
+    '限制: 不会根据模板、标题、历史内容或模型常识补全页面数据。',
   ].join('\n')
 }
 
@@ -4557,17 +4224,8 @@ function buildBlockedByMissingBrowserDataOutput(node: AgentFlowNode) {
     `${BROWSER_DATA_MISSING_MARKER}: true`,
     '无法生成有效输出: 上游浏览器取数节点没有提供真实页面数据。',
     '请先让浏览器取数节点自动采集到可解析的真实页面数据。',
-    '为避免错误数据，本节点不会根据模板、标题或隐含上下文生成商品排行、商品ID、商品标题。',
+    '为避免错误数据，本节点不会根据模板、标题或隐含上下文补全页面数据。',
   ].join('\n')
-}
-
-function extractXianyuMetricsFromLogs(logs: AgentNodeExecutionLog[]) {
-  for (const log of [...logs].reverse()) {
-    if (log.status !== 'completed') continue
-    const metrics = parseXianyuOverviewMetrics(log.modelOutput)
-    if (metrics.length > 0) return metrics
-  }
-  return []
 }
 
 function hasMissingBrowserData(logs: AgentNodeExecutionLog[]) {
@@ -4576,150 +4234,6 @@ function hasMissingBrowserData(logs: AgentNodeExecutionLog[]) {
       log.status === 'completed' &&
       log.modelOutput.includes(BROWSER_DATA_MISSING_MARKER)
   )
-}
-
-function parseXianyuOverviewMetrics(value: string): XianyuOverviewMetric[] {
-  const raw = value.trim()
-  if (!raw) return []
-
-  const fromJson = parseXianyuMetricJson(raw)
-  if (fromJson.length > 0) return fromJson
-
-  const metrics: XianyuOverviewMetric[] = []
-  const compact = raw
-    .replace(/\u00a0/g, ' ')
-    .replace(/[：:]/g, ' ')
-    .replace(/\s+/g, ' ')
-
-  for (const label of XIANYU_OVERVIEW_METRIC_LABELS) {
-    const tableMetric = parseMetricFromMarkdownTable(raw, label)
-    if (tableMetric) {
-      metrics.push(tableMetric)
-      continue
-    }
-
-    const index = compact.indexOf(label)
-    if (index < 0) continue
-    const segment = compact.slice(
-      index + label.length,
-      index + label.length + 120
-    )
-    const current = segment.match(
-      /\s*([¥￥]?\s*(?:-|\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?))/
-    )?.[1]
-    if (!current) continue
-    const previous = segment.match(
-      /前\s*1\s*日\s*([¥￥]?\s*(?:-|\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?))/
-    )?.[1]
-    const change = segment.match(/([↑↓]\s*\d+(?:\.\d+)?%|[-－])/)?.[1]
-    metrics.push({
-      label,
-      current: normalizeMetricValue(current),
-      previous: normalizeMetricValue(previous || '-'),
-      change: normalizeMetricValue(change || '-'),
-    })
-  }
-
-  return dedupeXianyuMetrics(metrics)
-}
-
-function parseXianyuMetricJson(value: string) {
-  const marker = `${XIANYU_OVERVIEW_METRICS_MARKER}:`
-  const markerIndex = value.indexOf(marker)
-  const source =
-    markerIndex >= 0 ? value.slice(markerIndex + marker.length) : value
-  const jsonText = source.match(/\[[\s\S]*?\]/)?.[0]
-  if (!jsonText) return []
-
-  try {
-    const parsed: unknown = JSON.parse(jsonText)
-    if (!Array.isArray(parsed)) return []
-    return dedupeXianyuMetrics(
-      parsed
-        .map((item) => {
-          if (!item || typeof item !== 'object') return null
-          const candidate = item as Partial<XianyuOverviewMetric>
-          if (typeof candidate.label !== 'string') return null
-          if (!XIANYU_OVERVIEW_METRIC_LABELS.includes(candidate.label)) {
-            return null
-          }
-          return {
-            label: candidate.label,
-            current: normalizeMetricValue(candidate.current || '-'),
-            previous: normalizeMetricValue(candidate.previous || '-'),
-            change: normalizeMetricValue(candidate.change || '-'),
-          }
-        })
-        .filter((item): item is XianyuOverviewMetric => Boolean(item))
-    )
-  } catch {
-    return []
-  }
-}
-
-function parseMetricFromMarkdownTable(value: string, label: string) {
-  const regex = new RegExp(
-    `\\|\\s*${escapeRegExp(label)}\\s*\\|\\s*([^|]+)\\|\\s*([^|]+)\\|\\s*([^|]+)\\|`,
-    'm'
-  )
-  const match = value.match(regex)
-  if (!match) return null
-  return {
-    label,
-    current: normalizeMetricValue(match[1]),
-    previous: normalizeMetricValue(match[2]),
-    change: normalizeMetricValue(match[3]),
-  }
-}
-
-function dedupeXianyuMetrics(metrics: XianyuOverviewMetric[]) {
-  const byLabel = new Map<string, XianyuOverviewMetric>()
-  for (const metric of metrics) {
-    if (!byLabel.has(metric.label)) {
-      byLabel.set(metric.label, metric)
-    }
-  }
-  return XIANYU_OVERVIEW_METRIC_LABELS.map((label) =>
-    byLabel.get(label)
-  ).filter((metric): metric is XianyuOverviewMetric => Boolean(metric))
-}
-
-function normalizeMetricValue(value: string) {
-  return value
-    .replace(/[￥¥]\s*/g, '¥')
-    .replace(/\s+/g, '')
-    .replace(/^－$/, '-')
-    .trim()
-}
-
-function formatXianyuMetricsMarkdown(metrics: XianyuOverviewMetric[]) {
-  return [
-    '| 指标 | 当前值 | 前1日 | 变化 |',
-    '| --- | ---: | ---: | ---: |',
-    ...metrics.map(
-      (metric) =>
-        `| ${metric.label} | ${metric.current} | ${metric.previous} | ${metric.change} |`
-    ),
-  ].join('\n')
-}
-
-function buildXianyuMetricInsightLines(metrics: XianyuOverviewMetric[]) {
-  const byLabel = new Map(metrics.map((metric) => [metric.label, metric]))
-  const focusLabels = [
-    '商品访问次数',
-    '商品曝光次数',
-    '商品浏览次数',
-    '支付笔数',
-    '支付金额（元）',
-  ]
-  const lines = focusLabels
-    .map((label) => byLabel.get(label))
-    .filter((metric): metric is XianyuOverviewMetric => Boolean(metric))
-    .map(
-      (metric) =>
-        `- ${metric.label}: 当前 ${metric.current}，前1日 ${metric.previous}，变化 ${metric.change}。`
-    )
-  return lines.length > 0 ? lines : ['- 已按上游结构化指标生成摘要。']
 }
 
 function escapeRegExp(value: string) {
@@ -4741,6 +4255,7 @@ function buildReportOutputSummary(
     running: '生成中',
     completed: '已生成预览',
     stopped: '已停止',
+    failed: '执行失败',
   }
   const formatLines = outputFormats.map(
     (format) => `${format}: ${statusText[status]}`
@@ -4792,11 +4307,11 @@ function buildNodeLogSteps(
   }
 
   if (node.data.kind === 'browser') {
-    const metrics = parseXianyuOverviewMetrics(browserCapturedText(node))
+    const capturedText = browserCapturedText(node)
     const error = browserCaptureError(node)
     steps.push(
-      metrics.length > 0
-        ? `从自动采集的页面文本解析 ${metrics.length} 个闲鱼数据总览指标。`
+      capturedText
+        ? `从自动采集的页面文本读取 ${capturedText.length} 个字符。`
         : error
           ? `浏览器自动采集失败: ${error}`
           : '等待 Edge/浏览器 DOM 采集器返回真实页面文本。'
@@ -4807,10 +4322,9 @@ function buildNodeLogSteps(
     const templateName = node.data.settings['整理模板']
     const templateOriginalName = node.data.settings['模板原文件名']
     const dataType = node.data.settings['数据类型'] || '自动识别'
-    const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
     steps.push(
-      metrics.length > 0
-        ? `使用上游 ${metrics.length} 个真实指标整理，不扩展隐含上下文。`
+      upstreamLogs.length > 0
+        ? `使用 ${upstreamLogs.length} 个上游真实节点输出整理，不扩展隐含上下文。`
         : templateName && templateName !== '未上传模板'
           ? `应用当前模板文件: ${templateOriginalName || templateName}`
           : `未上传模板，按数据类型「${dataType}」自动推断字段与格式。`
@@ -4825,18 +4339,15 @@ function buildNodeLogSteps(
     const outputFormats = reportFileOutputLabels(node)
     const outputDir =
       node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
-    const metrics = extractXianyuMetricsFromLogs(upstreamLogs)
     steps.push(
       templateBindings.length > 0
         ? `读取当前模板文件: ${templateBindingNames(templateBindings)}`
         : '未绑定模板文件，按当前节点描述生成日报。'
     )
-    if (metrics.length > 0) {
-      steps.push(
-        `使用上游 ${metrics.length} 个真实指标生成，不读取模板旧数据。`
-      )
-    } else if (hasMissingBrowserData(upstreamLogs)) {
+    if (hasMissingBrowserData(upstreamLogs)) {
       steps.push('上游真实页面数据缺失，本节点停止生成业务内容。')
+    } else {
+      steps.push(`使用 ${upstreamLogs.length} 个上游真实节点输出生成。`)
     }
     steps.push(`输出格式: ${outputFormats.join('、')}`)
     steps.push(`生成日报预览；正式执行时写入输出目录: ${outputDir}`)
@@ -6125,7 +5636,7 @@ function SettingControl({
         <Textarea
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          placeholder={'select 商品ID, 商品标题, 支付金额\nfilter 支付金额>0\nsort -支付金额\nlimit 20'}
+          placeholder={'select id, title, amount\nfilter amount>0\nsort -amount\nlimit 20'}
           className='min-h-32 rounded-[8px] font-mono text-xs'
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
@@ -6955,6 +6466,7 @@ function buildBackendInputVariables(blueprint: SavedAgentBlueprint) {
 }
 
 function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
+  if (nodes.some((node) => node.data.status === 'failed')) return 'failed'
   if (nodes.some((node) => node.data.status === 'running')) return 'running'
   if (hasScheduleNode(nodes)) return 'running'
   if (nodes.length > 0 && nodes.every((node) => node.data.status === 'done')) {
@@ -6983,6 +6495,8 @@ function normalizeSavedBlueprintStatus(
   savedStatus?: AgentBlueprintStatus
 ): AgentBlueprintStatus {
   if (savedStatus === 'paused') return 'paused'
+  if (savedStatus === 'failed') return 'failed'
+  if (nodes.some((node) => node.data.status === 'failed')) return 'failed'
   if (hasScheduleNode(nodes)) return 'running'
   if (
     savedStatus === 'running' &&
@@ -7003,8 +6517,10 @@ function getCurrentBlueprintStatus(
   nodes: AgentFlowNode[],
   savedStatus?: AgentBlueprintStatus
 ): AgentBlueprintStatus {
+  if (nodes.some((node) => node.data.status === 'failed')) return 'failed'
   if (nodes.some((node) => node.data.status === 'running')) return 'running'
   if (savedStatus === 'paused') return 'paused'
+  if (savedStatus === 'failed') return 'failed'
   if (hasScheduleNode(nodes)) return 'running'
   return getBlueprintStatus(nodes)
 }
@@ -7015,7 +6531,7 @@ function hasScheduleNode(nodes: AgentFlowNode[]) {
 
 function getRunPreviewButtonLabel(status: AgentBlueprintStatus) {
   if (status === 'paused') return '继续'
-  if (status === 'ended') return '重新执行'
+  if (status === 'ended' || status === 'failed') return '重新执行'
   return '试运行'
 }
 

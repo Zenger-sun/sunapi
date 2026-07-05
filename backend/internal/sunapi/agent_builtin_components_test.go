@@ -2,6 +2,7 @@ package sunapi
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 )
@@ -61,6 +62,58 @@ func TestExecuteAgentBranchLoopAndDedupeSortComponents(t *testing.T) {
 	}
 	if rows[0]["id"] != "b" {
 		t.Fatalf("first row id=%v want b", rows[0]["id"])
+	}
+}
+
+func TestExecuteBlueprintNodeGraphStopsOnFailedNode(t *testing.T) {
+	start := agentBlueprintGraphNode{ID: "start-1"}
+	start.Data.Kind = "start"
+	start.Data.Title = "开始"
+
+	browser := agentBlueprintGraphNode{ID: "browser-1"}
+	browser.Data.Kind = "browser"
+	browser.Data.Title = "浏览器取数"
+	browser.Data.Settings = map[string]string{}
+
+	stop := agentBlueprintGraphNode{ID: "stop-1"}
+	stop.Data.Kind = "stop"
+	stop.Data.Title = "停止"
+
+	nodes, err := json.Marshal([]agentBlueprintGraphNode{start, browser, stop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := json.Marshal([]agentBlueprintGraphEdge{
+		{Source: "start-1", Target: "browser-1"},
+		{Source: "browser-1", Target: "stop-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, _, err := executeBlueprintNodeGraph(
+		context.Background(),
+		nil,
+		&AgentBlueprint{ID: "bp-test", Nodes: nodes, Edges: edges},
+		nil,
+		map[string]interface{}{"type": "disabled"},
+	)
+	if err == nil {
+		t.Fatal("expected graph execution to fail when a node fails")
+	}
+
+	var graph agentBlueprintGraphExecution
+	if err := json.Unmarshal(output, &graph); err != nil {
+		t.Fatalf("failed to parse graph output: %v", err)
+	}
+	if len(graph.Nodes) != 2 {
+		t.Fatalf("executed nodes=%d want 2", len(graph.Nodes))
+	}
+	if graph.Nodes[1].NodeID != "browser-1" || graph.Nodes[1].Status != "failed" {
+		t.Fatalf("failed node=%+v", graph.Nodes[1])
+	}
+	if len(graph.Warnings) == 0 {
+		t.Fatal("expected graph warnings to include failed node")
 	}
 }
 

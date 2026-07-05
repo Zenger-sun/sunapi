@@ -238,6 +238,7 @@ func executeBlueprintNodeGraph(
 	results := make([]agentBlueprintNodeResult, 0, len(ordered))
 	outputsByNodeID := make(map[string]map[string]interface{}, len(ordered))
 	var warnings []string
+	var graphErr error
 
 	for _, node := range ordered {
 		upstream := upstreamAgentNodeOutputs(node.ID, edges, outputsByNodeID)
@@ -245,6 +246,9 @@ func executeBlueprintNodeGraph(
 		results = append(results, result)
 		if result.Status == "failed" {
 			warnings = append(warnings, fmt.Sprintf("%s: %s", node.ID, result.Error))
+			graphErr = fmt.Errorf("node %s failed: %s", node.ID, firstNonEmpty(result.Error, result.Message))
+			outputsByNodeID[node.ID] = result.Output
+			break
 		}
 		outputsByNodeID[node.ID] = result.Output
 	}
@@ -281,6 +285,9 @@ func executeBlueprintNodeGraph(
 		}
 	}
 
+	if graphErr != nil {
+		return json.RawMessage(outputJSON), archivePath, graphErr
+	}
 	return json.RawMessage(outputJSON), archivePath, nil
 }
 
@@ -2884,6 +2891,28 @@ func buildAgentGraphReportContent(node agentBlueprintGraphNode, upstream map[str
 }
 
 func agentGraphReportFiles(node agentBlueprintGraphNode, content string) []AgentReportOutputFile {
+	templateBindings := parseAgentReportTemplateBindings(
+		firstNonEmpty(node.Data.Settings["模板文件"], node.Data.Settings["网页模板"]),
+		node.Data.Settings["模板原文件名"],
+	)
+	if len(templateBindings) > 0 {
+		files := make([]AgentReportOutputFile, 0, len(templateBindings))
+		for _, binding := range templateBindings {
+			label := agentReportLabelForTemplatePath(binding.Path)
+			if label == "" {
+				label = firstNonEmpty(node.Data.Settings["输出格式"], "Markdown 日报")
+			}
+			files = append(files, AgentReportOutputFile{
+				Label:                label,
+				Extension:            agentReportExtensionForLabel(label),
+				Content:              content,
+				TemplatePath:         binding.Path,
+				TemplateOriginalName: binding.OriginalName,
+			})
+		}
+		return files
+	}
+
 	formats := splitAgentOutputFormats(node.Data.Settings["输出格式"])
 	if len(formats) == 0 {
 		formats = []string{"Markdown 日报"}
@@ -2899,6 +2928,73 @@ func agentGraphReportFiles(node agentBlueprintGraphNode, content string) []Agent
 		})
 	}
 	return files
+}
+
+type agentReportTemplateBinding struct {
+	Path         string `json:"path"`
+	OriginalName string `json:"originalName"`
+}
+
+func parseAgentReportTemplateBindings(value, originalName string) []agentReportTemplateBinding {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "未上传模板" {
+		return nil
+	}
+	if strings.HasPrefix(value, "[") {
+		var rawItems []interface{}
+		if err := json.Unmarshal([]byte(value), &rawItems); err == nil {
+			out := make([]agentReportTemplateBinding, 0, len(rawItems))
+			for _, item := range rawItems {
+				switch typed := item.(type) {
+				case string:
+					if strings.TrimSpace(typed) != "" {
+						out = append(out, agentReportTemplateBinding{
+							Path:         strings.TrimSpace(typed),
+							OriginalName: filepath.Base(filepath.FromSlash(typed)),
+						})
+					}
+				case map[string]interface{}:
+					pathValue := strings.TrimSpace(fmt.Sprint(typed["path"]))
+					if pathValue == "" || pathValue == "<nil>" {
+						continue
+					}
+					name := strings.TrimSpace(fmt.Sprint(typed["originalName"]))
+					if name == "" || name == "<nil>" {
+						name = filepath.Base(filepath.FromSlash(pathValue))
+					}
+					out = append(out, agentReportTemplateBinding{Path: pathValue, OriginalName: name})
+				}
+			}
+			return out
+		}
+	}
+	return []agentReportTemplateBinding{{
+		Path:         value,
+		OriginalName: firstNonEmpty(originalName, filepath.Base(filepath.FromSlash(value))),
+	}}
+}
+
+func agentReportLabelForTemplatePath(pathValue string) string {
+	switch strings.ToLower(filepath.Ext(filepath.FromSlash(pathValue))) {
+	case ".xlsx", ".xls":
+		return "Excel 表格"
+	case ".csv":
+		return "CSV 表格"
+	case ".md", ".markdown":
+		return "Markdown 日报"
+	case ".doc", ".docx":
+		return "Word 文档"
+	case ".pdf":
+		return "PDF 文档"
+	case ".html", ".htm":
+		return "HTML 网页"
+	case ".txt":
+		return "TXT 文本"
+	case ".json":
+		return "JSON 数据"
+	default:
+		return ""
+	}
 }
 
 func splitAgentOutputFormats(value string) []string {

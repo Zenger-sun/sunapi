@@ -11,7 +11,12 @@ hosting, sale, resale, sublicensing, or commercial use requires prior written
 permission from the SunAPI project owner.
 */
 
-export type AgentBlueprintStatus = 'pending' | 'running' | 'paused' | 'ended'
+export type AgentBlueprintStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'ended'
+  | 'failed'
 
 export type AgentBlueprintCommand =
   | { type: 'new' }
@@ -123,6 +128,7 @@ export function getAgentBlueprintStatusLabel(status: AgentBlueprintStatus) {
     running: '执行中',
     paused: '已暂停',
     ended: '已结束',
+    failed: '执行失败',
   }
   return labels[status]
 }
@@ -161,17 +167,6 @@ function normalizeBlueprintStatus(
       typeof node === 'object' &&
       (node as StoredAgentNode).data?.kind === 'schedule'
   )
-
-  if (status === 'paused') {
-    return 'paused'
-  }
-  if (hasScheduleNode) {
-    return 'running'
-  }
-  if (status === 'pending' || status === 'running') {
-    return status
-  }
-
   const nodeStatuses = nodes
     .map((node) =>
       node && typeof node === 'object'
@@ -179,6 +174,22 @@ function normalizeBlueprintStatus(
         : undefined
     )
     .filter(Boolean)
+
+  if (status === 'paused') {
+    return 'paused'
+  }
+  if (
+    status === 'failed' ||
+    nodeStatuses.some((nodeStatus) => nodeStatus === 'failed')
+  ) {
+    return 'failed'
+  }
+  if (hasScheduleNode) {
+    return 'running'
+  }
+  if (status === 'pending' || status === 'running') {
+    return status
+  }
 
   if (nodeStatuses.some((nodeStatus) => nodeStatus === 'running')) {
     return 'running'

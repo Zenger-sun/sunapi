@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -36,7 +37,10 @@ const (
 	maxAgentTemplatePreviewRunes = 6000
 )
 
-var agentTemplateIndexMu sync.Mutex
+var (
+	agentTemplateIndexMu                  sync.Mutex
+	agentReportTemplatePlaceholderPattern = regexp.MustCompile(`\{\{(?:title|标题|output_format|输出格式|content|内容|generated_at|生成时间)\}\}`)
+)
 
 var allowedAgentFileExtensions = map[string]bool{
 	".csv":  true,
@@ -625,9 +629,10 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 
 	var buf bytes.Buffer
 	writer := zip.NewWriter(&buf)
-	replaced := false
 	rows := agentReportWorksheetRows(title, label, content)
-	sheetData := []byte(buildAgentReportSheetDataXML(rows))
+	hasPlaceholders := agentReportTemplateHasPlaceholders(reader)
+	worksheetUpdated := false
+	placeholderReplaced := false
 
 	for _, file := range reader.File {
 		rc, err := file.Open()
@@ -646,9 +651,15 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 			return nil, closeErr
 		}
 
-		if !replaced && isAgentReportWorksheetEntry(file.Name) {
-			data = replaceAgentReportWorksheetData(data, sheetData)
-			replaced = true
+		if strings.HasSuffix(strings.ToLower(file.Name), ".xml") {
+			var replaced bool
+			data, replaced = replaceAgentReportTemplatePlaceholders(data, title, label, content)
+			placeholderReplaced = placeholderReplaced || replaced
+		}
+
+		if !worksheetUpdated && isAgentReportWorksheetEntry(file.Name) && !hasPlaceholders {
+			data = replaceAgentReportWorksheetData(data, []byte(buildAgentReportSheetDataXML(rows)))
+			worksheetUpdated = true
 		}
 
 		header := file.FileHeader
@@ -666,10 +677,31 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 	if err := writer.Close(); err != nil {
 		return nil, err
 	}
-	if !replaced {
+	if !worksheetUpdated && !placeholderReplaced {
 		return nil, errors.New("template worksheet not found")
 	}
 	return buf.Bytes(), nil
+}
+
+func agentReportTemplateHasPlaceholders(reader *zip.Reader) bool {
+	for _, file := range reader.File {
+		if !strings.HasSuffix(strings.ToLower(file.Name), ".xml") {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(rc, 2*1024*1024))
+		_ = rc.Close()
+		if readErr != nil {
+			continue
+		}
+		if agentReportTemplatePlaceholderPattern.Match(data) {
+			return true
+		}
+	}
+	return false
 }
 
 func isAgentReportWorksheetEntry(name string) bool {
@@ -692,6 +724,31 @@ func replaceAgentReportWorksheetData(worksheet, sheetData []byte) []byte {
 		return worksheet
 	}
 	return []byte(source[:insertAt] + string(sheetData) + source[insertAt:])
+}
+
+func replaceAgentReportTemplatePlaceholders(data []byte, title, label, content string) ([]byte, bool) {
+	source := string(data)
+	replacements := map[string]string{
+		"{{title}}":         xmlEscape(title),
+		"{{标题}}":            xmlEscape(title),
+		"{{output_format}}": xmlEscape(label),
+		"{{输出格式}}":          xmlEscape(label),
+		"{{content}}":       xmlEscape(content),
+		"{{内容}}":            xmlEscape(content),
+		"{{generated_at}}":  xmlEscape(time.Now().Format("2006-01-02 15:04:05")),
+		"{{生成时间}}":          xmlEscape(time.Now().Format("2006-01-02 15:04:05")),
+	}
+	replaced := false
+	for placeholder, value := range replacements {
+		if strings.Contains(source, placeholder) {
+			source = strings.ReplaceAll(source, placeholder, value)
+			replaced = true
+		}
+	}
+	if !replaced {
+		return data, false
+	}
+	return []byte(source), true
 }
 
 func agentReportWorksheetRows(title, label, content string) [][]string {
