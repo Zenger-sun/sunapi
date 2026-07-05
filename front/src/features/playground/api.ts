@@ -18,6 +18,9 @@ import type {
   ModelOption,
   AgentBrowserCaptureRequest,
   AgentBrowserCaptureResult,
+  AgentSkillFormData,
+  AgentSkillItem,
+  AgentSkillMarketplaceItem,
   AgentComponentFormData,
   AgentComponentItem,
   AgentFileUpload,
@@ -387,6 +390,61 @@ export async function deleteAgentComponent(id: string): Promise<void> {
 
   if (!data.success) {
     throw new Error(data.message || 'Failed to delete component')
+  }
+}
+
+export async function listAgentSkills(): Promise<AgentSkillItem[]> {
+  const res = await api.get('/api/agent-skills', {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list skills')
+  }
+
+  return data.data as AgentSkillItem[]
+}
+
+export async function listAgentSkillMarketplace(): Promise<
+  AgentSkillMarketplaceItem[]
+> {
+  const res = await api.get('/api/agent-skills/marketplace', {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list skill marketplace')
+  }
+
+  return data.data as AgentSkillMarketplaceItem[]
+}
+
+export async function createAgentSkill(
+  payload: AgentSkillFormData
+): Promise<AgentSkillItem> {
+  const res = await api.post('/api/agent-skills', payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to create skill')
+  }
+
+  return data.data as AgentSkillItem
+}
+
+export async function deleteAgentSkill(id: string): Promise<void> {
+  const res = await api.delete(`/api/agent-skills/${id}`, {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+
+  if (!data.success) {
+    throw new Error(data.message || 'Failed to delete skill')
   }
 }
 

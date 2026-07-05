@@ -211,6 +211,29 @@ func (s *Store) GetBlueprint(ctx context.Context, id string, userID int64) (*Age
 	return &b, nil
 }
 
+func (s *Store) GetBlueprintByID(ctx context.Context, id string) (*AgentBlueprint, error) {
+	var b AgentBlueprint
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, agent_id, user_id, name, description, status,
+		       trigger_config, model_group, model_name, skills,
+		       input_variables, archive_config, nodes, edges,
+		       created_time, updated_time, last_executed_time, next_execution_time,
+		       execution_count, failure_reason, execution_duration_ms
+		FROM agent_blueprints WHERE id=?`, id).
+		Scan(&b.ID, &b.AgentID, &b.UserID, &b.Name, &b.Description, &b.Status,
+			&b.TriggerConfig, &b.ModelGroup, &b.ModelName, &b.Skills,
+			&b.InputVariables, &b.ArchiveConfig, &b.Nodes, &b.Edges,
+			&b.CreatedTime, &b.UpdatedTime, &b.LastExecutedTime, &b.NextExecutionTime,
+			&b.ExecutionCount, &b.FailureReason, &b.ExecutionDurationMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
 func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int64, f BlueprintFormData) (*AgentBlueprint, error) {
 	if strings.TrimSpace(f.Name) == "" {
 		return nil, errors.New("blueprint name is required")

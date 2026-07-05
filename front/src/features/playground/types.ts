@@ -196,6 +196,45 @@ export interface AgentReportWriteResult {
   created_time: number
 }
 
+export interface AgentSkillItem {
+  id: string
+  name: string
+  description: string
+  version: string
+  source: 'builtin' | 'marketplace' | 'github' | 'custom'
+  source_url?: string
+  enabled: boolean
+  config?: Record<string, unknown>
+  permissions?: string[]
+  created_time: number
+  updated_time: number
+}
+
+export interface AgentSkillMarketplaceItem {
+  id: string
+  name: string
+  description: string
+  version: string
+  source_url?: string
+  tags?: string[]
+  capabilities?: string[]
+  permissions?: string[]
+  config?: Record<string, unknown>
+  installed: boolean
+}
+
+export interface AgentSkillFormData {
+  name: string
+  description: string
+  source_type: 'marketplace' | 'github' | 'custom'
+  source_url?: string
+  marketplace_id?: string
+  model_group?: string
+  model_name?: string
+  tags?: string[]
+  config?: Record<string, unknown>
+}
+
 export interface AgentBrowserCaptureRequest {
   url: string
   login_state?: string

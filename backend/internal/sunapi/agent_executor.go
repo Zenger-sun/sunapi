@@ -1,9 +1,11 @@
 package sunapi
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -50,7 +52,8 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 	// 计算耗时
 	durationMs := time.Since(startedAt).Milliseconds()
 
-	// 更新蓝图状态
+	// 更新蓝图状态。包含定时触发节点的蓝图代表一个持续运行的计划，
+	// 单次执行成功后仍保持 running，直到用户显式暂停。
 	finalStatus := "completed"
 	failureReason := ""
 	if execErr != nil {
@@ -58,6 +61,8 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 		failureReason = execErr.Error()
 		log.WithError(execErr).WithField("blueprint_id", bp.ID).
 			Warn("agent: blueprint execution failed")
+	} else if blueprintHasScheduleNode(bp) {
+		finalStatus = "running"
 	}
 
 	// 更新蓝图执行次数和时间
@@ -85,6 +90,22 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 		"status":       finalStatus,
 		"duration_ms":  durationMs,
 	}).Info("agent: blueprint execution finished")
+}
+
+func blueprintHasScheduleNode(bp *AgentBlueprint) bool {
+	if bp == nil || len(bp.Nodes) == 0 || string(bp.Nodes) == "null" {
+		return false
+	}
+	var nodes []agentBlueprintGraphNode
+	if err := json.Unmarshal(bp.Nodes, &nodes); err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if node.Data.Kind == "schedule" || node.Data.ComponentID == "component.schedule" {
+			return true
+		}
+	}
+	return false
 }
 
 // ── 核心执行逻辑 ──────────────────────────────────────────────────────────────
@@ -427,7 +448,11 @@ func executeAgentBlueprintNode(
 	case "request":
 		result = executeAgentRequestGraphNode(ctx, node, upstream, result)
 	case "transform":
-		result = executeAgentTransformGraphNode(node, upstream, result)
+		if node.Data.ComponentID == "component.code" {
+			result = executeAgentCodeGraphNode(node, upstream, result)
+		} else {
+			result = executeAgentTransformGraphNode(node, upstream, result)
+		}
 	case "image":
 		result = executeAgentImageGraphNode(ctx, store, bp, node, upstream, result)
 	case "report":
@@ -462,21 +487,47 @@ func executeAgentRequestGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	resp, err := executeAgentHTTPRequest(ctx, AgentHTTPRequest{
+	retryCount := parseAgentRetryCount(node.Data.Settings["重试"], 0)
+	req := AgentHTTPRequest{
 		URL:     url,
 		Method:  firstNonEmpty(node.Data.Settings["方法"], "GET"),
 		Headers: parseAgentHTTPHeaderLines(node.Data.Settings["请求头"]),
 		Body:    node.Data.Settings["请求体"],
 		Timeout: parseAgentDurationSeconds(node.Data.Settings["超时"], 30),
-	})
-	if err != nil {
+	}
+	resp, attemptLogs, hasResp, lastErr := executeAgentHTTPRequestWithRetry(
+		ctx,
+		req,
+		retryCount,
+		executeAgentHTTPRequest,
+		waitAgentHTTPRequestRetry,
+	)
+	if !hasResp && lastErr != nil {
 		result.Status = "failed"
 		result.Message = "真实 HTTP 请求失败。"
-		result.Error = err.Error()
-		result.Output = map[string]interface{}{"error": result.Error, "url": url}
+		result.Error = lastErr.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "url": url, "attempts": attemptLogs}
 		return result
 	}
-	result.Message = fmt.Sprintf("真实 HTTP 请求完成，状态码 %d。", resp.StatusCode)
+	if hasResp && lastErr != nil {
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("真实 HTTP 请求返回失败状态码 %d，已尝试 %d 次。", resp.StatusCode, len(attemptLogs))
+		result.Error = lastErr.Error()
+		result.Output = map[string]interface{}{
+			"error":        result.Error,
+			"url":          resp.URL,
+			"final_url":    resp.FinalURL,
+			"status_code":  resp.StatusCode,
+			"content_type": resp.ContentType,
+			"body":         resp.Body,
+			"truncated":    resp.Truncated,
+			"duration_ms":  resp.DurationMs,
+			"attempts":     attemptLogs,
+			"retry_count":  retryCount,
+		}
+		return result
+	}
+	result.Message = fmt.Sprintf("真实 HTTP 请求完成，状态码 %d，尝试 %d 次。", resp.StatusCode, len(attemptLogs))
 	result.Output = map[string]interface{}{
 		"url":          resp.URL,
 		"final_url":    resp.FinalURL,
@@ -485,6 +536,8 @@ func executeAgentRequestGraphNode(
 		"body":         resp.Body,
 		"truncated":    resp.Truncated,
 		"duration_ms":  resp.DurationMs,
+		"attempts":     attemptLogs,
+		"retry_count":  retryCount,
 	}
 	return result
 }
@@ -558,6 +611,441 @@ func executeAgentTransformGraphNode(
 		"description": node.Data.Description,
 	}
 	return result
+}
+
+func executeAgentCodeGraphNode(
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	result agentBlueprintNodeResult,
+) agentBlueprintNodeResult {
+	if len(upstream) == 0 {
+		result.Status = "failed"
+		result.Message = "代码处理节点没有收到上游真实输出。"
+		result.Error = "upstream data is required"
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	script := strings.TrimSpace(node.Data.Settings["脚本"])
+	if script == "" {
+		script = "select *\nlimit 100"
+	}
+	codeResult, err := runAgentCodeDSL(script, upstream)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "代码处理脚本执行失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "script": script}
+		return result
+	}
+	result.Message = fmt.Sprintf("代码处理完成，执行 %d 个步骤。", len(codeResult.Steps))
+	result.Output = map[string]interface{}{
+		"script":      script,
+		"steps":       codeResult.Steps,
+		"result":      codeResult.Value,
+		"result_type": fmt.Sprintf("%T", codeResult.Value),
+		"format":      firstNonEmpty(node.Data.Settings["输出格式"], "JSON 数组"),
+		"description": node.Data.Description,
+	}
+	return result
+}
+
+type agentCodeDSLResult struct {
+	Value interface{} `json:"value"`
+	Steps []string    `json:"steps"`
+}
+
+func runAgentCodeDSL(script string, upstream map[string]interface{}) (agentCodeDSLResult, error) {
+	value := extractAgentCodeInputValue(upstream)
+	steps := []string{}
+	for _, rawLine := range strings.Split(script, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		next, step, err := applyAgentCodeDSLLine(value, line)
+		if err != nil {
+			return agentCodeDSLResult{}, err
+		}
+		value = next
+		steps = append(steps, step)
+	}
+	if len(steps) == 0 {
+		return agentCodeDSLResult{}, errors.New("script has no executable steps")
+	}
+	return agentCodeDSLResult{Value: value, Steps: steps}, nil
+}
+
+func extractAgentCodeInputValue(upstream map[string]interface{}) interface{} {
+	if len(upstream) == 1 {
+		for _, value := range upstream {
+			if child, ok := value.(map[string]interface{}); ok {
+				for _, key := range []string{"result", "merged", "matched", "data", "rows", "items", "table"} {
+					if candidate, exists := child[key]; exists {
+						return candidate
+					}
+				}
+			}
+			return value
+		}
+	}
+	rows := make([]map[string]interface{}, 0, len(upstream))
+	keys := make([]string, 0, len(upstream))
+	for key := range upstream {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		rows = append(rows, map[string]interface{}{
+			"node":  key,
+			"value": upstream[key],
+		})
+	}
+	return rows
+}
+
+func applyAgentCodeDSLLine(value interface{}, line string) (interface{}, string, error) {
+	command, arg, _ := strings.Cut(line, " ")
+	command = strings.ToLower(strings.TrimSpace(command))
+	arg = strings.TrimSpace(arg)
+	switch command {
+	case "select", "fields":
+		fields := parseAgentCodeFields(arg)
+		if len(fields) == 0 || (len(fields) == 1 && fields[0] == "*") {
+			return value, "select *", nil
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		out := make([]map[string]interface{}, 0, len(rows))
+		for _, row := range rows {
+			next := map[string]interface{}{}
+			for _, field := range fields {
+				next[field] = agentCodeLookup(row, field)
+			}
+			out = append(out, next)
+		}
+		return out, "select " + strings.Join(fields, ", "), nil
+	case "filter", "where":
+		condition, err := parseAgentCodeCondition(arg)
+		if err != nil {
+			return nil, "", err
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		out := make([]map[string]interface{}, 0, len(rows))
+		for _, row := range rows {
+			if condition.Match(row) {
+				out = append(out, row)
+			}
+		}
+		return out, "filter " + condition.String(), nil
+	case "sort":
+		field := strings.TrimSpace(arg)
+		desc := false
+		if strings.HasPrefix(field, "-") {
+			desc = true
+			field = strings.TrimPrefix(field, "-")
+		}
+		field = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(field, " desc"), " DESC"))
+		if field == "" {
+			return nil, "", errors.New("sort requires a field")
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		sort.SliceStable(rows, func(i, j int) bool {
+			cmp := compareAgentCodeValues(agentCodeLookup(rows[i], field), agentCodeLookup(rows[j], field))
+			if desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		})
+		direction := "asc"
+		if desc {
+			direction = "desc"
+		}
+		return rows, "sort " + field + " " + direction, nil
+	case "limit":
+		n, err := parseAgentCodePositiveInt(arg)
+		if err != nil {
+			return nil, "", err
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		if len(rows) > n {
+			rows = rows[:n]
+		}
+		return rows, fmt.Sprintf("limit %d", n), nil
+	case "count":
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		return map[string]interface{}{"count": len(rows)}, "count rows", nil
+	case "sum", "average", "avg":
+		field := strings.TrimSpace(arg)
+		if field == "" {
+			return nil, "", errors.New(command + " requires a field")
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		sum := 0.0
+		count := 0
+		for _, row := range rows {
+			if n, ok := agentCodeFloat(agentCodeLookup(row, field)); ok {
+				sum += n
+				count++
+			}
+		}
+		if command == "average" || command == "avg" {
+			avg := 0.0
+			if count > 0 {
+				avg = sum / float64(count)
+			}
+			return map[string]interface{}{"field": field, "average": avg, "count": count}, "average " + field, nil
+		}
+		return map[string]interface{}{"field": field, "sum": sum, "count": count}, "sum " + field, nil
+	case "groupby", "group-by":
+		field := strings.TrimSpace(arg)
+		if field == "" {
+			return nil, "", errors.New("groupBy requires a field")
+		}
+		rows, err := agentCodeRows(value)
+		if err != nil {
+			return nil, "", err
+		}
+		groups := map[string]int{}
+		for _, row := range rows {
+			key := strings.TrimSpace(fmt.Sprint(agentCodeLookup(row, field)))
+			if key == "" {
+				key = "(empty)"
+			}
+			groups[key]++
+		}
+		out := make([]map[string]interface{}, 0, len(groups))
+		for key, count := range groups {
+			out = append(out, map[string]interface{}{"key": key, "count": count})
+		}
+		sort.SliceStable(out, func(i, j int) bool {
+			return fmt.Sprint(out[i]["key"]) < fmt.Sprint(out[j]["key"])
+		})
+		return out, "groupBy " + field, nil
+	default:
+		return nil, "", fmt.Errorf("unsupported script command %q", command)
+	}
+}
+
+type agentCodeCondition struct {
+	Field string
+	Op    string
+	Value string
+}
+
+func parseAgentCodeCondition(arg string) (agentCodeCondition, error) {
+	for _, op := range []string{">=", "<=", "!=", "=", ">", "<", "contains"} {
+		if op == "contains" {
+			parts := strings.SplitN(arg, " contains ", 2)
+			if len(parts) == 2 {
+				return agentCodeCondition{Field: strings.TrimSpace(parts[0]), Op: op, Value: strings.Trim(strings.TrimSpace(parts[1]), `"'`)}, nil
+			}
+			continue
+		}
+		if left, right, ok := strings.Cut(arg, op); ok {
+			field := strings.TrimSpace(left)
+			value := strings.Trim(strings.TrimSpace(right), `"'`)
+			if field == "" {
+				return agentCodeCondition{}, errors.New("filter field is required")
+			}
+			return agentCodeCondition{Field: field, Op: op, Value: value}, nil
+		}
+	}
+	return agentCodeCondition{}, errors.New("filter requires condition like status=ok or amount>10")
+}
+
+func (c agentCodeCondition) Match(row map[string]interface{}) bool {
+	actual := agentCodeLookup(row, c.Field)
+	switch c.Op {
+	case "contains":
+		return strings.Contains(strings.ToLower(fmt.Sprint(actual)), strings.ToLower(c.Value))
+	case "=":
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprint(actual)), c.Value)
+	case "!=":
+		return !strings.EqualFold(strings.TrimSpace(fmt.Sprint(actual)), c.Value)
+	case ">", ">=", "<", "<=":
+		left, lok := agentCodeFloat(actual)
+		right, rok := agentCodeFloat(c.Value)
+		if !lok || !rok {
+			cmp := strings.Compare(fmt.Sprint(actual), c.Value)
+			switch c.Op {
+			case ">":
+				return cmp > 0
+			case ">=":
+				return cmp >= 0
+			case "<":
+				return cmp < 0
+			case "<=":
+				return cmp <= 0
+			}
+		}
+		switch c.Op {
+		case ">":
+			return left > right
+		case ">=":
+			return left >= right
+		case "<":
+			return left < right
+		case "<=":
+			return left <= right
+		}
+	}
+	return false
+}
+
+func (c agentCodeCondition) String() string {
+	return c.Field + c.Op + c.Value
+}
+
+func parseAgentCodeFields(arg string) []string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(arg, func(r rune) bool {
+		return r == ',' || r == '，' || r == '、' || r == '|'
+	})
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func parseAgentCodePositiveInt(value string) (int, error) {
+	var n int
+	if _, err := fmt.Sscanf(strings.TrimSpace(value), "%d", &n); err != nil || n <= 0 {
+		return 0, errors.New("limit requires a positive integer")
+	}
+	if n > 10000 {
+		return 10000, nil
+	}
+	return n, nil
+}
+
+func agentCodeRows(value interface{}) ([]map[string]interface{}, error) {
+	switch typed := value.(type) {
+	case []map[string]interface{}:
+		return append([]map[string]interface{}{}, typed...), nil
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(typed))
+		for index, item := range typed {
+			if row, ok := item.(map[string]interface{}); ok {
+				out = append(out, row)
+			} else {
+				out = append(out, map[string]interface{}{"index": index, "value": item})
+			}
+		}
+		return out, nil
+	case map[string]interface{}:
+		if rows, ok := typed["rows"]; ok {
+			return agentCodeRows(rows)
+		}
+		if items, ok := typed["items"]; ok {
+			return agentCodeRows(items)
+		}
+		out := make([]map[string]interface{}, 0, len(typed))
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			out = append(out, map[string]interface{}{"key": key, "value": typed[key]})
+		}
+		return out, nil
+	case string:
+		var decoded interface{}
+		if err := json.Unmarshal([]byte(typed), &decoded); err == nil {
+			return agentCodeRows(decoded)
+		}
+		lines := strings.Split(typed, "\n")
+		out := make([]map[string]interface{}, 0, len(lines))
+		for index, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				out = append(out, map[string]interface{}{"index": index, "text": line})
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported input type %T", value)
+	}
+}
+
+func agentCodeLookup(row map[string]interface{}, field string) interface{} {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return nil
+	}
+	if value, ok := row[field]; ok {
+		return value
+	}
+	current := interface{}(row)
+	for _, part := range strings.Split(field, ".") {
+		obj, ok := current.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		current = obj[strings.TrimSpace(part)]
+	}
+	return current
+}
+
+func agentCodeFloat(value interface{}) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		n, err := typed.Float64()
+		return n, err == nil
+	case string:
+		var n float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(strings.TrimPrefix(typed, "¥")), "%f", &n); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func compareAgentCodeValues(a, b interface{}) int {
+	if af, ok := agentCodeFloat(a); ok {
+		if bf, ok := agentCodeFloat(b); ok {
+			if af < bf {
+				return -1
+			}
+			if af > bf {
+				return 1
+			}
+			return 0
+		}
+	}
+	return strings.Compare(fmt.Sprint(a), fmt.Sprint(b))
 }
 
 func executeAgentImageGraphNode(
@@ -815,18 +1303,26 @@ func executeAgentWebpageGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	html := "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>" +
-		escapeAgentHTML(firstNonEmpty(node.Data.Title, "智能体网页输出")) +
-		"</title></head><body><h1>" + escapeAgentHTML(firstNonEmpty(node.Data.Title, "智能体网页输出")) +
-		"</h1><pre>" + escapeAgentHTML(agentSummarizeUpstream(upstream, 8000)) + "</pre></body></html>"
+	title := firstNonEmpty(node.Data.Title, "智能体网页输出")
+	rows := flattenAgentUpstreamRows(upstream)
+	html := rowsToAgentHTML(title, rows, upstream)
+	dataJSON, _ := json.MarshalIndent(rows, "", "  ")
+	files := []AgentReportOutputFile{{
+		Label:     "HTML 网页",
+		Extension: "html",
+		Content:   html,
+	}, {
+		Label:     "JSON 数据",
+		Extension: "json",
+		Content:   string(dataJSON),
+	}}
+	if strings.Contains(node.Data.Settings["输出模式"], "仅输出数据") {
+		files = files[1:]
+	}
 	writeResult, err := writeAgentReportFiles(store.DataDir(), AgentReportWriteRequest{
-		Title:           firstNonEmpty(node.Data.Title, "网页输出"),
+		Title:           title,
 		OutputDirectory: firstNonEmpty(node.Data.Settings["输出目录"], "data/output/web-reports"),
-		Files: []AgentReportOutputFile{{
-			Label:     "HTML 网页",
-			Extension: "html",
-			Content:   html,
-		}},
+		Files:           files,
 	})
 	if err != nil {
 		result.Status = "failed"
@@ -835,10 +1331,12 @@ func executeAgentWebpageGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	result.Message = "网页文件已写入输出目录。"
+	result.Message = fmt.Sprintf("网页输出已写入输出目录，包含 %d 行数据。", len(rows))
 	result.ArchivePath = writeResult.OutputDirectory
 	result.Output = map[string]interface{}{
 		"html":             html,
+		"rows":             rows,
+		"row_count":        len(rows),
 		"output_directory": writeResult.OutputDirectory,
 		"files":            writeResult.Files,
 	}
@@ -852,42 +1350,109 @@ func executeAgentNotifyGraphNode(
 	result agentBlueprintNodeResult,
 ) agentBlueprintNodeResult {
 	channel := firstNonEmpty(node.Data.Settings["渠道"], "Webhook")
-	if channel != "Webhook" {
-		result.Message = "当前通知渠道未配置真实后端适配器，已生成待发送记录。"
-		result.Output = map[string]interface{}{"channel": channel, "pending": true, "upstream": upstream}
-		return result
-	}
-	webhook := firstNonEmpty(node.Data.Settings["Webhook"], node.Data.Settings["网址"])
+	webhook := firstNonEmpty(node.Data.Settings["Webhook"], node.Data.Settings["通知目标"], node.Data.Settings["网址"])
 	if strings.TrimSpace(webhook) == "" {
 		result.Status = "failed"
-		result.Message = "Webhook 通知未配置 URL。"
-		result.Error = "webhook url is required"
-		result.Output = map[string]interface{}{"error": result.Error}
+		result.Message = fmt.Sprintf("%s 通知未配置目标 URL。", channel)
+		result.Error = "notification target url is required"
+		result.Output = map[string]interface{}{"error": result.Error, "channel": channel}
 		return result
 	}
-	bodyBytes, _ := json.Marshal(map[string]interface{}{
-		"title":       firstNonEmpty(node.Data.Title, "智能体通知"),
-		"description": node.Data.Description,
-		"upstream":    upstream,
-		"created_at":  time.Now().Format(time.RFC3339),
-	})
+	bodyBytes, contentType, err := buildAgentNotificationPayload(channel, node, upstream)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "通知内容构建失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "channel": channel}
+		return result
+	}
 	resp, err := executeAgentHTTPRequest(ctx, AgentHTTPRequest{
 		URL:     webhook,
 		Method:  http.MethodPost,
-		Headers: map[string]string{"Content-Type": "application/json"},
+		Headers: map[string]string{"Content-Type": contentType},
 		Body:    string(bodyBytes),
 		Timeout: parseAgentDurationSeconds(node.Data.Settings["超时"], 30),
 	})
 	if err != nil {
 		result.Status = "failed"
-		result.Message = "Webhook 通知请求失败。"
+		result.Message = fmt.Sprintf("%s 通知请求失败。", channel)
 		result.Error = err.Error()
-		result.Output = map[string]interface{}{"error": result.Error}
+		result.Output = map[string]interface{}{"error": result.Error, "channel": channel, "url": webhook}
 		return result
 	}
-	result.Message = fmt.Sprintf("Webhook 已真实请求，状态码 %d。", resp.StatusCode)
-	result.Output = map[string]interface{}{"status_code": resp.StatusCode, "body": resp.Body}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("%s 通知返回失败状态码 %d。", channel, resp.StatusCode)
+		result.Error = truncateRunes(resp.Body, 1000)
+		result.Output = map[string]interface{}{"status_code": resp.StatusCode, "body": resp.Body, "channel": channel}
+		return result
+	}
+	result.Message = fmt.Sprintf("%s 通知已真实请求，状态码 %d。", channel, resp.StatusCode)
+	result.Output = map[string]interface{}{"status_code": resp.StatusCode, "body": resp.Body, "channel": channel, "url": resp.FinalURL}
 	return result
+}
+
+func buildAgentNotificationPayload(
+	channel string,
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+) ([]byte, string, error) {
+	title := firstNonEmpty(node.Data.Title, "智能体通知")
+	description := strings.TrimSpace(node.Data.Description)
+	text := buildAgentNotificationText(title, description, upstream)
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case "webhook":
+		body, err := json.Marshal(map[string]interface{}{
+			"title":       title,
+			"description": description,
+			"upstream":    upstream,
+			"created_at":  time.Now().Format(time.RFC3339),
+		})
+		return body, "application/json", err
+	case "slack":
+		body, err := json.Marshal(map[string]interface{}{"text": text})
+		return body, "application/json", err
+	case "飞书", "feishu", "lark":
+		body, err := json.Marshal(map[string]interface{}{
+			"msg_type": "text",
+			"content":  map[string]string{"text": text},
+		})
+		return body, "application/json", err
+	case "企业微信", "wecom", "wechat-work":
+		body, err := json.Marshal(map[string]interface{}{
+			"msgtype": "text",
+			"text":    map[string]string{"content": text},
+		})
+		return body, "application/json", err
+	case "钉钉", "dingtalk":
+		body, err := json.Marshal(map[string]interface{}{
+			"msgtype": "text",
+			"text":    map[string]string{"content": text},
+		})
+		return body, "application/json", err
+	case "邮件", "email", "mail":
+		return nil, "", errors.New("email notification requires an SMTP adapter; use Webhook or a chat robot URL")
+	default:
+		body, err := json.Marshal(map[string]interface{}{
+			"title":       title,
+			"description": description,
+			"text":        text,
+			"upstream":    upstream,
+			"channel":     channel,
+		})
+		return body, "application/json", err
+	}
+}
+
+func buildAgentNotificationText(title, description string, upstream map[string]interface{}) string {
+	parts := []string{title}
+	if description != "" {
+		parts = append(parts, description)
+	}
+	if len(upstream) > 0 {
+		parts = append(parts, agentSummarizeUpstream(upstream, 2000))
+	}
+	return truncateRunes(strings.Join(parts, "\n\n"), 3500)
 }
 
 func executeAgentCustomGraphNode(
@@ -931,7 +1496,7 @@ func executeAgentBuiltinCustomComponent(
 	case "component.filter":
 		return true, executeAgentFilterGraphNode(node, upstream, result)
 	case "component.merge":
-		return true, executeAgentMergeGraphNode(upstream, result)
+		return true, executeAgentMergeGraphNode(node, upstream, result)
 	case "component.file":
 		return true, executeAgentFileGraphNode(store, node, upstream, result)
 	default:
@@ -959,16 +1524,33 @@ func executeAgentFilterGraphNode(
 		result.Output = map[string]interface{}{"matched": filterNonEmptyUpstream(upstream), "condition": condition}
 		return result
 	}
-	result.Message = "条件过滤完成：当前仅支持确定性非空/字段存在过滤。"
+	matched, err := filterAgentUpstreamRows(upstream, condition)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "条件过滤失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "condition": condition}
+		return result
+	}
+	if len(matched) == 0 && strings.Contains(firstNonEmpty(node.Data.Settings["未命中处理"], "跳过"), "失败") {
+		result.Status = "failed"
+		result.Message = "条件过滤未命中任何数据。"
+		result.Error = "no rows matched filter condition"
+		result.Output = map[string]interface{}{"condition": condition, "matched": matched, "matched_count": 0}
+		return result
+	}
+	result.Message = fmt.Sprintf("条件过滤完成：命中 %d 行真实数据。", len(matched))
 	result.Output = map[string]interface{}{
-		"matched":   filterNonEmptyUpstream(upstream),
+		"matched":   matched,
 		"condition": condition,
-		"warning":   "复杂表达式需要代码处理组件或自定义组件执行。",
+		"rows":      matched,
+		"count":     len(matched),
 	}
 	return result
 }
 
 func executeAgentMergeGraphNode(
+	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	result agentBlueprintNodeResult,
 ) agentBlueprintNodeResult {
@@ -979,8 +1561,27 @@ func executeAgentMergeGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	result.Message = "合并数据完成：按上游节点 ID 保留全部真实输出。"
-	result.Output = map[string]interface{}{"merged": upstream, "summary": agentSummarizeUpstream(upstream, 4000)}
+	mode := firstNonEmpty(node.Data.Settings["合并方式"], "按字段")
+	field := firstNonEmpty(node.Data.Settings["合并字段"], node.Data.Settings["字段"], "id")
+	conflict := firstNonEmpty(node.Data.Settings["冲突处理"], "保留最新")
+	merged, mergeMode, conflicts, err := mergeAgentUpstreamRows(upstream, mode, field, conflict)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "合并数据失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error, "mode": mode, "field": field}
+		return result
+	}
+	result.Message = fmt.Sprintf("合并数据完成：%s，输出 %d 行真实数据。", mergeMode, len(merged))
+	result.Output = map[string]interface{}{
+		"merged":         merged,
+		"rows":           merged,
+		"count":          len(merged),
+		"mode":           mergeMode,
+		"field":          field,
+		"conflict_count": conflicts,
+		"summary":        agentSummarizeUpstream(upstream, 4000),
+	}
 	return result
 }
 
@@ -1000,7 +1601,7 @@ func executeAgentFileGraphNode(
 			result.Output = map[string]interface{}{"error": result.Error}
 			return result
 		}
-		content, err := readAgentDataFile(store, path)
+		fileResult, err := readAgentDataFile(store, path)
 		if err != nil {
 			result.Status = "failed"
 			result.Message = "文件读取失败。"
@@ -1008,8 +1609,18 @@ func executeAgentFileGraphNode(
 			result.Output = map[string]interface{}{"error": result.Error, "path": path}
 			return result
 		}
-		result.Message = "文件读取完成。"
-		result.Output = map[string]interface{}{"path": path, "content": content, "size": len(content)}
+		result.Message = fmt.Sprintf("文件读取完成，识别为 %s。", fileResult.Format)
+		result.Output = map[string]interface{}{
+			"path":        fileResult.Path,
+			"format":      fileResult.Format,
+			"extension":   fileResult.Extension,
+			"content":     fileResult.Content,
+			"rows":        fileResult.Rows,
+			"row_count":   len(fileResult.Rows),
+			"size":        fileResult.Size,
+			"truncated":   fileResult.Truncated,
+			"description": node.Data.Description,
+		}
 		return result
 	}
 	if len(upstream) == 0 {
@@ -1019,14 +1630,15 @@ func executeAgentFileGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	content := agentSummarizeUpstream(upstream, 12000)
+	format := firstNonEmpty(node.Data.Settings["格式"], "自动识别")
+	content, extension := formatAgentFileContent(format, upstream)
 	outputDir := firstNonEmpty(node.Data.Settings["输出目录"], "data/output/agent-files")
 	writeResult, err := writeAgentReportFiles(store.DataDir(), AgentReportWriteRequest{
 		Title:           firstNonEmpty(node.Data.Title, "文件输出"),
 		OutputDirectory: outputDir,
 		Files: []AgentReportOutputFile{{
-			Label:     firstNonEmpty(node.Data.Settings["格式"], "TXT 文本"),
-			Extension: agentReportExtensionForLabel(firstNonEmpty(node.Data.Settings["格式"], "TXT 文本")),
+			Label:     fileFormatLabel(format, extension),
+			Extension: extension,
 			Content:   content,
 		}},
 	})
@@ -1038,7 +1650,12 @@ func executeAgentFileGraphNode(
 		return result
 	}
 	result.Message = "文件写入完成。"
-	result.Output = map[string]interface{}{"files": writeResult.Files, "output_directory": writeResult.OutputDirectory}
+	result.Output = map[string]interface{}{
+		"files":            writeResult.Files,
+		"output_directory": writeResult.OutputDirectory,
+		"format":           fileFormatLabel(format, extension),
+		"extension":        extension,
+	}
 	return result
 }
 
@@ -1056,6 +1673,242 @@ func parseAgentHTTPHeaderLines(value string) map[string]string {
 		headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
 	return headers
+}
+
+func filterAgentUpstreamRows(upstream map[string]interface{}, condition string) ([]map[string]interface{}, error) {
+	parsed, err := parseAgentCodeCondition(condition)
+	if err != nil {
+		return nil, err
+	}
+	rows := flattenAgentUpstreamRows(upstream)
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		if parsed.Match(row) {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func mergeAgentUpstreamRows(
+	upstream map[string]interface{},
+	mode string,
+	field string,
+	conflict string,
+) ([]map[string]interface{}, string, int, error) {
+	rows := flattenAgentUpstreamRows(upstream)
+	if len(rows) == 0 {
+		return nil, "", 0, errors.New("no mergeable upstream rows")
+	}
+	mode = strings.TrimSpace(mode)
+	switch {
+	case strings.Contains(mode, "追加") || strings.EqualFold(mode, "append"):
+		return rows, "追加合并", 0, nil
+	case strings.Contains(mode, "索引") || strings.EqualFold(mode, "index"):
+		merged := mergeAgentRowsByIndex(rows)
+		return merged, "按索引合并", 0, nil
+	default:
+		field = strings.TrimSpace(field)
+		if field == "" {
+			return nil, "", 0, errors.New("merge field is required")
+		}
+		merged, conflicts := mergeAgentRowsByField(rows, field, conflict)
+		return merged, "按字段合并", conflicts, nil
+	}
+}
+
+func flattenAgentUpstreamRows(upstream map[string]interface{}) []map[string]interface{} {
+	keys := make([]string, 0, len(upstream))
+	for key := range upstream {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]map[string]interface{}, 0, len(keys))
+	for _, key := range keys {
+		rows, err := agentCodeRows(upstream[key])
+		if err != nil || len(rows) == 0 {
+			out = append(out, map[string]interface{}{"source_node": key, "value": upstream[key]})
+			continue
+		}
+		for index, row := range rows {
+			next := copyAgentRow(row)
+			if _, exists := next["source_node"]; !exists {
+				next["source_node"] = key
+			}
+			if _, exists := next["source_index"]; !exists {
+				next["source_index"] = index
+			}
+			out = append(out, next)
+		}
+	}
+	return out
+}
+
+func mergeAgentRowsByField(rows []map[string]interface{}, field string, conflict string) ([]map[string]interface{}, int) {
+	byKey := map[string]map[string]interface{}{}
+	order := []string{}
+	conflicts := 0
+	for _, row := range rows {
+		key := strings.TrimSpace(fmt.Sprint(agentCodeLookup(row, field)))
+		if key == "" || key == "<nil>" {
+			key = fmt.Sprintf("__missing_%d", len(order))
+		}
+		current, exists := byKey[key]
+		if !exists {
+			byKey[key] = copyAgentRow(row)
+			order = append(order, key)
+			continue
+		}
+		conflicts++
+		byKey[key] = mergeAgentRowValues(current, row, conflict)
+	}
+	out := make([]map[string]interface{}, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key])
+	}
+	return out, conflicts
+}
+
+func mergeAgentRowsByIndex(rows []map[string]interface{}) []map[string]interface{} {
+	byIndex := map[int]map[string]interface{}{}
+	indexes := []int{}
+	for position, row := range rows {
+		index := position
+		if n, ok := agentCodeInt(agentCodeLookup(row, "source_index")); ok {
+			index = n
+		}
+		current, exists := byIndex[index]
+		if !exists {
+			byIndex[index] = copyAgentRow(row)
+			indexes = append(indexes, index)
+			continue
+		}
+		byIndex[index] = mergeAgentRowValues(current, row, "保留最新")
+	}
+	sort.Ints(indexes)
+	out := make([]map[string]interface{}, 0, len(indexes))
+	for _, index := range indexes {
+		out = append(out, byIndex[index])
+	}
+	return out
+}
+
+func mergeAgentRowValues(left, right map[string]interface{}, conflict string) map[string]interface{} {
+	out := copyAgentRow(left)
+	keepOld := strings.Contains(conflict, "旧") || strings.Contains(conflict, "最早") || strings.Contains(conflict, "保留已有")
+	for key, value := range right {
+		if key == "" {
+			continue
+		}
+		existing, exists := out[key]
+		if !exists || existing == nil || !keepOld {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func copyAgentRow(row map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(row))
+	for key, value := range row {
+		out[key] = value
+	}
+	return out
+}
+
+func agentCodeInt(value interface{}) (int, bool) {
+	if n, ok := agentCodeFloat(value); ok {
+		return int(n), true
+	}
+	return 0, false
+}
+
+type agentHTTPRequestExecutor func(context.Context, AgentHTTPRequest) (AgentHTTPResponse, error)
+
+type agentHTTPRequestRetryWaiter func(context.Context, int) bool
+
+func executeAgentHTTPRequestWithRetry(
+	ctx context.Context,
+	req AgentHTTPRequest,
+	retryCount int,
+	executor agentHTTPRequestExecutor,
+	wait agentHTTPRequestRetryWaiter,
+) (AgentHTTPResponse, []map[string]interface{}, bool, error) {
+	if executor == nil {
+		executor = executeAgentHTTPRequest
+	}
+	if wait == nil {
+		wait = waitAgentHTTPRequestRetry
+	}
+	attemptLogs := make([]map[string]interface{}, 0, retryCount+1)
+	var resp AgentHTTPResponse
+	var hasResp bool
+	var lastErr error
+	for attempt := 1; attempt <= retryCount+1; attempt++ {
+		currentResp, err := executor(ctx, req)
+		if err != nil {
+			lastErr = err
+			attemptLogs = append(attemptLogs, map[string]interface{}{
+				"attempt": attempt,
+				"ok":      false,
+				"error":   err.Error(),
+			})
+			if attempt <= retryCount && wait(ctx, attempt) {
+				continue
+			}
+			break
+		}
+		resp = currentResp
+		hasResp = true
+		attemptLogs = append(attemptLogs, map[string]interface{}{
+			"attempt":     attempt,
+			"ok":          true,
+			"status_code": currentResp.StatusCode,
+			"duration_ms": currentResp.DurationMs,
+			"executed_at": currentResp.ExecutedAt,
+		})
+		if !shouldRetryAgentHTTPStatus(currentResp.StatusCode) {
+			lastErr = nil
+			break
+		}
+		lastErr = fmt.Errorf("HTTP status %d", currentResp.StatusCode)
+		if attempt <= retryCount && wait(ctx, attempt) {
+			continue
+		}
+		break
+	}
+	return resp, attemptLogs, hasResp, lastErr
+}
+
+func parseAgentRetryCount(value string, fallback int) int {
+	value = strings.TrimSpace(strings.TrimSuffix(value, "次"))
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil || parsed < 0 {
+		parsed = fallback
+	}
+	if parsed > 5 {
+		return 5
+	}
+	return parsed
+}
+
+func shouldRetryAgentHTTPStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= 500
+}
+
+func waitAgentHTTPRequestRetry(ctx context.Context, attempt int) bool {
+	delay := time.Duration(attempt) * 200 * time.Millisecond
+	if delay > time.Second {
+		delay = time.Second
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func firstInputValue(inputVars map[string]interface{}, keys ...string) interface{} {
@@ -1081,13 +1934,23 @@ func filterNonEmptyUpstream(upstream map[string]interface{}) map[string]interfac
 	return out
 }
 
-func readAgentDataFile(store *Store, displayPath string) (string, error) {
+type AgentFileReadResult struct {
+	Path      string                   `json:"path"`
+	Format    string                   `json:"format"`
+	Extension string                   `json:"extension"`
+	Content   string                   `json:"content"`
+	Rows      []map[string]interface{} `json:"rows,omitempty"`
+	Size      int                      `json:"size"`
+	Truncated bool                     `json:"truncated"`
+}
+
+func readAgentDataFile(store *Store, displayPath string) (AgentFileReadResult, error) {
 	if store == nil || strings.TrimSpace(store.DataDir()) == "" {
-		return "", errors.New("data directory is not configured")
+		return AgentFileReadResult{}, errors.New("data directory is not configured")
 	}
 	path := strings.Trim(strings.TrimSpace(filepath.ToSlash(displayPath)), "/")
 	if path == "" || strings.Contains(path, "..") {
-		return "", errors.New("invalid file path")
+		return AgentFileReadResult{}, errors.New("invalid file path")
 	}
 	if strings.HasPrefix(path, "data/") {
 		path = strings.TrimPrefix(path, "data/")
@@ -1095,16 +1958,440 @@ func readAgentDataFile(store *Store, displayPath string) (string, error) {
 	fullPath := filepath.Clean(filepath.Join(store.DataDir(), filepath.FromSlash(path)))
 	root := filepath.Clean(store.DataDir())
 	if fullPath != root && !strings.HasPrefix(fullPath, root+string(filepath.Separator)) {
-		return "", errors.New("invalid file path")
+		return AgentFileReadResult{}, errors.New("invalid file path")
 	}
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
-		return "", err
+		return AgentFileReadResult{}, err
 	}
+	originalSize := len(data)
+	truncated := false
 	if len(data) > 1024*1024 {
 		data = data[:1024*1024]
+		truncated = true
 	}
-	return string(data), nil
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	content, rows, format, err := parseAgentDataFileContent(fullPath, ext, data)
+	if err != nil {
+		return AgentFileReadResult{}, err
+	}
+	return AgentFileReadResult{
+		Path:      "data/" + filepath.ToSlash(path),
+		Format:    format,
+		Extension: strings.TrimPrefix(ext, "."),
+		Content:   content,
+		Rows:      rows,
+		Size:      originalSize,
+		Truncated: truncated,
+	}, nil
+}
+
+func parseAgentDataFileContent(absPath, ext string, data []byte) (string, []map[string]interface{}, string, error) {
+	switch ext {
+	case ".csv":
+		text := string(data)
+		rows := agentRowsFromTable(parseSimpleCSVRows(text))
+		return truncateRunes(text, 12000), rows, "CSV 表格", nil
+	case ".json":
+		text := string(data)
+		rows := agentRowsFromJSON(text)
+		return truncateRunes(text, 12000), rows, "JSON 数据", nil
+	case ".md", ".markdown":
+		text := string(data)
+		rows := agentRowsFromTable(parseMarkdownTableRows(text))
+		return truncateRunes(text, 12000), rows, "Markdown 文档", nil
+	case ".html", ".htm":
+		text := stripAgentHTMLTags(string(data))
+		return truncateRunes(normalizeAgentTemplatePreview(text), 12000), nil, "HTML 网页", nil
+	case ".txt":
+		text := string(data)
+		return truncateRunes(text, 12000), agentRowsFromLines(text), "TXT 文本", nil
+	case ".xlsx":
+		content, rows, err := readAgentXLSXContent(absPath)
+		if err != nil {
+			preview, previewErr := agentTemplateFilePreview(absPath, filepath.Base(absPath))
+			if previewErr != nil {
+				return "", nil, "", err
+			}
+			return truncateRunes(preview, 12000), nil, "Excel 表格", nil
+		}
+		return truncateRunes(content, 12000), rows, "Excel 表格", nil
+	case ".docx":
+		preview, err := agentTemplateFilePreview(absPath, filepath.Base(absPath))
+		if err != nil {
+			return "", nil, "", err
+		}
+		return truncateRunes(preview, 12000), agentRowsFromLines(preview), "Word 文档", nil
+	case ".pdf", ".doc", ".xls":
+		preview, err := agentTemplateFilePreview(absPath, filepath.Base(absPath))
+		if err != nil {
+			return "", nil, "", err
+		}
+		return truncateRunes(preview, 12000), nil, strings.ToUpper(strings.TrimPrefix(ext, ".")) + " 文件", nil
+	default:
+		return "", nil, "", fmt.Errorf("unsupported file extension %q", ext)
+	}
+}
+
+func parseSimpleCSVRows(text string) [][]string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	rows := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		row := make([]string, 0, len(parts))
+		for _, part := range parts {
+			row = append(row, strings.Trim(strings.TrimSpace(part), `"`))
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func agentRowsFromTable(table [][]string) []map[string]interface{} {
+	if len(table) == 0 {
+		return nil
+	}
+	headers := table[0]
+	out := make([]map[string]interface{}, 0, maxInt(0, len(table)-1))
+	for i, values := range table[1:] {
+		row := map[string]interface{}{"index": i}
+		for col, value := range values {
+			header := fmt.Sprintf("col_%d", col+1)
+			if col < len(headers) && strings.TrimSpace(headers[col]) != "" {
+				header = headers[col]
+			}
+			row[header] = value
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func agentRowsFromJSON(text string) []map[string]interface{} {
+	var decoded interface{}
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		return nil
+	}
+	rows, err := agentCodeRows(decoded)
+	if err != nil {
+		return nil
+	}
+	return rows
+}
+
+func agentRowsFromLines(text string) []map[string]interface{} {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	out := make([]map[string]interface{}, 0, len(lines))
+	for index, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, map[string]interface{}{"index": index, "text": line})
+	}
+	return out
+}
+
+func readAgentXLSXContent(absPath string) (string, []map[string]interface{}, error) {
+	reader, err := zip.OpenReader(absPath)
+	if err != nil {
+		return "", nil, err
+	}
+	defer reader.Close()
+	sharedStrings := []string{}
+	sheets := make([][]string, 0)
+	for _, file := range reader.File {
+		name := strings.ToLower(filepath.ToSlash(file.Name))
+		if name != "xl/sharedstrings.xml" && !(strings.HasPrefix(name, "xl/worksheets/sheet") && strings.HasSuffix(name, ".xml")) {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(rc, 512*1024))
+		_ = rc.Close()
+		if readErr != nil {
+			continue
+		}
+		if name == "xl/sharedstrings.xml" {
+			sharedStrings = parseAgentXLSXSharedStrings(data)
+			continue
+		}
+		if rows := parseAgentXLSXWorksheetRows(data, sharedStrings); len(rows) > 0 {
+			for _, row := range rows {
+				sheets = append(sheets, row)
+			}
+		}
+	}
+	if len(sheets) == 0 {
+		return "", nil, errors.New("no readable worksheet rows")
+	}
+	var b strings.Builder
+	for _, row := range sheets {
+		b.WriteString(strings.Join(row, "\t"))
+		b.WriteByte('\n')
+	}
+	return b.String(), agentRowsFromTable(sheets), nil
+}
+
+func parseAgentXLSXSharedStrings(data []byte) []string {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	out := []string{}
+	var b strings.Builder
+	inItem := false
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if strings.EqualFold(t.Name.Local, "si") {
+				inItem = true
+				b.Reset()
+			}
+		case xml.EndElement:
+			if strings.EqualFold(t.Name.Local, "si") && inItem {
+				out = append(out, b.String())
+				inItem = false
+			}
+		case xml.CharData:
+			if inItem {
+				b.WriteString(string(t))
+			}
+		}
+	}
+	return out
+}
+
+func parseAgentXLSXWorksheetRows(data []byte, sharedStrings []string) [][]string {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	rows := [][]string{}
+	current := []string{}
+	cellType := ""
+	cellValue := ""
+	inValue := false
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			switch strings.ToLower(t.Name.Local) {
+			case "row":
+				current = []string{}
+			case "c":
+				cellType = ""
+				cellValue = ""
+				for _, attr := range t.Attr {
+					if strings.EqualFold(attr.Name.Local, "t") {
+						cellType = attr.Value
+						break
+					}
+				}
+			case "v", "t":
+				inValue = true
+			}
+		case xml.EndElement:
+			switch strings.ToLower(t.Name.Local) {
+			case "v", "t":
+				inValue = false
+			case "c":
+				current = append(current, resolveAgentXLSXCellValue(cellValue, cellType, sharedStrings))
+			case "row":
+				if len(current) > 0 {
+					rows = append(rows, current)
+				}
+			}
+		case xml.CharData:
+			if inValue {
+				cellValue += string(t)
+			}
+		}
+	}
+	return rows
+}
+
+func resolveAgentXLSXCellValue(value, cellType string, sharedStrings []string) string {
+	value = strings.TrimSpace(value)
+	if cellType == "s" {
+		var idx int
+		if _, err := fmt.Sscanf(value, "%d", &idx); err == nil && idx >= 0 && idx < len(sharedStrings) {
+			return sharedStrings[idx]
+		}
+	}
+	return value
+}
+
+func formatAgentFileContent(format string, upstream map[string]interface{}) (string, string) {
+	label := fileFormatLabel(format, agentReportExtensionForLabel(format))
+	extension := agentReportExtensionForLabel(label)
+	rows := flattenAgentUpstreamRows(upstream)
+	switch extension {
+	case "json":
+		data, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return agentSummarizeUpstream(upstream, 12000), extension
+		}
+		return string(data), extension
+	case "csv":
+		return rowsToAgentCSV(rows), extension
+	case "html":
+		return rowsToAgentHTML(firstNonEmpty(label, "HTML 网页"), rows, upstream), extension
+	case "xlsx":
+		return rowsToAgentMarkdownTable(rows), extension
+	case "txt":
+		return agentSummarizeUpstream(upstream, 12000), extension
+	default:
+		return rowsToAgentMarkdownTable(rows), extension
+	}
+}
+
+func fileFormatLabel(format, extension string) string {
+	format = strings.TrimSpace(format)
+	if format != "" && format != "自动识别" {
+		return format
+	}
+	switch extension {
+	case "json":
+		return "JSON 数据"
+	case "csv":
+		return "CSV 表格"
+	case "html":
+		return "HTML 网页"
+	case "xlsx":
+		return "Excel 表格"
+	case "txt":
+		return "TXT 文本"
+	default:
+		return "Markdown 文档"
+	}
+}
+
+func rowsToAgentCSV(rows []map[string]interface{}) string {
+	headers := collectAgentRowHeaders(rows)
+	var b strings.Builder
+	b.WriteString(joinAgentCSVRow(headers))
+	b.WriteByte('\n')
+	for _, row := range rows {
+		values := make([]string, 0, len(headers))
+		for _, header := range headers {
+			values = append(values, stringFromInterface(row[header]))
+		}
+		b.WriteString(joinAgentCSVRow(values))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func joinAgentCSVRow(values []string) string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ReplaceAll(value, `"`, `""`)
+		if strings.ContainsAny(value, ",\"\r\n") {
+			value = `"` + value + `"`
+		}
+		out = append(out, value)
+	}
+	return strings.Join(out, ",")
+}
+
+func rowsToAgentMarkdownTable(rows []map[string]interface{}) string {
+	headers := collectAgentRowHeaders(rows)
+	if len(headers) == 0 {
+		return "暂无数据。"
+	}
+	var b strings.Builder
+	b.WriteString("| ")
+	b.WriteString(strings.Join(headers, " | "))
+	b.WriteString(" |\n| ")
+	for i := range headers {
+		if i > 0 {
+			b.WriteString(" | ")
+		}
+		b.WriteString("---")
+	}
+	b.WriteString(" |\n")
+	for _, row := range rows {
+		b.WriteString("| ")
+		for i, header := range headers {
+			if i > 0 {
+				b.WriteString(" | ")
+			}
+			b.WriteString(escapeMarkdownCell(stringFromInterface(row[header])))
+		}
+		b.WriteString(" |\n")
+	}
+	return b.String()
+}
+
+func rowsToAgentHTML(title string, rows []map[string]interface{}, upstream map[string]interface{}) string {
+	headers := collectAgentRowHeaders(rows)
+	var b strings.Builder
+	b.WriteString("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>")
+	b.WriteString(escapeAgentHTML(title))
+	b.WriteString("</title></head><body><h1>")
+	b.WriteString(escapeAgentHTML(title))
+	b.WriteString("</h1>")
+	if len(headers) > 0 {
+		b.WriteString("<table><thead><tr>")
+		for _, header := range headers {
+			b.WriteString("<th>")
+			b.WriteString(escapeAgentHTML(header))
+			b.WriteString("</th>")
+		}
+		b.WriteString("</tr></thead><tbody>")
+		for _, row := range rows {
+			b.WriteString("<tr>")
+			for _, header := range headers {
+				b.WriteString("<td>")
+				b.WriteString(escapeAgentHTML(stringFromInterface(row[header])))
+				b.WriteString("</td>")
+			}
+			b.WriteString("</tr>")
+		}
+		b.WriteString("</tbody></table>")
+	} else {
+		b.WriteString("<pre>")
+		b.WriteString(escapeAgentHTML(agentSummarizeUpstream(upstream, 12000)))
+		b.WriteString("</pre>")
+	}
+	b.WriteString("</body></html>")
+	return b.String()
+}
+
+func collectAgentRowHeaders(rows []map[string]interface{}) []string {
+	seen := map[string]bool{}
+	headers := []string{}
+	preferred := []string{"index", "source_node", "source_index"}
+	for _, header := range preferred {
+		for _, row := range rows {
+			if _, ok := row[header]; ok && !seen[header] {
+				seen[header] = true
+				headers = append(headers, header)
+			}
+		}
+	}
+	for _, row := range rows {
+		keys := make([]string, 0, len(row))
+		for key := range row {
+			if !seen[key] {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			seen[key] = true
+			headers = append(headers, key)
+		}
+	}
+	return headers
 }
 
 func parseAgentDurationSeconds(value string, fallback int) int {
@@ -1266,7 +2553,7 @@ func firstNonEmpty(values ...string) string {
 // 它直接复用服务自身的 /v1/chat/completions 接口，避免重复实现认证逻辑。
 func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, inputVars map[string]interface{}) (string, error) {
 	templateContext := buildBlueprintTemplatePromptContext(store, inputVars)
-	skillContext := buildBlueprintSkillPromptContext(bp)
+	skillContext := buildBlueprintSkillPromptContext(ctx, store, bp)
 
 	// 构建系统 Prompt
 	systemPrompt := buildBlueprintSystemPrompt(bp, inputVars, templateContext, skillContext)
@@ -1579,12 +2866,25 @@ func normalizeBuiltinAgentSkillID(id string) string {
 	return id
 }
 
-func buildBlueprintSkillPromptContext(bp *AgentBlueprint) string {
+func buildBlueprintSkillPromptContext(ctx context.Context, store *Store, bp *AgentBlueprint) string {
 	skillIDs := extractBlueprintSkillIDs(bp)
 	if len(skillIDs) == 0 {
 		return ""
 	}
 
+	installedSkills := map[string]AgentSkill{}
+	if store != nil && bp != nil && bp.UserID > 0 {
+		if skills, err := store.ListSkills(ctx, bp.UserID); err == nil {
+			for _, skill := range skills {
+				if skill.Enabled {
+					installedSkills[skill.ID] = skill
+					for _, alias := range installedSkillAliases(skill) {
+						installedSkills[alias] = skill
+					}
+				}
+			}
+		}
+	}
 	var sb strings.Builder
 	written := 0
 	for _, skillID := range skillIDs {
@@ -1595,6 +2895,17 @@ func buildBlueprintSkillPromptContext(bp *AgentBlueprint) string {
 			}
 			sb.WriteString(fmt.Sprintf("- %s：%s\n", def.Label, strings.Join(def.Capabilities, "、")))
 			for _, instruction := range def.Instructions {
+				sb.WriteString("  * " + instruction + "\n")
+			}
+			written++
+			continue
+		}
+		if skill, ok := installedSkills[skillID]; ok {
+			if written == 0 {
+				sb.WriteString("启用 Skill 约束：\n")
+			}
+			sb.WriteString(fmt.Sprintf("- %s：%s\n", skill.Name, skill.Description))
+			for _, instruction := range installedSkillInstructions(skill) {
 				sb.WriteString("  * " + instruction + "\n")
 			}
 			written++
@@ -1612,6 +2923,47 @@ func buildBlueprintSkillPromptContext(bp *AgentBlueprint) string {
 		return ""
 	}
 	return sb.String()
+}
+
+func installedSkillAliases(skill AgentSkill) []string {
+	var cfg struct {
+		MarketplaceID string `json:"marketplace_id"`
+		GitHubURL     string `json:"github_url"`
+		Source        string `json:"source"`
+	}
+	if len(skill.Config) > 0 {
+		_ = json.Unmarshal(skill.Config, &cfg)
+	}
+	return uniqueNonEmptyStrings([]string{
+		cfg.MarketplaceID,
+		cfg.GitHubURL,
+		cfg.Source,
+		skill.SourceURL,
+	})
+}
+
+func installedSkillInstructions(skill AgentSkill) []string {
+	var cfg struct {
+		Capabilities []string `json:"capabilities"`
+		Instructions []string `json:"instructions"`
+		Tags         []string `json:"tags"`
+		ModelGroup   string   `json:"model_group"`
+		ModelName    string   `json:"model_name"`
+	}
+	if len(skill.Config) > 0 {
+		_ = json.Unmarshal(skill.Config, &cfg)
+	}
+	instructions := uniqueNonEmptyStrings(cfg.Instructions)
+	if len(instructions) == 0 {
+		if len(cfg.Capabilities) > 0 {
+			instructions = append(instructions, "核心能力："+strings.Join(cfg.Capabilities, "、"))
+		}
+		instructions = append(instructions, "只作为当前节点的补充执行约束，不扩大未显式提供的业务上下文。")
+	}
+	if strings.TrimSpace(cfg.ModelName) != "" {
+		instructions = append(instructions, "推荐模型："+strings.TrimSpace(cfg.ModelName))
+	}
+	return instructions
 }
 
 func extractBlueprintSkillIDs(bp *AgentBlueprint) []string {

@@ -1,6 +1,8 @@
 package sunapi
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -59,6 +61,9 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	api.GET("/agent-components", handleListComponents(store))
 	api.POST("/agent-components", handleCreateComponent(store))
 	api.DELETE("/agent-components/:id", handleDeleteComponent(store))
+
+	webhooks := engine.Group("/api/agent-webhooks")
+	webhooks.Any("/:bpID", handleAgentWebhookTrigger(store))
 }
 
 // ── 智能体处理器 ──────────────────────────────────────────────────────────────
@@ -210,11 +215,15 @@ func handleResumeBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
-		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, "pending", ""); err != nil {
+		status := "pending"
+		if blueprintHasScheduleNode(bp) {
+			status = "running"
+		}
+		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, status, ""); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		bp.Status = "pending"
+		bp.Status = status
 		ok(c, bp)
 	}
 }
@@ -260,6 +269,154 @@ func handleRunBlueprint(store *Store) gin.HandlerFunc {
 		bp.Status = "running"
 		ok(c, bp)
 	}
+}
+
+func handleAgentWebhookTrigger(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		bpID := strings.TrimSpace(c.Param("bpID"))
+		if bpID == "" {
+			fail(c, http.StatusBadRequest, errBadRequest("blueprint id is required"))
+			return
+		}
+		bp, err := store.GetBlueprintByID(c.Request.Context(), bpID)
+		if err != nil || bp == nil {
+			fail(c, http.StatusNotFound, errNotFound("blueprint"))
+			return
+		}
+		if bp.Status == "paused" {
+			fail(c, http.StatusConflict, errConflict("blueprint is paused"))
+			return
+		}
+		if !blueprintHasWebhookTrigger(bp) {
+			fail(c, http.StatusBadRequest, errBadRequest("blueprint does not contain a webhook trigger"))
+			return
+		}
+		if err := validateAgentWebhookSecret(c, bp); err != nil {
+			fail(c, http.StatusUnauthorized, err)
+			return
+		}
+
+		payload, err := buildAgentWebhookInput(c)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		inputVars, _ := json.Marshal(map[string]interface{}{
+			"webhook":         payload,
+			"webhook_body":    payload["body"],
+			"webhook_headers": payload["headers"],
+			"webhook_query":   payload["query"],
+			"webhook_method":  payload["method"],
+			"webhook_path":    payload["path"],
+			"triggered_at":    time.Now().Format(time.RFC3339),
+		})
+		runBP := *bp
+		runBP.InputVariables = inputVars
+
+		if err := store.UpdateBlueprintStatus(c.Request.Context(), bp.ID, "running", ""); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		go runBlueprintTask(store, &runBP)
+		ok(c, gin.H{
+			"accepted":     true,
+			"blueprint_id": bp.ID,
+			"agent_id":     bp.AgentID,
+			"status":       "running",
+		})
+	}
+}
+
+func buildAgentWebhookInput(c *gin.Context) (map[string]interface{}, error) {
+	bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, 2*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	var body interface{} = string(bodyBytes)
+	if len(strings.TrimSpace(string(bodyBytes))) > 0 {
+		var decoded interface{}
+		if err := json.Unmarshal(bodyBytes, &decoded); err == nil {
+			body = decoded
+		}
+	}
+	headers := map[string]string{}
+	for key, values := range c.Request.Header {
+		if len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
+	query := map[string]string{}
+	for key, values := range c.Request.URL.Query() {
+		if len(values) > 0 {
+			query[key] = values[0]
+		}
+	}
+	return map[string]interface{}{
+		"method":       c.Request.Method,
+		"path":         c.Request.URL.Path,
+		"query":        query,
+		"headers":      headers,
+		"body":         body,
+		"content_type": c.GetHeader("Content-Type"),
+		"remote_addr":  c.ClientIP(),
+	}, nil
+}
+
+func validateAgentWebhookSecret(c *gin.Context, bp *AgentBlueprint) error {
+	secret := strings.TrimSpace(agentWebhookSecret(bp))
+	if secret == "" {
+		return nil
+	}
+	provided := firstNonEmpty(
+		c.GetHeader("X-SunAPI-Webhook-Secret"),
+		c.GetHeader("X-Webhook-Secret"),
+		c.Query("secret"),
+	)
+	if provided != secret {
+		return errUnauthorized("invalid webhook secret")
+	}
+	return nil
+}
+
+func blueprintHasWebhookTrigger(bp *AgentBlueprint) bool {
+	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
+	if err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if node.Data.ComponentID == "component.webhook" {
+			return true
+		}
+		if node.Data.Kind == "custom" && strings.Contains(strings.ToLower(node.Data.Title), "webhook") {
+			return true
+		}
+	}
+	return false
+}
+
+func agentWebhookSecret(bp *AgentBlueprint) string {
+	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
+	if err == nil {
+		for _, node := range nodes {
+			if node.Data.ComponentID != "component.webhook" {
+				continue
+			}
+			if secret := firstNonEmpty(node.Data.Settings["密钥"], node.Data.Settings["Secret"], node.Data.Settings["secret"]); secret != "" {
+				return secret
+			}
+		}
+	}
+	var trigger map[string]interface{}
+	if len(bp.TriggerConfig) > 0 {
+		_ = json.Unmarshal(bp.TriggerConfig, &trigger)
+	}
+	if value, ok := trigger["secret"].(string); ok {
+		return value
+	}
+	if value, ok := trigger["密钥"].(string); ok {
+		return value
+	}
+	return ""
 }
 
 // ── 执行日志处理器 ────────────────────────────────────────────────────────────

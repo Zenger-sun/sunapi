@@ -88,6 +88,8 @@ import {
   getAgents,
   getBlueprintsByAgent,
   listBlueprintExecutionLogs,
+  pauseBlueprint,
+  resumeBlueprint,
   runBlueprint,
   updateBlueprint,
 } from '@/features/agents/api'
@@ -105,14 +107,22 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   captureAgentBrowserPage,
   createAgentComponent,
+  createAgentSkill,
   deleteAgentComponent,
+  deleteAgentSkill,
   executeAgentHTTPRequest,
+  listAgentSkillMarketplace,
+  listAgentSkills,
   listAgentFiles,
   listAgentComponents,
   startImageGenerationTask,
   uploadAgentFile,
   writeAgentReport,
 } from '../api'
+import type {
+  AgentSkillItem,
+  AgentSkillMarketplaceItem,
+} from '../types'
 import {
   AGENT_BLUEPRINT_COMMAND_EVENT,
   AGENT_BLUEPRINTS_CHANGED_EVENT,
@@ -208,6 +218,10 @@ type SkillChoice = {
   source: SkillSource
   reference?: string
   capabilities?: string[]
+  marketplaceId?: string
+  modelGroup?: string
+  modelName?: string
+  tags?: string[]
 }
 
 type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
@@ -471,57 +485,6 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   notify: 'skill.api-function',
   stop: 'skill.mcp-workflow',
 }
-
-const MARKETPLACE_SKILLS: SkillChoice[] = [
-  {
-    label: '网页研究简报 Skill',
-    value: 'skill.marketplace.web-research-brief',
-    description: '围绕网页资料收集、来源核验和引用摘要生成研究简报。',
-    source: 'marketplace',
-    reference: 'n8n / Web research workflow',
-    capabilities: ['搜索计划', '网页摘要', '来源核验'],
-  },
-  {
-    label: '浏览器自动化 Skill',
-    value: 'skill.marketplace.browser-operator',
-    description: '处理登录态页面读取、动态 DOM 抽取、截图证据和安全操作边界。',
-    source: 'marketplace',
-    reference: 'n8n / Browser workflow',
-    capabilities: ['页面导航', 'DOM 抽取', '截图证据'],
-  },
-  {
-    label: 'HTTP API 调用 Skill',
-    value: 'skill.marketplace.http-api-tool',
-    description: '组织 HTTP 请求、鉴权、分页、重试和 JSON/文本响应解析。',
-    source: 'marketplace',
-    reference: 'n8n HTTP Request / Zapier actions',
-    capabilities: ['参数校验', '分页重试', '响应解析'],
-  },
-  {
-    label: '文件转换与表格 Skill',
-    value: 'skill.marketplace.file-transformer',
-    description: '读取 Excel、CSV、PDF、Word、HTML、Markdown 和 TXT 并进行结构化转换。',
-    source: 'marketplace',
-    reference: 'n8n Read/Write Files',
-    capabilities: ['多格式读取', '表格整理', '文件生成'],
-  },
-  {
-    label: '数据清洗分析 Skill',
-    value: 'skill.marketplace.data-cleaning',
-    description: '用于去重、排序、统计、字段映射、指标口径和可复现数据处理。',
-    source: 'marketplace',
-    reference: 'n8n Code node',
-    capabilities: ['数据清洗', '指标计算', '口径校验'],
-  },
-  {
-    label: '通知路由 Skill',
-    value: 'skill.marketplace.notification-router',
-    description: '把任务结果投递到邮件、Webhook、飞书、企业微信、Slack 等通道。',
-    source: 'marketplace',
-    reference: 'Zapier actions / Webhook',
-    capabilities: ['通道选择', '消息格式化', '失败重试'],
-  },
-]
 
 const FREQUENCY_OPTIONS = ['每天', '工作日', '每周', '每月', '每小时']
 const TIMEZONE_OPTIONS = [
@@ -835,7 +798,8 @@ const NODE_META: Record<
     inputs: ['日报文档', '通知目标'],
     outputs: ['发送结果'],
     settings: {
-      渠道: '邮件',
+      渠道: 'Webhook',
+      通知目标: '',
       确认: '发送前确认',
       Webhook: '',
     },
@@ -921,6 +885,8 @@ export function AgentWorkspace({
 }: AgentWorkspaceProps) {
   const [managedSkills, setManagedSkills] =
     useState<SkillChoice[]>(readSavedSkills)
+  const [marketplaceSkills, setMarketplaceSkills] = useState<SkillChoice[]>([])
+  const [isSkillCatalogLoading, setIsSkillCatalogLoading] = useState(false)
   const [componentCatalog, setComponentCatalog] = useState<
     AgentComponentItem[]
   >([])
@@ -1358,6 +1324,52 @@ export function AgentWorkspace({
     void reloadComponents()
   }, [reloadComponents])
 
+  const reloadSkills = useCallback(async () => {
+    setIsSkillCatalogLoading(true)
+    try {
+      const [skills, marketplace] = await Promise.all([
+        listAgentSkills(),
+        listAgentSkillMarketplace(),
+      ])
+      const installed = skills
+        .map(skillChoiceFromAgentSkill)
+        .filter((skill): skill is SkillChoice => Boolean(skill))
+      const marketplaceChoices = marketplace.map(skillChoiceFromMarketplaceItem)
+      setMarketplaceSkills(marketplaceChoices)
+      setManagedSkills((current) => {
+        const backendValues = new Set(installed.map((skill) => skill.value))
+        const backendMarketplaceIds = new Set(
+          installed
+            .map((skill) => skill.marketplaceId)
+            .filter((value): value is string => Boolean(value))
+        )
+        const localOnly = current.filter(
+          (skill) =>
+            !backendValues.has(skill.value) &&
+            (!skill.marketplaceId ||
+              !backendMarketplaceIds.has(skill.marketplaceId)) &&
+            !(
+              skill.reference &&
+              installed.some((item) => item.reference === skill.reference)
+            )
+        )
+        const next = mergeSkillChoices(installed, localOnly).filter(
+          (skill) => skill.source !== 'built-in'
+        )
+        writeSavedSkills(next)
+        return next
+      })
+    } catch (error) {
+      console.warn('Failed to load agent skills', error)
+    } finally {
+      setIsSkillCatalogLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void reloadSkills()
+  }, [reloadSkills])
+
   const handleDeleteBlueprint = useCallback(
     (blueprintId: string) => {
       const next = blueprints.filter((item) => item.id !== blueprintId)
@@ -1392,6 +1404,41 @@ export function AgentWorkspace({
   )
 
   const handleRunPreview = useCallback(() => {
+    if (currentBlueprintStatus === 'paused') {
+      const currentBlueprint = blueprints.find(
+        (item) => item.id === currentBlueprintId
+      )
+      if (currentBlueprint?.backendAgentId && currentBlueprint.backendBlueprintId) {
+        void resumeBlueprint(
+          currentBlueprint.backendAgentId,
+          currentBlueprint.backendBlueprintId
+        )
+          .then((backendBlueprint) => {
+            setBlueprints((current) => {
+              const next = current.map((item) =>
+                item.id === currentBlueprint.id
+                  ? { ...item, status: backendBlueprint.status ?? 'running' }
+                  : item
+              )
+              writeSavedBlueprints(next)
+              notifyAgentBlueprintsChanged()
+              return next
+            })
+            persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
+            toast.success('定时蓝图已继续运行')
+          })
+          .catch((error) => {
+            toast.error(
+              error instanceof Error ? `继续失败: ${error.message}` : '继续失败'
+            )
+          })
+        return
+      }
+      persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
+      toast.success('定时蓝图已继续运行')
+      return
+    }
+
     const prepared = ensureTerminalStopNode(nodes, edges, templateByKind)
     const runExecutionNodes = orderNodes(prepared.nodes, prepared.edges)
     if (runExecutionNodes.length === 0) return
@@ -1615,6 +1662,7 @@ export function AgentWorkspace({
     blueprints,
     cancelPreviewRun,
     currentBlueprintId,
+    currentBlueprintStatus,
     edges,
     executionLog,
     nodes,
@@ -1625,6 +1673,19 @@ export function AgentWorkspace({
   ])
 
   const handleStopPreview = useCallback(() => {
+    const currentBlueprint = blueprints.find(
+      (item) => item.id === currentBlueprintId
+    )
+    if (currentBlueprint?.backendAgentId && currentBlueprint.backendBlueprintId) {
+      void pauseBlueprint(
+        currentBlueprint.backendAgentId,
+        currentBlueprint.backendBlueprintId
+      ).catch((error) => {
+        toast.error(
+          error instanceof Error ? `暂停后端蓝图失败: ${error.message}` : '暂停后端蓝图失败'
+        )
+      })
+    }
     cancelPreviewRun()
     const stoppedAt = Date.now()
     const nextExecutionLog = stopRunningExecutionLogs(executionLog, stoppedAt)
@@ -1641,25 +1702,95 @@ export function AgentWorkspace({
       persistCurrentBlueprintSnapshot(nextNodes, nextExecutionLog, 'paused')
       return nextNodes
     })
-  }, [cancelPreviewRun, executionLog, persistCurrentBlueprintSnapshot])
+  }, [
+    blueprints,
+    cancelPreviewRun,
+    currentBlueprintId,
+    executionLog,
+    persistCurrentBlueprintSnapshot,
+  ])
 
-  const handleAddSkill = useCallback((skill: SkillChoice) => {
-    setManagedSkills((current) => {
-      const next = mergeSkillChoices(current, [skill]).filter(
-        (item) => item.source !== 'built-in'
-      )
-      writeSavedSkills(next)
-      return next
-    })
-  }, [])
+  const handleAddSkill = useCallback(
+    async (skill: SkillChoice) => {
+      let installedSkill = skill
+      try {
+        if (skill.source === 'marketplace') {
+          const created = await createAgentSkill({
+            name: '',
+            description: '',
+            source_type: 'marketplace',
+            marketplace_id: skill.marketplaceId ?? skill.value,
+          })
+          installedSkill = skillChoiceFromAgentSkill(created) ?? {
+            ...skill,
+            value: created.id,
+          }
+        } else if (skill.source === 'github') {
+          const created = await createAgentSkill({
+            name: '',
+            description: '',
+            source_type: 'github',
+            source_url: skill.reference ?? skill.value,
+            tags: skill.tags,
+          })
+          installedSkill = skillChoiceFromAgentSkill(created) ?? {
+            ...skill,
+            value: created.id,
+          }
+        } else if (skill.source === 'custom') {
+          const created = await createAgentSkill({
+            name: skill.label,
+            description: skill.description,
+            source_type: 'custom',
+            model_group: skill.modelGroup || currentGroup || 'default',
+            model_name: skill.modelName || currentModel || '',
+            tags: skill.tags,
+          })
+          installedSkill = skillChoiceFromAgentSkill(created) ?? {
+            ...skill,
+            value: created.id,
+          }
+        }
 
-  const handleDeleteSkill = useCallback((skillValue: string) => {
-    setManagedSkills((current) => {
-      const next = current.filter((skill) => skill.value !== skillValue)
-      writeSavedSkills(next)
-      return next
-    })
-  }, [])
+        setManagedSkills((current) => {
+          const next = mergeSkillChoices([installedSkill], current).filter(
+            (item) => item.source !== 'built-in'
+          )
+          writeSavedSkills(next)
+          return next
+        })
+        void reloadSkills()
+        toast.success('Skill 已安装')
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : 'Skill 安装失败'
+        )
+        throw error
+      }
+    },
+    [currentGroup, currentModel, reloadSkills]
+  )
+
+  const handleDeleteSkill = useCallback(
+    async (skillValue: string) => {
+      try {
+        await deleteAgentSkill(skillValue)
+        setManagedSkills((current) => {
+          const next = current.filter((skill) => skill.value !== skillValue)
+          writeSavedSkills(next)
+          return next
+        })
+        void reloadSkills()
+        toast.success('Skill 已删除')
+      } catch (error) {
+        toast.error(
+          error instanceof Error ? error.message : 'Skill 删除失败'
+        )
+        throw error
+      }
+    },
+    [reloadSkills]
+  )
 
   const handleCreateComponent = useCallback(
     async (payload: AgentComponentFormData) => {
@@ -1837,8 +1968,10 @@ export function AgentWorkspace({
         nodes={nodes}
         skillChoices={skillChoices}
         managedSkills={managedSkills}
+        marketplaceSkills={marketplaceSkills}
         paletteGroups={filteredPaletteGroups}
         isComponentCatalogLoading={isComponentCatalogLoading}
+        isSkillCatalogLoading={isSkillCatalogLoading}
         onAddSkill={handleAddSkill}
         onAddNode={handleAddNode}
         onCreateComponent={handleCreateComponent}
@@ -1863,6 +1996,7 @@ export function AgentWorkspace({
         onUpdateSetting={handleUpdateSetting}
         search={search}
         selectedNode={selectedNode}
+        currentBlueprintId={currentBlueprintId}
         hasScheduledBlueprint={hasScheduledBlueprint}
       />
     </ReactFlowProvider>
@@ -1879,13 +2013,16 @@ type BlueprintWorkspaceProps = {
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
+  marketplaceSkills: SkillChoice[]
   paletteGroups: PaletteTemplateGroup[]
   isComponentCatalogLoading: boolean
+  isSkillCatalogLoading: boolean
   blueprintTitle: string
   backendExecutionLogs: AgentExecutionLog[]
   canRedo: boolean
   canUndo: boolean
   currentBlueprintStatus: AgentBlueprintStatus
+  currentBlueprintId: string | null
   currentGroup?: string
   hasScheduledBlueprint: boolean
   lastSavedAt: number | null
@@ -1902,8 +2039,8 @@ type BlueprintWorkspaceProps = {
   onSaveBlueprint: () => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
-  onAddSkill: (skill: SkillChoice) => void
-  onDeleteSkill: (skillValue: string) => void
+  onAddSkill: (skill: SkillChoice) => Promise<void>
+  onDeleteSkill: (skillValue: string) => Promise<void>
   onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
   onDeleteComponent: (componentId: string) => Promise<void>
   onSetNodeSkill: (nodeId: string, skill: string) => void
@@ -1924,13 +2061,16 @@ function BlueprintWorkspace({
   groupChoices,
   skillChoices,
   managedSkills,
+  marketplaceSkills,
   paletteGroups,
   isComponentCatalogLoading,
+  isSkillCatalogLoading,
   blueprintTitle,
   backendExecutionLogs,
   canRedo,
   canUndo,
   currentBlueprintStatus,
+  currentBlueprintId,
   currentGroup,
   hasScheduledBlueprint,
   lastSavedAt,
@@ -2002,9 +2142,13 @@ function BlueprintWorkspace({
       <aside className='border-border/70 bg-muted/25 hidden w-68 shrink-0 flex-col border-r lg:flex'>
         <Palette
           activePanel={activeToolPanel}
+          groupChoices={groupChoices}
           groups={paletteGroups}
           isComponentCatalogLoading={isComponentCatalogLoading}
+          isSkillCatalogLoading={isSkillCatalogLoading}
+          marketplaceSkills={marketplaceSkills}
           managedSkills={managedSkills}
+          modelChoices={modelChoices}
           onAddNode={onAddNode}
           onAddSkill={onAddSkill}
           onCreateComponent={onCreateComponent}
@@ -2203,6 +2347,7 @@ function BlueprintWorkspace({
 
       <aside className='border-border/70 bg-background hidden w-[333px] shrink-0 flex-col border-l xl:flex'>
         <Inspector
+          blueprintId={currentBlueprintId}
           currentGroup={currentGroup}
           groupChoices={groupChoices}
           modelChoices={modelChoices}
@@ -2218,10 +2363,14 @@ function BlueprintWorkspace({
 }
 
 function Palette({
+  groupChoices,
   groups,
   isComponentCatalogLoading,
+  isSkillCatalogLoading,
   skillChoices,
   managedSkills,
+  marketplaceSkills,
+  modelChoices,
   search,
   onSearchChange,
   onAddNode,
@@ -2231,17 +2380,21 @@ function Palette({
   onDeleteSkill,
 }: {
   activePanel: AgentToolPanel
+  groupChoices: GroupOption[]
   groups: PaletteTemplateGroup[]
   isComponentCatalogLoading: boolean
+  isSkillCatalogLoading: boolean
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
+  marketplaceSkills: SkillChoice[]
+  modelChoices: ModelChoice[]
   search: string
   onSearchChange: (value: string) => void
   onAddNode: (templateKey: AgentNodeKind | string) => void
-  onAddSkill: (skill: SkillChoice) => void
+  onAddSkill: (skill: SkillChoice) => Promise<void>
   onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
   onDeleteComponent: (componentId: string) => Promise<void>
-  onDeleteSkill: (skillValue: string) => void
+  onDeleteSkill: (skillValue: string) => Promise<void>
   onPanelChange: (panel: AgentToolPanel) => void
 }) {
   return (
@@ -2326,7 +2479,11 @@ function Palette({
         >
           <div className='px-2 py-2'>
             <SkillManagerPanel
+              groupChoices={groupChoices}
+              isLoading={isSkillCatalogLoading}
+              marketplaceSkills={marketplaceSkills}
               managedSkills={managedSkills}
+              modelChoices={modelChoices}
               skillChoices={skillChoices}
               onAddSkill={onAddSkill}
               onDeleteSkill={onDeleteSkill}
@@ -2857,6 +3014,7 @@ function IoList({ label, values }: { label: string; values: string[] }) {
 
 function Inspector({
   selectedNode,
+  blueprintId,
   modelChoices,
   groupChoices,
   skillChoices,
@@ -2866,6 +3024,7 @@ function Inspector({
   onUpdateSetting,
 }: {
   selectedNode: AgentFlowNode | null
+  blueprintId: string | null
   modelChoices: ModelChoice[]
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
@@ -2890,6 +3049,7 @@ function Inspector({
         {selectedNode ? (
           <div className='space-y-4 p-3'>
             <NodeConfigPanel
+              blueprintId={blueprintId}
               currentGroup={currentGroup}
               groupChoices={groupChoices}
               modelChoices={modelChoices}
@@ -3205,16 +3365,15 @@ async function executeHTTPNodes(nodes: AgentFlowNode[]) {
     const isNotify = node.data.kind === 'notify'
     const url = (
       isNotify
-        ? node.data.settings['Webhook'] || node.data.settings['网址']
+        ? node.data.settings['Webhook'] ||
+          node.data.settings['通知目标'] ||
+          node.data.settings['网址']
         : node.data.settings['网址'] || node.data.settings['请求URL']
     )?.trim()
-    if (isNotify && node.data.settings['渠道'] !== 'Webhook') {
-      continue
-    }
     if (!url) {
       nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
         [HTTP_ERROR_SETTING]: isNotify
-          ? 'Webhook 通知未配置 URL。'
+          ? `${node.data.settings['渠道'] || 'Webhook'} 通知未配置目标 URL。`
           : '网页请求节点未配置网址。',
         [HTTP_RESPONSE_SETTING]: '',
         [HTTP_STATUS_SETTING]: '',
@@ -3388,11 +3547,36 @@ function normalizeImageCount(value?: string) {
 }
 
 function buildNotifyWebhookBody(node: AgentFlowNode) {
+  const channel = node.data.settings['渠道'] || 'Webhook'
+  const text = [
+    node.data.title,
+    node.data.description,
+    `生成时间: ${new Date().toISOString()}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+  if (/slack/i.test(channel)) {
+    return JSON.stringify({ text }, null, 2)
+  }
+  if (/飞书|feishu|lark/i.test(channel)) {
+    return JSON.stringify(
+      { msg_type: 'text', content: { text } },
+      null,
+      2
+    )
+  }
+  if (/企业微信|wecom|wechat-work|钉钉|dingtalk/i.test(channel)) {
+    return JSON.stringify(
+      { msgtype: 'text', text: { content: text } },
+      null,
+      2
+    )
+  }
   return JSON.stringify(
     {
       title: node.data.title,
       description: node.data.description,
-      channel: node.data.settings['渠道'] || 'Webhook',
+      channel,
       target: node.data.settings['通知目标'] || node.data.settings['Webhook'] || '',
       generated_at: new Date().toISOString(),
     },
@@ -4154,29 +4338,19 @@ function buildImageNodeModelOutput(node: AgentFlowNode, skillLine: string) {
 }
 
 function buildNotifyNodeModelOutput(node: AgentFlowNode, skillLine: string) {
-  const channel = node.data.settings['渠道'] || '邮件'
+  const channel = node.data.settings['渠道'] || 'Webhook'
   const confirm = node.data.settings['确认'] || '发送前确认'
   const statusCode = node.data.settings[HTTP_STATUS_SETTING]
   const error = node.data.settings[HTTP_ERROR_SETTING]
-
-  if (channel === 'Webhook') {
-    return [
-      `模型: ${node.data.model}${skillLine}`,
-      '通知结果:',
-      statusCode
-        ? `- Webhook 已真实请求，状态码 ${statusCode}。`
-        : `- Webhook 未发送成功: ${error || '未配置 URL'}`,
-      `- 目标: ${node.data.settings['Webhook'] || node.data.settings['网址'] || '未配置'}`,
-      `- 确认策略: ${confirm}`,
-    ].join('\n')
-  }
-
   return [
     `模型: ${node.data.model}${skillLine}`,
-    '通知待发送:',
+    '通知结果:',
     `- 渠道: ${channel}`,
+    statusCode
+      ? `- 已真实请求，状态码 ${statusCode}。`
+      : `- 未发送成功: ${error || '未配置目标 URL'}`,
+    `- 目标: ${node.data.settings['Webhook'] || node.data.settings['通知目标'] || node.data.settings['网址'] || '未配置'}`,
     `- 确认策略: ${confirm}`,
-    '- 当前未配置真实外发适配器，因此只生成待发送记录，不标记为已发送。',
   ].join('\n')
 }
 
@@ -4649,6 +4823,7 @@ function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
 
 function NodeConfigPanel({
   node,
+  blueprintId,
   modelChoices,
   groupChoices,
   skillChoices,
@@ -4658,6 +4833,7 @@ function NodeConfigPanel({
   onUpdateSetting,
 }: {
   node: AgentFlowNode
+  blueprintId: string | null
   modelChoices: ModelChoice[]
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
@@ -4701,6 +4877,7 @@ function NodeConfigPanel({
                 label={key}
                 value={value}
                 nodeKind={node.data.kind}
+                blueprintId={blueprintId}
                 settings={node.data.settings}
                 onChange={(nextValue) => onUpdateSetting(key, nextValue)}
                 onChangeSetting={onUpdateSetting}
@@ -5403,6 +5580,7 @@ function SettingControl({
   label,
   value,
   nodeKind,
+  blueprintId,
   settings,
   onChange,
   onChangeSetting,
@@ -5410,6 +5588,7 @@ function SettingControl({
   label: string
   value: string
   nodeKind: AgentNodeKind
+  blueprintId?: string | null
   settings: Record<string, string>
   onChange: (value: string) => void
   onChangeSetting?: (key: string, value: string) => void
@@ -5446,6 +5625,25 @@ function SettingControl({
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
           支持 key=value 或 JSON 格式，仅用于 POST/PUT 请求体或 URL 查询参数。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (nodeKind === 'custom' && label === '路径' && /webhook/i.test(value)) {
+    const concretePath = blueprintId
+      ? `/api/agent-webhooks/${blueprintId}`
+      : '/api/agent-webhooks/{保存蓝图后生成的 ID}'
+    return (
+      <LabeledField label='Webhook 地址'>
+        <Input
+          value={concretePath}
+          readOnly
+          className='h-8 rounded-[8px] font-mono text-xs'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          外部系统向此地址发送请求会触发当前蓝图执行；若配置密钥，请在
+          X-SunAPI-Webhook-Secret 请求头或 secret 查询参数中传入。
         </div>
       </LabeledField>
     )
@@ -5846,6 +6044,23 @@ function SettingControl({
     )
   }
 
+  if (label === '脚本') {
+    return (
+      <LabeledField label='代码处理脚本'>
+        <Textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={'select 商品ID, 商品标题, 支付金额\nfilter 支付金额>0\nsort -支付金额\nlimit 20'}
+          className='min-h-32 rounded-[8px] font-mono text-xs'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          支持 select、filter、sort、limit、count、sum、average、groupBy
+          等安全数据处理指令；只处理上游真实输出，不执行系统命令。
+        </div>
+      </LabeledField>
+    )
+  }
+
   if (label === '执行频率') {
     return (
       <LabeledField label={label}>
@@ -5929,59 +6144,120 @@ function SettingControl({
 }
 
 function SkillManagerPanel({
+  groupChoices,
+  isLoading,
+  marketplaceSkills,
+  modelChoices,
   skillChoices,
   managedSkills: _managedSkills,
   compact: _compact,
   onAddSkill,
   onDeleteSkill,
 }: {
+  groupChoices: GroupOption[]
+  isLoading: boolean
+  marketplaceSkills: SkillChoice[]
+  modelChoices: ModelChoice[]
   skillChoices: SkillChoice[]
   managedSkills: SkillChoice[]
   compact?: boolean
-  onAddSkill: (skill: SkillChoice) => void
-  onDeleteSkill: (skillValue: string) => void
+  onAddSkill: (skill: SkillChoice) => Promise<void>
+  onDeleteSkill: (skillValue: string) => Promise<void>
 }) {
   const [activeTab, setActiveTab] = useState<SkillDraftSource>('github')
   const [githubUrl, setGithubUrl] = useState('')
   const [customName, setCustomName] = useState('')
   const [customDescription, setCustomDescription] = useState('')
+  const [customModelGroup, setCustomModelGroup] = useState(
+    groupChoices[0]?.value ?? 'default'
+  )
+  const [customModelName, setCustomModelName] = useState(
+    modelChoices[0]?.value ?? ''
+  )
+  const [customTags, setCustomTags] = useState('')
+  const [submittingKey, setSubmittingKey] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!groupChoices.some((group) => group.value === customModelGroup)) {
+      setCustomModelGroup(groupChoices[0]?.value ?? 'default')
+    }
+  }, [customModelGroup, groupChoices])
+
+  useEffect(() => {
+    if (customModelName) return
+    setCustomModelName(modelChoices[0]?.value ?? '')
+  }, [customModelName, modelChoices])
 
   const installedValues = useMemo(
     () => new Set(skillChoices.map((s) => s.value)),
     [skillChoices]
   )
+  const installedMarketplaceIds = useMemo(
+    () =>
+      new Set(
+        skillChoices
+          .map((s) => s.marketplaceId)
+          .filter((value): value is string => Boolean(value))
+      ),
+    [skillChoices]
+  )
 
-  const handleAdd = () => {
+  const handleAdd = async (skill?: SkillChoice) => {
+    const submitKey = skill?.value ?? activeTab
     if (activeTab === 'github') {
       const url = githubUrl.trim()
       if (!url) return
-      onAddSkill({
-        label: `${formatSkillNameFromReference(url)} Skill`,
-        value: `skill.github.${createStableId(url)}`,
-        description: '从 GitHub 地址添加的 Skill。',
-        source: 'github',
-        reference: url,
-      })
-      setGithubUrl('')
+      setSubmittingKey(submitKey)
+      try {
+        await onAddSkill({
+          label: `${formatSkillNameFromReference(url)} Skill`,
+          value: `skill.github.${createStableId(url)}`,
+          description: '从 GitHub 地址添加的 Skill。',
+          source: 'github',
+          reference: url,
+        })
+        setGithubUrl('')
+      } finally {
+        setSubmittingKey(null)
+      }
       return
     }
     if (activeTab === 'marketplace') {
-      const skill = MARKETPLACE_SKILLS.find(
-        (s) => !installedValues.has(s.value)
-      )
-      if (skill) onAddSkill(skill)
+      const marketplaceSkill =
+        skill ??
+        marketplaceSkills.find(
+          (s) =>
+            !installedValues.has(s.value) &&
+            (!s.marketplaceId || !installedMarketplaceIds.has(s.marketplaceId))
+        )
+      if (!marketplaceSkill) return
+      setSubmittingKey(marketplaceSkill.value)
+      try {
+        await onAddSkill(marketplaceSkill)
+      } finally {
+        setSubmittingKey(null)
+      }
       return
     }
     const name = customName.trim()
     if (!name) return
-    onAddSkill({
-      label: name.endsWith('Skill') ? name : `${name} Skill`,
-      value: `skill.custom.${createStableId(name)}`,
-      description: customDescription.trim() || '用户自定义 Skill。',
-      source: 'custom',
-    })
-    setCustomName('')
-    setCustomDescription('')
+    setSubmittingKey(submitKey)
+    try {
+      await onAddSkill({
+        label: name.endsWith('Skill') ? name : `${name} Skill`,
+        value: `skill.custom.${createStableId(name)}`,
+        description: customDescription.trim() || '用户自定义 Skill。',
+        source: 'custom',
+        modelGroup: customModelGroup,
+        modelName: customModelName,
+        tags: splitSkillTags(customTags),
+      })
+      setCustomName('')
+      setCustomDescription('')
+      setCustomTags('')
+    } finally {
+      setSubmittingKey(null)
+    }
   }
 
   const builtinSkills = skillChoices.filter((s) => s.source === 'built-in')
@@ -6028,16 +6304,18 @@ function SkillManagerPanel({
               onChange={(e) => setGithubUrl(e.target.value)}
               placeholder='https://github.com/org/skill'
               className='h-7 flex-1 rounded-[6px] text-xs'
-              onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleAdd()
+              }}
             />
             <Button
               type='button'
               size='sm'
               className='h-7 rounded-[6px] px-2.5 text-xs'
-              onClick={handleAdd}
-              disabled={!githubUrl.trim()}
+              onClick={() => void handleAdd()}
+              disabled={!githubUrl.trim() || submittingKey === 'github'}
             >
-              添加
+              {submittingKey === 'github' ? '安装中' : '添加'}
             </Button>
           </div>
         )}
@@ -6045,8 +6323,24 @@ function SkillManagerPanel({
         {/* 商城选择 */}
         {activeTab === 'marketplace' && (
           <div className='flex flex-col gap-1.5'>
-            {MARKETPLACE_SKILLS.map((skill) => {
-              const installed = installedValues.has(skill.value)
+            {isLoading && marketplaceSkills.length === 0 ? (
+              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
+                正在加载 Skill 商城...
+              </div>
+            ) : null}
+            {!isLoading && marketplaceSkills.length === 0 ? (
+              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
+                暂无可安装 Skill
+              </div>
+            ) : null}
+            {marketplaceSkills.map((skill) => {
+              const installed =
+                installedValues.has(skill.value) ||
+                Boolean(
+                  skill.marketplaceId &&
+                    installedMarketplaceIds.has(skill.marketplaceId)
+                )
+              const installing = submittingKey === skill.value
               return (
                 <div
                   key={skill.value}
@@ -6065,10 +6359,10 @@ function SkillManagerPanel({
                     size='sm'
                     variant={installed ? 'ghost' : 'outline'}
                     className='h-6 shrink-0 rounded-[5px] px-2 text-[10px]'
-                    disabled={installed}
-                    onClick={() => !installed && onAddSkill(skill)}
+                    disabled={installed || installing}
+                    onClick={() => !installed && void handleAdd(skill)}
                   >
-                    {installed ? '已添加' : '+ 添加'}
+                    {installed ? '已添加' : installing ? '安装中' : '+ 添加'}
                   </Button>
                 </div>
               )
@@ -6091,14 +6385,44 @@ function SkillManagerPanel({
               placeholder='描述（可选）'
               className='min-h-[52px] resize-none rounded-[6px] text-xs'
             />
+            <div className='grid grid-cols-2 gap-1.5'>
+              <NativeSelect
+                value={customModelGroup}
+                onChange={(event) => setCustomModelGroup(event.target.value)}
+                className='h-7 rounded-[6px] text-xs'
+              >
+                {groupChoices.map((group) => (
+                  <NativeSelectOption key={group.value} value={group.value}>
+                    {group.label}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+              <NativeSelect
+                value={customModelName}
+                onChange={(event) => setCustomModelName(event.target.value)}
+                className='h-7 rounded-[6px] text-xs'
+              >
+                {modelChoices.map((model) => (
+                  <NativeSelectOption key={model.value} value={model.value}>
+                    {model.label}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </div>
+            <Input
+              value={customTags}
+              onChange={(e) => setCustomTags(e.target.value)}
+              placeholder='标签，逗号分隔'
+              className='h-7 rounded-[6px] text-xs'
+            />
             <Button
               type='button'
               size='sm'
               className='h-7 rounded-[6px] text-xs'
-              onClick={handleAdd}
-              disabled={!customName.trim()}
+              onClick={() => void handleAdd()}
+              disabled={!customName.trim() || submittingKey === 'custom'}
             >
-              创建 Skill
+              {submittingKey === 'custom' ? '创建中' : '创建 Skill'}
             </Button>
           </div>
         )}
@@ -6144,7 +6468,13 @@ function SkillManagerPanel({
                 <button
                   type='button'
                   className='text-muted-foreground hover:text-destructive shrink-0 rounded-[5px] p-1 opacity-0 transition-opacity group-hover:opacity-100'
-                  onClick={() => onDeleteSkill(skill.value)}
+                  disabled={submittingKey === skill.value}
+                  onClick={() => {
+                    setSubmittingKey(skill.value)
+                    void onDeleteSkill(skill.value).finally(() =>
+                      setSubmittingKey(null)
+                    )
+                  }}
                   title='删除'
                 >
                   <Trash2Icon className='size-3' />
@@ -6307,6 +6637,60 @@ function mergeSkillChoices(...groups: SkillChoice[][]) {
     seen.add(skill.value)
     return true
   })
+}
+
+function skillChoiceFromAgentSkill(skill: AgentSkillItem): SkillChoice | null {
+  if (!skill.enabled) return null
+  if (skill.source === 'builtin') return null
+  const source =
+    skill.source === 'marketplace' ||
+    skill.source === 'github' ||
+    skill.source === 'custom'
+      ? skill.source
+      : 'custom'
+  const marketplaceId =
+    typeof skill.config?.marketplace_id === 'string'
+      ? skill.config.marketplace_id
+      : undefined
+  const capabilities = Array.isArray(skill.config?.capabilities)
+    ? skill.config.capabilities.filter(
+        (item): item is string => typeof item === 'string'
+      )
+    : undefined
+  return {
+    label: skill.name,
+    value: skill.id,
+    description: skill.description,
+    source,
+    reference: skill.source_url || marketplaceId,
+    capabilities,
+    marketplaceId,
+  }
+}
+
+function skillChoiceFromMarketplaceItem(
+  skill: AgentSkillMarketplaceItem
+): SkillChoice {
+  return {
+    label: skill.name,
+    value: skill.id,
+    description: skill.description,
+    source: 'marketplace',
+    reference: skill.source_url,
+    capabilities: skill.capabilities,
+    marketplaceId: skill.id,
+  }
+}
+
+function splitSkillTags(value: string) {
+  return Array.from(
+    new Set(
+      value
+        .split(/[,\n，、]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  )
 }
 
 function readSavedSkills(): SkillChoice[] {
@@ -6806,7 +7190,14 @@ function buildTemplates(
   if (!components.length) return baseTemplates
 
   const dynamicTemplates = components
-    .filter((component) => component.enabled && component.source === 'custom')
+    .filter(
+      (component) =>
+        component.enabled &&
+        (component.source === 'custom' ||
+          !baseTemplates.some(
+            (template) => template.componentId === component.id
+          ))
+    )
     .map((component) =>
       componentToNodeTemplate(component, models, currentModel, currentGroup)
     )
