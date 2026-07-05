@@ -30,6 +30,8 @@ type AgentBlueprint struct {
 	Skills              json.RawMessage `json:"skills"` // []string
 	InputVariables      json.RawMessage `json:"input_variables,omitempty"`
 	ArchiveConfig       json.RawMessage `json:"archive_config,omitempty"`
+	Nodes               json.RawMessage `json:"nodes,omitempty"`
+	Edges               json.RawMessage `json:"edges,omitempty"`
 	CreatedTime         int64           `json:"created_time"`
 	UpdatedTime         int64           `json:"updated_time"`
 	LastExecutedTime    int64           `json:"last_executed_time,omitempty"`
@@ -116,6 +118,8 @@ type BlueprintFormData struct {
 	Skills         json.RawMessage `json:"skills"`
 	InputVariables json.RawMessage `json:"input_variables,omitempty"`
 	ArchiveConfig  json.RawMessage `json:"archive_config,omitempty"`
+	Nodes          json.RawMessage `json:"nodes,omitempty"`
+	Edges          json.RawMessage `json:"edges,omitempty"`
 }
 
 // SkillFormData 创建Skill的表单数据

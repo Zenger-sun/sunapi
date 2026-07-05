@@ -866,6 +866,7 @@ func RegisterPlaygroundRoutes(engine *gin.Engine, store *Store, base *handlers.B
 	}
 
 	openaiHandlers := openai.NewOpenAIAPIHandler(base)
+	store.SetPlaygroundImageHandlers(openaiHandlers)
 	registerPlaygroundImageTaskRoutes(engine, store, openaiHandlers)
 
 	pg := engine.Group("/pg")

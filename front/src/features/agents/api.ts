@@ -10,6 +10,7 @@ import { queryOptions, useMutation, useQueryClient } from '@tanstack/react-query
 import { api } from '@/lib/api'
 import {
   type Agent,
+  type AgentExecutionLog,
   type Blueprint,
   type Skill,
   type SkillMarketplaceItem,
@@ -30,17 +31,17 @@ function extractData<T>(resp: { data: { data?: T } }): T {
 // 智能体 API
 // ============================================================================
 
-async function getAgents(): Promise<Agent[]> {
+export async function getAgents(): Promise<Agent[]> {
   const resp = await api.get('/api/agents')
   return extractData<Agent[]>(resp) ?? []
 }
 
-async function createAgent(data: AgentFormData): Promise<Agent> {
+export async function createAgent(data: AgentFormData): Promise<Agent> {
   const resp = await api.post('/api/agents', data)
   return extractData<Agent>(resp)
 }
 
-async function updateAgent(
+export async function updateAgent(
   id: string,
   data: Partial<AgentFormData>
 ): Promise<Agent> {
@@ -48,7 +49,7 @@ async function updateAgent(
   return extractData<Agent>(resp)
 }
 
-async function deleteAgent(id: string): Promise<void> {
+export async function deleteAgent(id: string): Promise<void> {
   await api.delete(`/api/agents/${id}`)
 }
 
@@ -56,12 +57,12 @@ async function deleteAgent(id: string): Promise<void> {
 // 蓝图 API
 // ============================================================================
 
-async function getBlueprintsByAgent(agentId: string): Promise<Blueprint[]> {
+export async function getBlueprintsByAgent(agentId: string): Promise<Blueprint[]> {
   const resp = await api.get(`/api/agents/${agentId}/blueprints`)
   return extractData<Blueprint[]>(resp) ?? []
 }
 
-async function createBlueprint(
+export async function createBlueprint(
   agentId: string,
   data: BlueprintFormData
 ): Promise<Blueprint> {
@@ -69,7 +70,7 @@ async function createBlueprint(
   return extractData<Blueprint>(resp)
 }
 
-async function updateBlueprint(
+export async function updateBlueprint(
   agentId: string,
   id: string,
   data: Partial<BlueprintFormData>
@@ -78,28 +79,39 @@ async function updateBlueprint(
   return extractData<Blueprint>(resp)
 }
 
-async function deleteBlueprint(agentId: string, id: string): Promise<void> {
+export async function deleteBlueprint(agentId: string, id: string): Promise<void> {
   await api.delete(`/api/agents/${agentId}/blueprints/${id}`)
 }
 
-async function pauseBlueprint(agentId: string, id: string): Promise<Blueprint> {
+export async function pauseBlueprint(agentId: string, id: string): Promise<Blueprint> {
   const resp = await api.post(`/api/agents/${agentId}/blueprints/${id}/pause`)
   return extractData<Blueprint>(resp)
 }
 
-async function resumeBlueprint(agentId: string, id: string): Promise<Blueprint> {
+export async function resumeBlueprint(agentId: string, id: string): Promise<Blueprint> {
   const resp = await api.post(`/api/agents/${agentId}/blueprints/${id}/resume`)
   return extractData<Blueprint>(resp)
 }
 
-async function retryBlueprint(agentId: string, id: string): Promise<Blueprint> {
+export async function retryBlueprint(agentId: string, id: string): Promise<Blueprint> {
   const resp = await api.post(`/api/agents/${agentId}/blueprints/${id}/retry`)
   return extractData<Blueprint>(resp)
 }
 
-async function runBlueprint(agentId: string, id: string): Promise<Blueprint> {
+export async function runBlueprint(agentId: string, id: string): Promise<Blueprint> {
   const resp = await api.post(`/api/agents/${agentId}/blueprints/${id}/run`)
   return extractData<Blueprint>(resp)
+}
+
+export async function listBlueprintExecutionLogs(
+  agentId: string,
+  id: string,
+  limit = 5
+): Promise<AgentExecutionLog[]> {
+  const resp = await api.get(`/api/agents/${agentId}/blueprints/${id}/logs`, {
+    params: { limit },
+  })
+  return extractData<AgentExecutionLog[]>(resp) ?? []
 }
 
 // ============================================================================

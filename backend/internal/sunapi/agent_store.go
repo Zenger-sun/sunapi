@@ -157,7 +157,7 @@ func (s *Store) ListBlueprints(ctx context.Context, agentID string, userID int64
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, agent_id, user_id, name, description, status,
 		       trigger_config, model_group, model_name, skills,
-		       input_variables, archive_config,
+		       input_variables, archive_config, nodes, edges,
 		       created_time, updated_time, last_executed_time, next_execution_time,
 		       execution_count, failure_reason, execution_duration_ms
 		FROM agent_blueprints
@@ -174,7 +174,7 @@ func (s *Store) ListBlueprints(ctx context.Context, agentID string, userID int64
 		if err := rows.Scan(
 			&b.ID, &b.AgentID, &b.UserID, &b.Name, &b.Description, &b.Status,
 			&b.TriggerConfig, &b.ModelGroup, &b.ModelName, &b.Skills,
-			&b.InputVariables, &b.ArchiveConfig,
+			&b.InputVariables, &b.ArchiveConfig, &b.Nodes, &b.Edges,
 			&b.CreatedTime, &b.UpdatedTime, &b.LastExecutedTime, &b.NextExecutionTime,
 			&b.ExecutionCount, &b.FailureReason, &b.ExecutionDurationMs,
 		); err != nil {
@@ -193,13 +193,13 @@ func (s *Store) GetBlueprint(ctx context.Context, id string, userID int64) (*Age
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, agent_id, user_id, name, description, status,
 		       trigger_config, model_group, model_name, skills,
-		       input_variables, archive_config,
+		       input_variables, archive_config, nodes, edges,
 		       created_time, updated_time, last_executed_time, next_execution_time,
 		       execution_count, failure_reason, execution_duration_ms
 		FROM agent_blueprints WHERE id=? AND user_id=?`, id, userID).
 		Scan(&b.ID, &b.AgentID, &b.UserID, &b.Name, &b.Description, &b.Status,
 			&b.TriggerConfig, &b.ModelGroup, &b.ModelName, &b.Skills,
-			&b.InputVariables, &b.ArchiveConfig,
+			&b.InputVariables, &b.ArchiveConfig, &b.Nodes, &b.Edges,
 			&b.CreatedTime, &b.UpdatedTime, &b.LastExecutedTime, &b.NextExecutionTime,
 			&b.ExecutionCount, &b.FailureReason, &b.ExecutionDurationMs)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -236,6 +236,14 @@ func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int6
 	if len(rawArchive) == 0 || string(rawArchive) == "null" {
 		rawArchive = json.RawMessage(`{}`)
 	}
+	rawNodes := f.Nodes
+	if len(rawNodes) == 0 || string(rawNodes) == "null" {
+		rawNodes = json.RawMessage(`[]`)
+	}
+	rawEdges := f.Edges
+	if len(rawEdges) == 0 || string(rawEdges) == "null" {
+		rawEdges = json.RawMessage(`[]`)
+	}
 
 	b := &AgentBlueprint{
 		ID:             newBlueprintID(),
@@ -250,6 +258,8 @@ func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int6
 		Skills:         rawSkills,
 		InputVariables: rawVars,
 		ArchiveConfig:  rawArchive,
+		Nodes:          rawNodes,
+		Edges:          rawEdges,
 		CreatedTime:    now,
 		UpdatedTime:    now,
 	}
@@ -258,14 +268,14 @@ func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int6
 		INSERT INTO agent_blueprints
 		(id, agent_id, user_id, name, description, status,
 		 trigger_config, model_group, model_name, skills,
-		 input_variables, archive_config,
+		 input_variables, archive_config, nodes, edges,
 		 created_time, updated_time,
 		 last_executed_time, next_execution_time,
 		 execution_count, failure_reason, execution_duration_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,'',0)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,'',0)`,
 		b.ID, b.AgentID, b.UserID, b.Name, b.Description, b.Status,
 		b.TriggerConfig, b.ModelGroup, b.ModelName, b.Skills,
-		b.InputVariables, b.ArchiveConfig,
+		b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges,
 		b.CreatedTime, b.UpdatedTime)
 	if err != nil {
 		return nil, err
@@ -310,15 +320,21 @@ func (s *Store) UpdateBlueprint(ctx context.Context, id string, userID int64, f 
 	if len(f.ArchiveConfig) > 0 && string(f.ArchiveConfig) != "null" {
 		b.ArchiveConfig = f.ArchiveConfig
 	}
+	if len(f.Nodes) > 0 && string(f.Nodes) != "null" {
+		b.Nodes = f.Nodes
+	}
+	if len(f.Edges) > 0 && string(f.Edges) != "null" {
+		b.Edges = f.Edges
+	}
 	b.UpdatedTime = now
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE agent_blueprints
 		SET name=?, description=?, trigger_config=?, model_group=?, model_name=?,
-		    skills=?, input_variables=?, archive_config=?, updated_time=?
+		    skills=?, input_variables=?, archive_config=?, nodes=?, edges=?, updated_time=?
 		WHERE id=? AND user_id=?`,
 		b.Name, b.Description, b.TriggerConfig, b.ModelGroup, b.ModelName,
-		b.Skills, b.InputVariables, b.ArchiveConfig, b.UpdatedTime, id, userID)
+		b.Skills, b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges, b.UpdatedTime, id, userID)
 	if err != nil {
 		return nil, err
 	}

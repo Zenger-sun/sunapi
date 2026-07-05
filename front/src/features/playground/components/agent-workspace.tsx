@@ -82,6 +82,15 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import {
+  createAgent,
+  createBlueprint,
+  getAgents,
+  getBlueprintsByAgent,
+  listBlueprintExecutionLogs,
+  runBlueprint,
+  updateBlueprint,
+} from '@/features/agents/api'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -100,6 +109,7 @@ import {
   executeAgentHTTPRequest,
   listAgentFiles,
   listAgentComponents,
+  startImageGenerationTask,
   uploadAgentFile,
   writeAgentReport,
 } from '../api'
@@ -113,6 +123,9 @@ import {
   type AgentBlueprintStatus,
 } from '../lib/agent-blueprints'
 import type {
+  AgentExecutionLog,
+} from '@/features/agents/types'
+import type {
   AgentFileUpload,
   AgentFileUploadPurpose,
   AgentComponentItem,
@@ -120,6 +133,8 @@ import type {
   AgentReportOutputFile,
   AgentReportWrittenFile,
   GroupOption,
+  ImageAspectRatio,
+  ImageGenerationParams,
   ModelOption,
 } from '../types'
 
@@ -252,6 +267,8 @@ type SavedAgentBlueprint = {
   updatedAt: number
   status?: AgentBlueprintStatus
   executionLog?: AgentExecutionLogMap
+  backendAgentId?: string
+  backendBlueprintId?: string
 }
 
 type AgentBlueprintHistorySnapshot = {
@@ -525,6 +542,11 @@ const BROWSER_DATA_MISSING_MARKER = 'browser_data_missing'
 const HTTP_RESPONSE_SETTING = 'HTTP 响应'
 const HTTP_STATUS_SETTING = 'HTTP 状态码'
 const HTTP_ERROR_SETTING = 'HTTP 错误'
+const IMAGE_TASK_ID_SETTING = '图片任务 ID'
+const IMAGE_TASK_STATUS_SETTING = '图片任务状态'
+const IMAGE_TASK_URLS_SETTING = '图片 URL'
+const IMAGE_TASK_ERROR_SETTING = '图片错误'
+const IMAGE_TASK_PROMPT_SETTING = '图片任务提示词'
 const XIANYU_OVERVIEW_METRICS_MARKER = 'xianyu_overview_metrics'
 const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 日报', 'CSV 表格']
 const REPORT_OUTPUT_FORMAT_PRESETS = [
@@ -740,7 +762,7 @@ const NODE_META: Record<
     inputs: ['任务描述'],
     outputs: ['JSON 数据', '请求日志'],
     settings: {
-      请求URL: 'https://api.example.com/data',
+      网址: 'https://api.example.com/data',
       请求参数: '',
       方法: 'GET',
       超时: '30s',
@@ -782,6 +804,7 @@ const NODE_META: Record<
       尺寸: '16:9',
       风格: '清爽数据看板',
       数量: '1',
+      负面提示词: '',
     },
   },
   report: {
@@ -959,6 +982,9 @@ export function AgentWorkspace({
   const [executionLog, setExecutionLog] = useState<AgentExecutionLogMap>(
     () => initialBlueprint?.executionLog ?? {}
   )
+  const [backendExecutionLogs, setBackendExecutionLogs] = useState<
+    AgentExecutionLog[]
+  >([])
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     initialBlueprint?.nodes[0]?.id ?? 'browser'
   )
@@ -1029,6 +1055,32 @@ export function AgentWorkspace({
     redoStackRef.current = []
     bumpHistoryVersion()
   }, [bumpHistoryVersion, createHistorySnapshot])
+  const refreshBackendExecutionLogs = useCallback(
+    async (agentId: string, blueprintId: string) => {
+      const logs = await listBlueprintExecutionLogs(agentId, blueprintId, 5)
+      setBackendExecutionLogs(logs)
+      return logs
+    },
+    []
+  )
+  const pollBackendExecutionLogs = useCallback(
+    async (agentId: string, blueprintId: string) => {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const logs = await refreshBackendExecutionLogs(agentId, blueprintId)
+        const latest = logs[0]
+        if (
+          latest &&
+          latest.status !== 'running' &&
+          latest.status !== 'pending'
+        ) {
+          return logs
+        }
+        await waitForAgentBackendPoll(900)
+      }
+      return refreshBackendExecutionLogs(agentId, blueprintId)
+    },
+    [refreshBackendExecutionLogs]
+  )
   const restoreHistorySnapshot = useCallback(
     (snapshot: AgentBlueprintHistorySnapshot) => {
       cancelPreviewRun()
@@ -1211,6 +1263,8 @@ export function AgentWorkspace({
       updatedAt: now,
       status: currentBlueprintStatus,
       executionLog,
+      backendAgentId: existing?.backendAgentId,
+      backendBlueprintId: existing?.backendBlueprintId,
     }
     const next = [
       blueprint,
@@ -1223,6 +1277,32 @@ export function AgentWorkspace({
     setBlueprints(next)
     writeSavedBlueprints(next)
     notifyAgentBlueprintsChanged()
+
+    void syncSavedBlueprintToBackend(blueprint)
+      .then((synced) => {
+        if (!synced) return
+        setBlueprints((current) => {
+          const syncedBlueprints = current.map((item) =>
+            item.id === synced.id ? synced : item
+          )
+          writeSavedBlueprints(syncedBlueprints)
+          notifyAgentBlueprintsChanged()
+          return syncedBlueprints
+        })
+        if (synced.backendAgentId && synced.backendBlueprintId) {
+          void refreshBackendExecutionLogs(
+            synced.backendAgentId,
+            synced.backendBlueprintId
+          ).catch(() => undefined)
+        }
+      })
+      .catch((error) => {
+        toast.error(
+          error instanceof Error
+            ? `蓝图已本地保存，后端同步失败: ${error.message}`
+            : '蓝图已本地保存，后端同步失败'
+        )
+      })
   }, [
     blueprintTitle,
     blueprints,
@@ -1231,6 +1311,7 @@ export function AgentWorkspace({
     edges,
     executionLog,
     nodes,
+    refreshBackendExecutionLogs,
   ])
 
   const handleLoadBlueprint = useCallback(
@@ -1249,9 +1330,16 @@ export function AgentWorkspace({
       setNodes(normalizedNodes)
       setEdges(blueprint.edges)
       setExecutionLog(blueprint.executionLog ?? {})
+      setBackendExecutionLogs([])
+      if (blueprint.backendAgentId && blueprint.backendBlueprintId) {
+        void refreshBackendExecutionLogs(
+          blueprint.backendAgentId,
+          blueprint.backendBlueprintId
+        ).catch(() => undefined)
+      }
       setSelectedNodeId(normalizedNodes[0]?.id ?? '')
     },
-    [bumpHistoryVersion, cancelPreviewRun]
+    [bumpHistoryVersion, cancelPreviewRun, refreshBackendExecutionLogs]
   )
 
   const reloadComponents = useCallback(async () => {
@@ -1315,6 +1403,58 @@ export function AgentWorkspace({
     if (prepared.changed) {
       setEdges(prepared.edges)
     }
+
+    const backendBlueprint: SavedAgentBlueprint = {
+      id: currentBlueprintId ?? `blueprint-${Date.now()}`,
+      title: blueprintTitle.trim() || '未命名蓝图',
+      nodes: stripTransientNodeSettings(prepared.nodes),
+      edges: prepared.edges,
+      createdAt:
+        blueprints.find((item) => item.id === currentBlueprintId)?.createdAt ??
+        Date.now(),
+      updatedAt: Date.now(),
+      status: 'running',
+      executionLog,
+      backendAgentId: blueprints.find((item) => item.id === currentBlueprintId)
+        ?.backendAgentId,
+      backendBlueprintId: blueprints.find(
+        (item) => item.id === currentBlueprintId
+      )?.backendBlueprintId,
+    }
+    void runSavedBlueprintOnBackend(backendBlueprint)
+      .then((synced) => {
+        if (!synced) return
+        setBlueprints((current) => {
+          const exists = current.some((item) => item.id === synced.id)
+          const next = exists
+            ? current.map((item) =>
+                item.id === synced.id
+                  ? {
+                      ...item,
+                      backendAgentId: synced.backendAgentId,
+                      backendBlueprintId: synced.backendBlueprintId,
+                    }
+                  : item
+              )
+            : [synced, ...current]
+          writeSavedBlueprints(next)
+          notifyAgentBlueprintsChanged()
+          return next
+        })
+        if (synced.backendAgentId && synced.backendBlueprintId) {
+          void pollBackendExecutionLogs(
+            synced.backendAgentId,
+            synced.backendBlueprintId
+          ).catch(() => undefined)
+        }
+      })
+      .catch((error) => {
+        toast.error(
+          error instanceof Error
+            ? `后端正式运行触发失败: ${error.message}`
+            : '后端正式运行触发失败'
+        )
+      })
 
     const commitPreviewStateForNodes = (
       activeNodes: AgentFlowNode[],
@@ -1456,6 +1596,9 @@ export function AgentWorkspace({
 
     void captureBrowserNodes(runExecutionNodes)
       .then((capturedNodes) => executeHTTPNodes(capturedNodes))
+      .then((capturedNodes) =>
+        executeImageNodes(capturedNodes, prepared.edges, skillChoices)
+      )
       .then((capturedNodes) => {
         if (previewRunIdRef.current !== runId) return
         startTimedPreview(capturedNodes)
@@ -1468,9 +1611,14 @@ export function AgentWorkspace({
         startTimedPreview(markBrowserCaptureError(runExecutionNodes, error))
       })
   }, [
+    blueprintTitle,
+    blueprints,
     cancelPreviewRun,
+    currentBlueprintId,
     edges,
+    executionLog,
     nodes,
+    pollBackendExecutionLogs,
     persistCurrentBlueprintSnapshot,
     skillChoices,
     templateByKind,
@@ -1675,6 +1823,7 @@ export function AgentWorkspace({
     <ReactFlowProvider>
       <BlueprintWorkspace
         blueprintTitle={blueprintTitle}
+        backendExecutionLogs={backendExecutionLogs}
         canRedo={canRedoBlueprint}
         canUndo={canUndoBlueprint}
         currentBlueprintStatus={currentBlueprintStatus}
@@ -1733,6 +1882,7 @@ type BlueprintWorkspaceProps = {
   paletteGroups: PaletteTemplateGroup[]
   isComponentCatalogLoading: boolean
   blueprintTitle: string
+  backendExecutionLogs: AgentExecutionLog[]
   canRedo: boolean
   canUndo: boolean
   currentBlueprintStatus: AgentBlueprintStatus
@@ -1777,6 +1927,7 @@ function BlueprintWorkspace({
   paletteGroups,
   isComponentCatalogLoading,
   blueprintTitle,
+  backendExecutionLogs,
   canRedo,
   canUndo,
   currentBlueprintStatus,
@@ -2036,8 +2187,9 @@ function BlueprintWorkspace({
 
         <div className='pointer-events-none absolute inset-x-0 bottom-0 z-20'>
           <div className='pointer-events-auto'>
-            <ExecutionPreviewDock
-              executionLog={executionLog}
+        <ExecutionPreviewDock
+          backendExecutionLogs={backendExecutionLogs}
+          executionLog={executionLog}
               executionNodes={executionNodes}
               isOpen={isPreviewOpen}
               selectedNode={selectedNode}
@@ -3054,7 +3206,7 @@ async function executeHTTPNodes(nodes: AgentFlowNode[]) {
     const url = (
       isNotify
         ? node.data.settings['Webhook'] || node.data.settings['网址']
-        : node.data.settings['网址']
+        : node.data.settings['网址'] || node.data.settings['请求URL']
     )?.trim()
     if (isNotify && node.data.settings['渠道'] !== 'Webhook') {
       continue
@@ -3099,6 +3251,140 @@ async function executeHTTPNodes(nodes: AgentFlowNode[]) {
   }
 
   return nextNodes
+}
+
+async function executeImageNodes(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[],
+  skillChoices: SkillChoice[]
+) {
+  let nextNodes = nodes
+
+  for (const node of nodes) {
+    if (node.data.kind !== 'image') continue
+
+    const priorLogs = buildCompletedLogsBeforeNode(
+      nextNodes,
+      edges,
+      node.id,
+      skillChoices
+    )
+    const upstreamLogs = directUpstreamLogs(node, priorLogs, edges)
+    const prompt = buildImageNodePrompt(node, upstreamLogs)
+    const params = buildImageNodeParams(node)
+    const createdAt = Date.now()
+    const taskId = `agent-image-${node.id}-${createdAt}`
+
+    try {
+      const saved = await startImageGenerationTask({
+        id: taskId,
+        prompt,
+        negativePrompt: params.negativePrompt || undefined,
+        params,
+        model: node.data.model || 'gpt-image-1',
+        group: node.data.group || 'default',
+        referenceImages: [],
+        urls: [],
+        status: 'running',
+        errorMessage: undefined,
+        durationMs: undefined,
+        createdAt,
+        updatedAt: createdAt,
+      })
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [IMAGE_TASK_ID_SETTING]: saved.id,
+        [IMAGE_TASK_STATUS_SETTING]: saved.status,
+        [IMAGE_TASK_URLS_SETTING]: saved.urls?.join('\n') || '',
+        [IMAGE_TASK_ERROR_SETTING]: saved.errorMessage || '',
+        [IMAGE_TASK_PROMPT_SETTING]: prompt,
+      })
+    } catch (error) {
+      nextNodes = updateNodeRuntimeSettings(nextNodes, node.id, {
+        [IMAGE_TASK_ID_SETTING]: taskId,
+        [IMAGE_TASK_STATUS_SETTING]: 'failed',
+        [IMAGE_TASK_URLS_SETTING]: '',
+        [IMAGE_TASK_ERROR_SETTING]:
+          error instanceof Error ? error.message : '图片任务提交失败。',
+        [IMAGE_TASK_PROMPT_SETTING]: prompt,
+      })
+    }
+  }
+
+  return nextNodes
+}
+
+function buildCompletedLogsBeforeNode(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[],
+  nodeId: string,
+  skillChoices: SkillChoice[]
+) {
+  const nodeIndex = nodes.findIndex((node) => node.id === nodeId)
+  const beforeNodes = nodeIndex >= 0 ? nodes.slice(0, nodeIndex) : []
+  const statusById = new Map<string, AgentNodeStatus>()
+  beforeNodes.forEach((node) => statusById.set(node.id, 'done'))
+  return buildPreviewExecutionLog(beforeNodes, statusById, skillChoices, edges)
+}
+
+function buildImageNodePrompt(
+  node: AgentFlowNode,
+  upstreamLogs: AgentNodeExecutionLog[]
+) {
+  const explicitPrompt = node.data.settings['图片提示词']?.trim()
+  const upstreamSummary = summarizeUpstreamLogs(upstreamLogs, 2400)
+  return [
+    node.data.description.trim(),
+    explicitPrompt ? `图片提示词: ${explicitPrompt}` : '',
+    `风格: ${node.data.settings['风格'] || 'auto'}`,
+    upstreamSummary
+      ? `上游真实输入:\n${upstreamSummary}`
+      : '上游真实输入: 未提供，按当前节点描述生成通用图片。',
+    '要求: 只依据上游真实输入和当前节点描述生成，不使用演示图片或内置样例。',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function buildImageNodeParams(node: AgentFlowNode): ImageGenerationParams {
+  const aspectRatio = normalizeImageAspectRatio(node.data.settings['尺寸'])
+  return {
+    resolution: 'auto',
+    aspectRatio,
+    quality: 'auto',
+    style: imageStyleForSetting(node.data.settings['风格']),
+    n: normalizeImageCount(node.data.settings['数量']),
+    seed: null,
+    negativePrompt: node.data.settings['负面提示词'] || '',
+  }
+}
+
+function normalizeImageAspectRatio(value?: string): ImageAspectRatio {
+  const allowed = new Set<ImageAspectRatio>([
+    'auto',
+    '1:1',
+    '16:9',
+    '9:16',
+    '4:3',
+    '3:4',
+    '3:2',
+    '2:3',
+  ])
+  return allowed.has(value as ImageAspectRatio)
+    ? (value as ImageAspectRatio)
+    : 'auto'
+}
+
+function imageStyleForSetting(value?: string): ImageGenerationParams['style'] {
+  if (!value || value === 'auto') return 'auto'
+  if (/自然|写实|natural/i.test(value)) return 'natural'
+  if (/鲜明|营销|vivid/i.test(value)) return 'vivid'
+  return 'auto'
+}
+
+function normalizeImageCount(value?: string) {
+  const parsed = Number.parseInt(value || '1', 10)
+  if (!Number.isFinite(parsed)) return 1
+  return Math.min(4, Math.max(1, parsed))
 }
 
 function buildNotifyWebhookBody(node: AgentFlowNode) {
@@ -3157,6 +3443,11 @@ function stripTransientNodeSettings(nodes: AgentFlowNode[]) {
     }
     if (node.data.kind === 'request') {
       for (const key of TRANSIENT_HTTP_SETTING_LABELS) {
+        delete settings[key]
+      }
+    }
+    if (node.data.kind === 'image') {
+      for (const key of TRANSIENT_IMAGE_SETTING_LABELS) {
         delete settings[key]
       }
     }
@@ -3544,6 +3835,25 @@ function buildNodeOutputSummary(
     ]
   }
 
+  if (node.data.kind === 'image' && status === 'completed') {
+    const taskId = node.data.settings[IMAGE_TASK_ID_SETTING]
+    const taskStatus = node.data.settings[IMAGE_TASK_STATUS_SETTING]
+    const urls = splitLines(node.data.settings[IMAGE_TASK_URLS_SETTING] || '')
+    const error = node.data.settings[IMAGE_TASK_ERROR_SETTING]
+    if (error || taskStatus === 'failed') {
+      return [
+        `图片 URL: 任务提交失败`,
+        `图片说明: ${error || '图片任务未成功提交'}`,
+      ]
+    }
+    return [
+      urls.length > 0
+        ? `图片 URL: ${urls.length} 个结果已写入绘图历史`
+        : `图片 URL: 真实图片任务已提交，等待后台生成`,
+      `图片说明: 任务 ${taskId || '未记录'}，状态 ${taskStatus || 'running'}`,
+    ]
+  }
+
   if (
     (node.data.kind === 'transform' || node.data.kind === 'report') &&
     hasMissingBrowserData(upstreamLogs) &&
@@ -3559,7 +3869,7 @@ function buildNodeOutputSummary(
   const suffix: Record<AgentNodeLogStatus, string> = {
     pending: '等待生成',
     running: '生成中',
-    completed: '已生成预览样本',
+    completed: '已根据真实输入生成',
     stopped: '已停止，保留部分输入',
   }
 
@@ -3622,13 +3932,28 @@ function buildNodeModelOutput(
       if (hasMissingBrowserData(upstreamLogs)) {
         return buildBlockedByMissingBrowserDataOutput(node)
       }
+      const upstreamSummary = summarizeUpstreamLogs(upstreamLogs, 5000)
+      if (!upstreamSummary) {
+        return [
+          `模型: ${node.data.model}${skillLine}`,
+          '无法整理数据: 当前节点没有收到已完成的上游真实输出。',
+          '处理: 请连接浏览器取数、网页请求、文件读取或其他真实数据节点后重新执行。',
+          '限制: 不会生成示例字段、示例值或根据蓝图标题补全业务数据。',
+        ].join('\n')
+      }
       return [
         `模型: ${node.data.model}${skillLine}`,
-        '整理结果:',
-        '| 字段 | 值 | 说明 |',
-        '| --- | --- | --- |',
-        '| 指标 A | 示例值 1 | 来自上一节点数据 |',
-        '| 指标 B | 示例值 2 | 按当前节点描述整理 |',
+        '整理结果: 仅使用上一节点真实输出和当前节点描述。',
+        '',
+        formatGenericUpstreamSummaryMarkdown(upstreamLogs),
+        '',
+        '关键结论:',
+        ...buildGenericInsightLines(upstreamLogs),
+        '',
+        '限制: 未识别到专用结构化指标时，只保留上游真实输出摘要，不编造字段或数据。',
+        '',
+        '上游原文摘录:',
+        upstreamSummary,
         '',
         templateName && templateName !== '未上传模板'
           ? `已按当前模板文件「${templateOriginalName || templateName}」整理字段。`
@@ -3636,13 +3961,7 @@ function buildNodeModelOutput(
       ].join('\n')
     }
     case 'image':
-      return [
-        `模型: ${node.data.model}${skillLine}`,
-        '图片生成结果:',
-        '- 已根据上一节点输出和当前节点描述生成图片提示。',
-        '- 图片 URL: /api/playground/image-history/files/demo-dashboard.png',
-        '- 图片说明: 预览图内容由当前节点描述决定。',
-      ].join('\n')
+      return buildImageNodeModelOutput(node, skillLine)
     case 'report': {
       const outputDir =
         node.data.settings['输出目录'] || DEFAULT_OUTPUT_DIR_REPORT
@@ -3723,6 +4042,8 @@ function buildNodeModelOutput(
         `结束方式: ${node.data.settings['结束方式'] || '本轮完成后停止'}`,
         '产物目录: 以上游输出节点配置为准。',
       ].join('\n')
+    case 'custom':
+      return buildCustomNodeModelOutput(node, skillLine, upstreamLogs)
     default:
       return `模型: ${node.data.model}${skillLine}\n节点已完成，输出将传给下一节点。`
   }
@@ -3797,6 +4118,41 @@ function buildRequestNodeModelOutput(node: AgentFlowNode, skillLine: string) {
     .join('\n')
 }
 
+function buildImageNodeModelOutput(node: AgentFlowNode, skillLine: string) {
+  const taskId = node.data.settings[IMAGE_TASK_ID_SETTING] || ''
+  const status = node.data.settings[IMAGE_TASK_STATUS_SETTING] || ''
+  const urls = splitLines(node.data.settings[IMAGE_TASK_URLS_SETTING] || '')
+  const error = node.data.settings[IMAGE_TASK_ERROR_SETTING] || ''
+  const prompt = node.data.settings[IMAGE_TASK_PROMPT_SETTING] || ''
+
+  if (error || status === 'failed') {
+    return [
+      `模型: ${node.data.model}${skillLine}`,
+      '图片任务提交失败。',
+      `任务 ID: ${taskId || '未创建'}`,
+      `错误: ${error || '图片服务未返回成功状态'}`,
+      '限制: 不使用演示图片或固定 URL 作为节点输出。',
+      prompt ? `提交提示词:\n${truncateText(prompt, 1600)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  return [
+    `模型: ${node.data.model}${skillLine}`,
+    '图片生成结果:',
+    `- 真实图片任务已提交到创作台绘图队列。`,
+    `- 任务 ID: ${taskId || '未记录'}`,
+    `- 当前状态: ${status || 'running'}`,
+    urls.length > 0
+      ? `- 图片 URL:\n${urls.map((url) => `  - ${url}`).join('\n')}`
+      : '- 图片 URL: 后台生成完成后写入绘图日志和图片历史。',
+    prompt ? `\n提交提示词:\n${truncateText(prompt, 1600)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
 function buildNotifyNodeModelOutput(node: AgentFlowNode, skillLine: string) {
   const channel = node.data.settings['渠道'] || '邮件'
   const confirm = node.data.settings['确认'] || '发送前确认'
@@ -3837,6 +4193,109 @@ function parseMaybeJSON(value: string) {
 
 function formatJSONPreview(value: unknown) {
   return truncateText(JSON.stringify(value, null, 2), 4000)
+}
+
+function splitLines(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+function summarizeUpstreamLogs(
+  logs: AgentNodeExecutionLog[],
+  maxLength: number
+) {
+  const completedLogs = logs.filter((log) => log.status === 'completed')
+  if (completedLogs.length === 0) return ''
+  return truncateText(
+    completedLogs
+      .map((log) => {
+        const output = log.modelOutput.trim()
+        return [
+          `### ${log.nodeId}`,
+          log.message ? `状态: ${log.message}` : '',
+          output,
+        ]
+          .filter(Boolean)
+          .join('\n')
+      })
+      .join('\n\n'),
+    maxLength
+  )
+}
+
+function formatGenericUpstreamSummaryMarkdown(logs: AgentNodeExecutionLog[]) {
+  const rows = logs
+    .filter((log) => log.status === 'completed')
+    .map((log) => [
+      log.nodeId,
+      log.outputSummary.join('；') || log.message,
+      truncateText(log.modelOutput.replace(/\s+/g, ' ').trim(), 160),
+    ])
+
+  if (rows.length === 0) {
+    return '未收到已完成的上游真实输出。'
+  }
+
+  return [
+    '| 上游节点 | 输出摘要 | 真实内容摘录 |',
+    '| --- | --- | --- |',
+    ...rows.map(
+      ([nodeId, summary, excerpt]) =>
+        `| ${escapeMarkdownTableCell(nodeId)} | ${escapeMarkdownTableCell(summary)} | ${escapeMarkdownTableCell(excerpt)} |`
+    ),
+  ].join('\n')
+}
+
+function buildGenericInsightLines(logs: AgentNodeExecutionLog[]) {
+  const completedLogs = logs.filter((log) => log.status === 'completed')
+  if (completedLogs.length === 0) {
+    return ['- 上游没有已完成输出，无法生成结论。']
+  }
+
+  return completedLogs.map((log) => {
+    const excerpt =
+      log.outputSummary.find(Boolean) ||
+      truncateText(log.modelOutput.replace(/\s+/g, ' ').trim(), 120)
+    return `- ${log.nodeId}: ${excerpt}`
+  })
+}
+
+function buildCustomNodeModelOutput(
+  node: AgentFlowNode,
+  skillLine: string,
+  upstreamLogs: AgentNodeExecutionLog[]
+) {
+  const upstreamSummary = summarizeUpstreamLogs(upstreamLogs, 4000)
+  if (!upstreamSummary) {
+    return [
+      `模型: ${node.data.model}${skillLine}`,
+      `自定义组件: ${node.data.title}`,
+      '无法执行: 当前自定义组件没有收到已完成的上游真实输出。',
+      '处理: 请在组件描述中明确输入字段，或连接真实数据节点后重新执行。',
+      '限制: 不使用内置样例或默认业务上下文补全输出。',
+    ].join('\n')
+  }
+
+  return [
+    `模型: ${node.data.model}${skillLine}`,
+    `自定义组件: ${node.data.title}`,
+    '执行依据: 仅使用当前组件描述、配置字段和上一节点真实输出。',
+    '',
+    '上游输入摘要:',
+    formatGenericUpstreamSummaryMarkdown(upstreamLogs),
+    '',
+    '处理要求:',
+    node.data.description || '未填写组件描述。',
+    '',
+    '输出:',
+    upstreamSummary,
+  ].join('\n')
+}
+
+function escapeMarkdownTableCell(value: string) {
+  return value.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br />')
 }
 
 function truncateText(value: string, maxLength: number) {
@@ -4448,6 +4907,7 @@ function CompactField({
 }
 
 function ExecutionPreviewDock({
+  backendExecutionLogs,
   executionLog,
   executionNodes,
   skillChoices,
@@ -4456,6 +4916,7 @@ function ExecutionPreviewDock({
   onSelectNode,
   onOpenChange,
 }: {
+  backendExecutionLogs: AgentExecutionLog[]
   executionLog: AgentExecutionLogMap
   executionNodes: AgentFlowNode[]
   skillChoices: SkillChoice[]
@@ -4465,6 +4926,7 @@ function ExecutionPreviewDock({
   onOpenChange: (open: boolean) => void
 }) {
   const logNode = selectedNode ?? executionNodes[0] ?? null
+  const latestBackendLog = backendExecutionLogs[0]
 
   return (
     <section className='border-border/70 bg-background shrink-0 border-t'>
@@ -4487,6 +4949,9 @@ function ExecutionPreviewDock({
 
       {isOpen && (
         <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-hidden border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
+          {latestBackendLog && (
+            <BackendExecutionLogBanner log={latestBackendLog} />
+          )}
           {executionNodes.length === 0 ? (
             <div className='text-muted-foreground py-4 text-center text-xs xl:col-span-2'>
               画布上还没有可执行的节点，从左侧拖入组件开始搭建。
@@ -4569,6 +5034,48 @@ function ExecutionPreviewDock({
   )
 }
 
+function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
+  const isFailed = log.status === 'failed'
+  const isRunning = log.status === 'running'
+  return (
+    <div
+      className={cn(
+        'flex min-w-0 flex-wrap items-center gap-2 rounded-[8px] border px-3 py-2 text-[11px] xl:col-span-2',
+        isFailed && 'border-destructive/35 bg-destructive/5 text-destructive',
+        isRunning && 'border-blue-500/30 bg-blue-500/5 text-blue-700',
+        !isFailed &&
+          !isRunning &&
+          'border-emerald-500/30 bg-emerald-500/5 text-emerald-700'
+      )}
+    >
+      <span className='font-semibold'>后端正式运行</span>
+      <span>{formatBackendLogStatus(log.status)}</span>
+      <span className='text-muted-foreground'>
+        开始 {formatLogTime(log.start_time)}
+      </span>
+      <span className='text-muted-foreground'>
+        耗时 {formatDuration(log.duration_ms)}
+      </span>
+      {log.archive_path && (
+        <span className='text-muted-foreground min-w-0 truncate'>
+          归档 {log.archive_path}
+        </span>
+      )}
+      {log.error_msg && <span className='min-w-0 truncate'>{log.error_msg}</span>}
+    </div>
+  )
+}
+
+function formatBackendLogStatus(status: string) {
+  const labels: Record<string, string> = {
+    running: '执行中',
+    completed: '已完成',
+    failed: '执行失败',
+    paused: '已暂停',
+  }
+  return labels[status] ?? status
+}
+
 const DEFAULT_OUTPUT_DIR_REPORT = 'data/output/reports'
 const DEFAULT_OUTPUT_DIR_WEB = 'data/output/web-reports'
 const LEGACY_TEMPLATE_DIR_REPORT = '/templates/reports'
@@ -4593,12 +5100,20 @@ const TRANSIENT_HTTP_SETTING_LABELS = new Set([
   'HTTP 内容类型',
   'HTTP 耗时',
 ])
+const TRANSIENT_IMAGE_SETTING_LABELS = new Set([
+  IMAGE_TASK_ID_SETTING,
+  IMAGE_TASK_STATUS_SETTING,
+  IMAGE_TASK_URLS_SETTING,
+  IMAGE_TASK_ERROR_SETTING,
+  IMAGE_TASK_PROMPT_SETTING,
+])
 const HIDDEN_SETTING_LABELS = new Set([
   '模板目录',
   '模板原文件名',
   '模板预览',
   ...TRANSIENT_BROWSER_SETTING_LABELS,
   ...TRANSIENT_HTTP_SETTING_LABELS,
+  ...TRANSIENT_IMAGE_SETTING_LABELS,
 ])
 const DEFAULT_TRANSFORM_TEMPLATE_PLACEHOLDER =
   '字段: 名称, 数值, 状态, 备注\n格式: Markdown 表格 + JSON 数组\n排序: 按数值降序\n说明: 缺失字段保留空值并标注来源'
@@ -5877,6 +6392,109 @@ function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
   }
 }
 
+function waitForAgentBackendPoll(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+async function syncSavedBlueprintToBackend(
+  blueprint: SavedAgentBlueprint
+): Promise<SavedAgentBlueprint | null> {
+  const agent = await ensureCreatorStudioAgent()
+  const payload = buildBackendBlueprintForm(blueprint)
+  const saved = blueprint.backendBlueprintId
+    ? await updateBlueprint(agent.id, blueprint.backendBlueprintId, payload)
+    : await createBlueprint(agent.id, payload)
+
+  return {
+    ...blueprint,
+    backendAgentId: agent.id,
+    backendBlueprintId: saved.id,
+  }
+}
+
+async function runSavedBlueprintOnBackend(
+  blueprint: SavedAgentBlueprint
+): Promise<SavedAgentBlueprint | null> {
+  const synced = await syncSavedBlueprintToBackend(blueprint)
+  if (!synced?.backendAgentId || !synced.backendBlueprintId) return synced
+  await runBlueprint(synced.backendAgentId, synced.backendBlueprintId)
+  return synced
+}
+
+async function ensureCreatorStudioAgent() {
+  const agents = await getAgents()
+  const existing = agents.find((agent) => agent.name === '创作台智能体')
+  if (existing) return existing
+  return createAgent({
+    name: '创作台智能体',
+    description: '由创作台蓝图自动同步，用于后端正式执行节点化工作流。',
+  })
+}
+
+function buildBackendBlueprintForm(blueprint: SavedAgentBlueprint) {
+  const orderedNodes = orderNodes(blueprint.nodes, blueprint.edges)
+  const firstNode = orderedNodes[0]
+  const firstModelNode =
+    orderedNodes.find((node) => !node.data.model.startsWith('system.')) ??
+    firstNode
+  const skills = orderedNodes
+    .map((node) => node.data.skill)
+    .filter((skill): skill is string => Boolean(skill))
+  return {
+    name: blueprint.title,
+    description:
+      firstModelNode?.data.description ||
+      firstNode?.data.description ||
+      '创作台蓝图同步任务',
+    trigger: buildBackendTriggerConfig(orderedNodes),
+    model_group: firstModelNode?.data.group || 'default',
+    model_name: firstModelNode?.data.model || 'gpt-4.1-mini',
+    skills: Array.from(new Set(skills)),
+    input_variables: buildBackendInputVariables(blueprint),
+    archive_config: {
+      type: 'platform',
+      triggerOn: 'success',
+    },
+    nodes: stripTransientNodeSettings(blueprint.nodes),
+    edges: blueprint.edges,
+  }
+}
+
+function buildBackendTriggerConfig(nodes: AgentFlowNode[]) {
+  const schedule = nodes.find((node) => node.data.kind === 'schedule')
+  if (!schedule) {
+    return {
+      type: 'manual',
+      timezone: 'Asia/Shanghai',
+    }
+  }
+  return {
+    type: 'scheduled',
+    frequency: backendFrequencyFromLabel(schedule.data.settings['执行频率']),
+    time: schedule.data.settings['执行时间'] || '08:30',
+    timezone: schedule.data.settings['时区'] || 'Asia/Shanghai',
+  }
+}
+
+function backendFrequencyFromLabel(value?: string) {
+  if (value === '每小时') return 'hourly'
+  if (value === '每周') return 'weekly'
+  if (value === '每月') return 'monthly'
+  return 'daily'
+}
+
+function buildBackendInputVariables(blueprint: SavedAgentBlueprint) {
+  return {
+    local_blueprint_id: blueprint.id,
+    title: blueprint.title,
+    saved_at: blueprint.updatedAt,
+    nodes_count: blueprint.nodes.length,
+    edges_count: blueprint.edges.length,
+  }
+}
+
 function getBlueprintStatus(nodes: AgentFlowNode[]): AgentBlueprintStatus {
   if (nodes.some((node) => node.data.status === 'running')) return 'running'
   if (hasScheduleNode(nodes)) return 'running'
@@ -6113,7 +6731,16 @@ function normalizeNodeSettings(
     }
   }
   if (kind === 'request') {
+    if (!normalized['网址'] && normalized['请求URL']) {
+      normalized['网址'] = normalized['请求URL']
+    }
+    delete normalized['请求URL']
     for (const key of TRANSIENT_HTTP_SETTING_LABELS) {
+      delete normalized[key]
+    }
+  }
+  if (kind === 'image') {
+    for (const key of TRANSIENT_IMAGE_SETTING_LABELS) {
       delete normalized[key]
     }
   }

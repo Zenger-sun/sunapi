@@ -51,24 +51,54 @@ func registerPlaygroundImageTaskRoutes(engine *gin.Engine, store *Store, imageHa
 			return
 		}
 
-		userID := playgroundUserID(c)
-		item := payload.PlaygroundImageGeneration
-		item.Status = "running"
-		item.ErrorMessage = ""
-		item.URLs = []string{}
-		if item.CreatedAt <= 0 {
-			item.CreatedAt = time.Now().UnixMilli()
-		}
-		saved, err := store.SavePlaygroundImageGeneration(c.Request.Context(), userID, item)
+		saved, err := startPlaygroundImageTask(
+			c.Request.Context(),
+			store,
+			imageHandlers,
+			playgroundUserID(c),
+			payload.PlaygroundImageGeneration,
+			payload.Request,
+		)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-
-		requestBody := normalizePlaygroundImageTaskRequest(payload.Request, saved)
-		go runPlaygroundImageTask(store, imageHandlers, userID, saved, requestBody)
 		ok(c, saved)
 	})
+}
+
+func startPlaygroundImageTask(
+	ctx context.Context,
+	store *Store,
+	imageHandlers *openai.OpenAIAPIHandler,
+	userID int64,
+	item PlaygroundImageGeneration,
+	rawRequest json.RawMessage,
+) (PlaygroundImageGeneration, error) {
+	if store == nil {
+		return PlaygroundImageGeneration{}, errors.New("store is unavailable")
+	}
+	if imageHandlers == nil {
+		return PlaygroundImageGeneration{}, errors.New("image handler is unavailable")
+	}
+	if len(bytes.TrimSpace(rawRequest)) == 0 {
+		return PlaygroundImageGeneration{}, errors.New("image task request is required")
+	}
+
+	item.Status = "running"
+	item.ErrorMessage = ""
+	item.URLs = []string{}
+	if item.CreatedAt <= 0 {
+		item.CreatedAt = time.Now().UnixMilli()
+	}
+	saved, err := store.SavePlaygroundImageGeneration(ctx, userID, item)
+	if err != nil {
+		return PlaygroundImageGeneration{}, err
+	}
+
+	requestBody := normalizePlaygroundImageTaskRequest(rawRequest, saved)
+	go runPlaygroundImageTask(store, imageHandlers, userID, saved, requestBody)
+	return saved, nil
 }
 
 func normalizePlaygroundImageTaskRequest(raw json.RawMessage, item PlaygroundImageGeneration) []byte {

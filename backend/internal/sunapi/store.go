@@ -13,14 +13,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db      *sql.DB
-	dataDir string
+	db                        *sql.DB
+	dataDir                   string
+	playgroundImageHandlersMu sync.RWMutex
+	playgroundImageHandlers   *openai.OpenAIAPIHandler
 }
 
 const (
@@ -60,6 +64,24 @@ func (s *Store) DataDir() string {
 		return ""
 	}
 	return s.dataDir
+}
+
+func (s *Store) SetPlaygroundImageHandlers(imageHandlers *openai.OpenAIAPIHandler) {
+	if s == nil {
+		return
+	}
+	s.playgroundImageHandlersMu.Lock()
+	defer s.playgroundImageHandlersMu.Unlock()
+	s.playgroundImageHandlers = imageHandlers
+}
+
+func (s *Store) PlaygroundImageHandlers() *openai.OpenAIAPIHandler {
+	if s == nil {
+		return nil
+	}
+	s.playgroundImageHandlersMu.RLock()
+	defer s.playgroundImageHandlersMu.RUnlock()
+	return s.playgroundImageHandlers
 }
 
 func ensureDir(path string) error {
@@ -279,6 +301,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			skills TEXT NOT NULL DEFAULT '[]',
 			input_variables TEXT NOT NULL DEFAULT '{}',
 			archive_config TEXT NOT NULL DEFAULT '{}',
+			nodes TEXT NOT NULL DEFAULT '[]',
+			edges TEXT NOT NULL DEFAULT '[]',
 			created_time INTEGER NOT NULL,
 			updated_time INTEGER NOT NULL,
 			last_executed_time INTEGER NOT NULL DEFAULT 0,
@@ -355,6 +379,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "usage_logs", "username", "TEXT NOT NULL DEFAULT 'local'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "agent_blueprints", "nodes", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "agent_blueprints", "edges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "channels", "type", "INTEGER NOT NULL DEFAULT 1"); err != nil {

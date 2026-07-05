@@ -181,6 +181,8 @@ export const blueprintSchema = z.object({
   skills: z.array(z.string()),
   input_variables: z.record(z.string(), z.any()).optional(),
   archive_config: archiveConfigSchema.optional(),
+  nodes: z.array(z.unknown()).optional(),
+  edges: z.array(z.unknown()).optional(),
   created_time: z.number(),
   updated_time: z.number(),
   last_executed_time: z.number().optional(),
@@ -191,6 +193,20 @@ export const blueprintSchema = z.object({
 })
 
 export type Blueprint = z.infer<typeof blueprintSchema>
+
+export interface AgentExecutionLog {
+  id: string
+  blueprint_id: string
+  agent_id: string
+  user_id: number
+  status: string
+  start_time: number
+  end_time?: number
+  duration_ms?: number
+  output?: unknown
+  error_msg?: string
+  archive_path?: string
+}
 
 // ============================================================================
 // 智能体 Schema
@@ -246,6 +262,8 @@ export interface BlueprintFormData {
   skills: string[]
   input_variables?: Record<string, any>
   archive_config?: ArchiveConfig
+  nodes?: unknown[]
+  edges?: unknown[]
 }
 
 export interface SkillFormData {
