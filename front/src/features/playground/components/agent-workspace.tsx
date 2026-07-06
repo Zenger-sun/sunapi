@@ -36,6 +36,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
+  type AriaLabelConfig,
   type Connection,
   type Edge,
   type EdgeChange,
@@ -75,6 +76,7 @@ import {
   Table2Icon,
   Trash2Icon,
   Undo2Icon,
+  UploadIcon,
   WebhookIcon,
   WrenchIcon,
   XIcon,
@@ -96,6 +98,13 @@ import {
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import {
   NativeSelect,
@@ -104,6 +113,12 @@ import {
 } from '@/components/ui/native-select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import {
   createAgentComponent,
   createAgentSkill,
@@ -247,6 +262,14 @@ type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
 
 type SkillDraftSource = Exclude<SkillSource, 'built-in'>
 
+type SkillStore = {
+  id: string
+  name: string
+  description: string
+  url?: string
+  builtin?: boolean
+}
+
 type AgentToolPanel = 'components' | 'skills'
 
 type BuiltinSkillDefinition = SkillChoice & {
@@ -298,6 +321,13 @@ type SavedAgentBlueprint = {
   backendBlueprintId?: string
 }
 
+type AgentPreviewRunMode = 'default' | 'manual'
+
+type BackendBlueprintFormOptions = {
+  forceCreate?: boolean
+  triggerMode?: 'auto' | 'manual'
+}
+
 type AgentBlueprintHistorySnapshot = {
   title: string
   nodes: AgentFlowNode[]
@@ -308,7 +338,16 @@ type AgentBlueprintHistorySnapshot = {
 
 const DRAG_NODE_TYPE = 'application/sunapi-agent-node'
 const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
+const AGENT_SKILL_STORES_STORAGE_KEY = 'sunapi.playground.skill.stores.v1'
 const MAX_BLUEPRINT_HISTORY = 50
+
+const CREATOR_FLOW_ARIA_LABEL_CONFIG: Partial<AriaLabelConfig> = {
+  'controls.ariaLabel': '画布控制',
+  'controls.zoomIn.ariaLabel': '放大',
+  'controls.zoomOut.ariaLabel': '缩小',
+  'controls.fitView.ariaLabel': '适应视图',
+  'controls.interactive.ariaLabel': '锁定/解锁画布',
+}
 
 const NO_SKILL_VALUE = ''
 const NO_SKILL_CHOICE: SkillChoice = {
@@ -316,6 +355,13 @@ const NO_SKILL_CHOICE: SkillChoice = {
   value: NO_SKILL_VALUE,
   description: '该节点仅按基础提示词执行，不叠加任何 Skill 优化。',
   source: 'built-in',
+}
+
+const DEFAULT_SKILL_STORE: SkillStore = {
+  id: 'official',
+  name: '官方 Skill 商城',
+  description: '内置常用 Skill，优先保证可用性和通用场景覆盖。',
+  builtin: true,
 }
 
 const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
@@ -869,6 +915,12 @@ type PaletteTemplateGroup = {
   templates: NodeTemplate[]
 }
 
+type ComponentPaletteSection = {
+  title: string
+  badge: string
+  templates: NodeTemplate[]
+}
+
 const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-schedule-browser', source: 'schedule', target: 'browser' },
   { id: 'e-start-browser', source: 'start', target: 'browser' },
@@ -1105,7 +1157,9 @@ export function AgentWorkspace({
     (
       log: AgentExecutionLog,
       activeNodes: AgentFlowNode[],
-      activeEdges: AgentFlowEdge[]
+      activeEdges: AgentFlowEdge[],
+      statusOverride?: AgentBlueprintStatus,
+      snapshotEdges: AgentFlowEdge[] = activeEdges
     ) => {
       const preview = buildBackendExecutionPreview(log, activeNodes, activeEdges)
       if (!preview) return
@@ -1129,8 +1183,8 @@ export function AgentWorkspace({
         persistCurrentBlueprintSnapshot(
           stripTransientNodeSettings(nextNodes),
           preview.executionLog,
-          preview.blueprintStatus,
-          activeEdges
+          statusOverride ?? preview.blueprintStatus,
+          snapshotEdges
         )
         return nextNodes
       })
@@ -1437,8 +1491,10 @@ export function AgentWorkspace({
     ]
   )
 
-  const handleRunPreview = useCallback(() => {
-    if (currentBlueprintStatus === 'paused') {
+  const handleRunPreview = useCallback((mode: AgentPreviewRunMode = 'default') => {
+    const isManualPreview = mode === 'manual'
+
+    if (currentBlueprintStatus === 'paused' && !isManualPreview) {
       const currentBlueprint = blueprints.find(
         (item) => item.id === currentBlueprintId
       )
@@ -1474,11 +1530,20 @@ export function AgentWorkspace({
     }
 
     const prepared = ensureTerminalStopNode(nodes, edges, templateByKind)
-    const runExecutionNodes = orderNodes(prepared.nodes, prepared.edges)
+    const runGraph = isManualPreview
+      ? buildManualPreviewGraph(prepared.nodes, prepared.edges)
+      : { nodes: prepared.nodes, edges: prepared.edges }
+    const runExecutionNodes = orderNodes(runGraph.nodes, runGraph.edges)
     if (runExecutionNodes.length === 0) return
 
     cancelPreviewRun()
     const runId = previewRunIdRef.current
+    const statusAfterManualPreview: AgentBlueprintStatus | undefined =
+      isManualPreview && hasScheduledBlueprint
+        ? currentBlueprintStatus === 'paused'
+          ? 'paused'
+          : 'running'
+        : undefined
 
     if (prepared.changed) {
       setEdges(prepared.edges)
@@ -1487,8 +1552,8 @@ export function AgentWorkspace({
     const backendBlueprint: SavedAgentBlueprint = {
       id: currentBlueprintId ?? `blueprint-${Date.now()}`,
       title: blueprintTitle.trim() || '未命名蓝图',
-      nodes: stripTransientNodeSettings(prepared.nodes),
-      edges: prepared.edges,
+      nodes: stripTransientNodeSettings(runGraph.nodes),
+      edges: runGraph.edges,
       createdAt:
         blueprints.find((item) => item.id === currentBlueprintId)?.createdAt ??
         Date.now(),
@@ -1501,27 +1566,34 @@ export function AgentWorkspace({
         (item) => item.id === currentBlueprintId
       )?.backendBlueprintId,
     }
-    void runSavedBlueprintOnBackend(backendBlueprint)
+    void runSavedBlueprintOnBackend(
+      backendBlueprint,
+      isManualPreview
+        ? { forceCreate: true, triggerMode: 'manual' }
+        : undefined
+    )
       .then(async (synced) => {
         if (!synced) return
         if (previewRunIdRef.current !== runId) return
-        setBlueprints((current) => {
-          const exists = current.some((item) => item.id === synced.id)
-          const next = exists
-            ? current.map((item) =>
-                item.id === synced.id
-                  ? {
-                      ...item,
-                      backendAgentId: synced.backendAgentId,
-                      backendBlueprintId: synced.backendBlueprintId,
-                    }
-                  : item
-              )
-            : [synced, ...current]
-          writeSavedBlueprints(next)
-          notifyAgentBlueprintsChanged()
-          return next
-        })
+        if (!isManualPreview) {
+          setBlueprints((current) => {
+            const exists = current.some((item) => item.id === synced.id)
+            const next = exists
+              ? current.map((item) =>
+                  item.id === synced.id
+                    ? {
+                        ...item,
+                        backendAgentId: synced.backendAgentId,
+                        backendBlueprintId: synced.backendBlueprintId,
+                      }
+                    : item
+                )
+              : [synced, ...current]
+            writeSavedBlueprints(next)
+            notifyAgentBlueprintsChanged()
+            return next
+          })
+        }
         if (synced.backendAgentId && synced.backendBlueprintId) {
           try {
             const logs = await pollBackendExecutionLogs(
@@ -1534,6 +1606,8 @@ export function AgentWorkspace({
               applyBackendExecutionLogToPreview(
                 latestLog,
                 runExecutionNodes,
+                runGraph.edges,
+                statusAfterManualPreview,
                 prepared.edges
               )
             }
@@ -1558,7 +1632,7 @@ export function AgentWorkspace({
           runExecutionNodes,
           statusById,
           skillChoices,
-          prepared.edges
+          runGraph.edges
         )
         const firstNode = runExecutionNodes[0]
         if (firstNode) {
@@ -1570,21 +1644,22 @@ export function AgentWorkspace({
           }
         }
         setExecutionLog(failedLog)
-        setNodes((current) =>
-          current.map((node) => ({
+        setNodes((current) => {
+          const nextNodes = current.map((node) => ({
             ...node,
             data: {
               ...node.data,
               status: statusById.get(node.id) ?? node.data.status,
             },
           }))
-        )
-        persistCurrentBlueprintSnapshot(
-          stripTransientNodeSettings(runExecutionNodes),
-          failedLog,
-          'failed',
-          prepared.edges
-        )
+          persistCurrentBlueprintSnapshot(
+            stripTransientNodeSettings(nextNodes),
+            failedLog,
+            statusAfterManualPreview ?? 'failed',
+            prepared.edges
+          )
+          return nextNodes
+        })
         toast.error(
           error instanceof Error
             ? `后端正式运行触发失败: ${error.message}`
@@ -1597,7 +1672,7 @@ export function AgentWorkspace({
       runExecutionNodes,
       initialStatusById,
       skillChoices,
-      prepared.edges
+      runGraph.edges
     )
     setExecutionLog(initialExecutionLog)
     setNodes((current) => {
@@ -1630,7 +1705,7 @@ export function AgentWorkspace({
       persistCurrentBlueprintSnapshot(
         stripTransientNodeSettings(nextNodes),
         initialExecutionLog,
-        'running',
+        statusAfterManualPreview ?? 'running',
         prepared.edges
       )
       return nextNodes
@@ -1644,6 +1719,7 @@ export function AgentWorkspace({
     currentBlueprintStatus,
     edges,
     executionLog,
+    hasScheduledBlueprint,
     nodes,
     pollBackendExecutionLogs,
     persistCurrentBlueprintSnapshot,
@@ -2025,7 +2101,7 @@ type BlueprintWorkspaceProps = {
   onSetNodeSkill: (nodeId: string, skill: string) => void
   onRedo: () => void
   onReset: () => void
-  onRunPreview: () => void
+  onRunPreview: (mode?: AgentPreviewRunMode) => void
   onStopPreview: () => void
   onUndo: () => void
 }
@@ -2153,7 +2229,7 @@ function BlueprintWorkspace({
           }}
           onDrop={handleDrop}
         >
-          <div className='pointer-events-none absolute top-3 right-3 left-3 z-10 flex flex-wrap items-center justify-between gap-2'>
+          <div className='pointer-events-none absolute top-3 right-3 left-3 z-10 flex flex-wrap items-start justify-between gap-2'>
             <div className='bg-background/88 border-border/70 pointer-events-auto flex min-w-0 items-center gap-2 rounded-[8px] border px-2 py-1.5 shadow-sm backdrop-blur'>
               <div className='bg-primary text-primary-foreground flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
                 <ChartNetworkIcon className='size-4' />
@@ -2175,79 +2251,75 @@ function BlueprintWorkspace({
               </div>
             </div>
 
-            <div className='bg-background/88 border-border/70 pointer-events-auto flex items-center gap-1 rounded-[8px] border p-1 shadow-sm backdrop-blur'>
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                className='h-8 gap-1.5 rounded-[6px] px-2'
-                onClick={onReset}
-              >
-                <RotateCcwIcon className='size-3.5' />
-                重置
-              </Button>
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                className='h-8 gap-1.5 rounded-[6px] px-2'
-                disabled={!canUndo}
-                onClick={onUndo}
-              >
-                <Undo2Icon className='size-3.5' />
-                前一步
-              </Button>
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                className='h-8 gap-1.5 rounded-[6px] px-2'
-                disabled={!canRedo}
-                onClick={onRedo}
-              >
-                <Redo2Icon className='size-3.5' />
-                后一步
-              </Button>
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                className='h-8 gap-1.5 rounded-[6px] px-2'
-                onClick={onSaveBlueprint}
-              >
-                <SaveIcon className='size-3.5' />
-                保存
-              </Button>
-              {currentBlueprintStatus === 'running' ? (
-                <Button
-                  type='button'
-                  size='sm'
-                  variant='destructive'
-                  className='h-8 gap-1.5 rounded-[6px] px-2'
-                  onClick={onStopPreview}
+            <TooltipProvider>
+              <div className='bg-background/88 border-border/70 pointer-events-auto flex items-center gap-1 rounded-[8px] border p-1 shadow-sm backdrop-blur'>
+                <CanvasToolbarButton label='重置' onClick={onReset}>
+                  <RotateCcwIcon className='size-3.5' />
+                </CanvasToolbarButton>
+                <CanvasToolbarButton
+                  label='前一步'
+                  disabled={!canUndo}
+                  onClick={onUndo}
                 >
-                  {hasScheduledBlueprint ? (
-                    <PauseIcon className='size-3.5' />
-                  ) : (
+                  <Undo2Icon className='size-3.5' />
+                </CanvasToolbarButton>
+                <CanvasToolbarButton
+                  label='后一步'
+                  disabled={!canRedo}
+                  onClick={onRedo}
+                >
+                  <Redo2Icon className='size-3.5' />
+                </CanvasToolbarButton>
+                <CanvasToolbarButton label='保存' onClick={onSaveBlueprint}>
+                  <SaveIcon className='size-3.5' />
+                </CanvasToolbarButton>
+                {hasScheduledBlueprint ? (
+                  <>
+                    {currentBlueprintStatus === 'paused' ? (
+                      <CanvasToolbarButton
+                        label='继续定时'
+                        onClick={() => onRunPreview()}
+                      >
+                        <PlayIcon className='size-3.5' />
+                      </CanvasToolbarButton>
+                    ) : (
+                      <CanvasToolbarButton
+                        label='暂停定时'
+                        variant='destructive'
+                        onClick={onStopPreview}
+                      >
+                        <PauseIcon className='size-3.5' />
+                      </CanvasToolbarButton>
+                    )}
+                    <CanvasToolbarButton
+                      label='手动试运行'
+                      onClick={() => onRunPreview('manual')}
+                    >
+                      <ZapIcon className='size-3.5' />
+                    </CanvasToolbarButton>
+                  </>
+                ) : currentBlueprintStatus === 'running' ? (
+                  <CanvasToolbarButton
+                    label='停止'
+                    variant='destructive'
+                    onClick={onStopPreview}
+                  >
                     <StopCircleIcon className='size-3.5' />
-                  )}
-                  {hasScheduledBlueprint ? '暂停' : '停止'}
-                </Button>
-              ) : (
-                <Button
-                  type='button'
-                  size='sm'
-                  className='h-8 gap-1.5 rounded-[6px] px-2'
-                  onClick={onRunPreview}
-                >
-                  <ZapIcon className='size-3.5' />
-                  {getRunPreviewButtonLabel(currentBlueprintStatus)}
-                </Button>
-              )}
-            </div>
+                  </CanvasToolbarButton>
+                ) : (
+                  <CanvasToolbarButton
+                    label={getRunPreviewButtonLabel(currentBlueprintStatus)}
+                    onClick={() => onRunPreview()}
+                  >
+                    <ZapIcon className='size-3.5' />
+                  </CanvasToolbarButton>
+                )}
+              </div>
+            </TooltipProvider>
           </div>
 
           <ReactFlow<AgentFlowNode, AgentFlowEdge>
+            ariaLabelConfig={CREATOR_FLOW_ARIA_LABEL_CONFIG}
             className='agent-blueprint-canvas'
             colorMode='system'
             connectionLineStyle={{
@@ -2433,13 +2505,16 @@ function Palette({
               modelChoices={modelChoices}
               onCreateComponent={onCreateComponent}
             />
-            {groups.map((group) => (
-              <div key={group.title} className='mb-1'>
-                <div className='text-muted-foreground px-1 pt-0.5 pb-1 text-[10px] font-semibold tracking-widest uppercase'>
-                  {group.title}
+            {buildComponentPaletteSections(groups).map((section) => (
+              <div key={section.title} className='mb-2'>
+                <div className='text-muted-foreground flex items-center gap-1 px-1 pt-0.5 pb-1 text-[10px] font-semibold tracking-widest uppercase'>
+                  <span>{section.title}</span>
+                  <span className='bg-muted rounded-full px-1.5 py-0 text-[9px] tracking-normal'>
+                    {section.badge}
+                  </span>
                 </div>
                 <div className='grid gap-0.5'>
-                  {group.templates.map((template) => (
+                  {section.templates.map((template) => (
                     <PaletteItem
                       key={template.componentId ?? template.kind}
                       template={template}
@@ -2573,71 +2648,117 @@ function ComponentManagerPanel({
         )}
       </button>
       {open && (
-        <div className='mt-2 flex flex-col gap-1.5'>
-          <Input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder='组件名称'
-            className='h-7 rounded-[6px] text-xs'
-          />
-          <Textarea
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder='描述这个组件如何处理输入并产生输出'
-            className='min-h-[54px] resize-none rounded-[6px] text-xs'
-          />
-          <NativeSelect
-            value={group}
-            onChange={(event) => setGroup(event.target.value)}
-            className='h-7 rounded-[6px] text-xs'
-          >
-            <NativeSelectOption value='trigger'>触发</NativeSelectOption>
-            <NativeSelectOption value='collect'>采集</NativeSelectOption>
-            <NativeSelectOption value='process'>智能处理</NativeSelectOption>
-            <NativeSelectOption value='output'>输出</NativeSelectOption>
-          </NativeSelect>
-          <div className='grid grid-cols-2 gap-1.5'>
+        <div className='mt-2 flex flex-col gap-2'>
+          <div className='bg-muted/30 rounded-[8px] px-2 py-1.5'>
+            <div className='text-[11px] font-semibold'>创建自定义组件</div>
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              组件名称
+            </span>
+            <Input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder='例如：商品指标分析'
+              className='h-7 rounded-[6px] text-xs'
+            />
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              组件描述
+            </span>
+            <Textarea
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              placeholder='说明它如何处理上游输入，以及要产出什么结果'
+              className='min-h-[60px] resize-none rounded-[6px] text-xs'
+            />
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              使用模型
+            </span>
+            <div className='grid grid-cols-2 gap-1.5'>
+              <NativeSelect
+                value={modelGroup}
+                onChange={(event) => setModelGroup(event.target.value)}
+                className='h-7 rounded-[6px] text-xs'
+              >
+                {groupChoices.map((option) => (
+                  <NativeSelectOption key={option.value} value={option.value}>
+                    {option.label}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+              <NativeSelect
+                value={modelName}
+                onChange={(event) => setModelName(event.target.value)}
+                className='h-7 rounded-[6px] text-xs'
+              >
+                {modelChoices.map((option) => (
+                  <NativeSelectOption key={option.value} value={option.value}>
+                    {option.label}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </div>
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              组件分类
+            </span>
             <NativeSelect
-              value={modelGroup}
-              onChange={(event) => setModelGroup(event.target.value)}
+              value={group}
+              onChange={(event) => setGroup(event.target.value)}
               className='h-7 rounded-[6px] text-xs'
             >
-              {groupChoices.map((option) => (
-                <NativeSelectOption key={option.value} value={option.value}>
-                  {option.label}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
-            <NativeSelect
-              value={modelName}
-              onChange={(event) => setModelName(event.target.value)}
-              className='h-7 rounded-[6px] text-xs'
-            >
-              {modelChoices.map((option) => (
-                <NativeSelectOption key={option.value} value={option.value}>
-                  {option.label}
-                </NativeSelectOption>
-              ))}
+              <NativeSelectOption value='trigger'>触发</NativeSelectOption>
+              <NativeSelectOption value='collect'>采集</NativeSelectOption>
+              <NativeSelectOption value='process'>智能处理</NativeSelectOption>
+              <NativeSelectOption value='output'>输出</NativeSelectOption>
             </NativeSelect>
           </div>
-          <Input
-            value={inputs}
-            onChange={(event) => setInputs(event.target.value)}
-            placeholder='输入，逗号分隔'
-            className='h-7 rounded-[6px] text-xs'
-          />
-          <Input
-            value={outputs}
-            onChange={(event) => setOutputs(event.target.value)}
-            placeholder='输出，逗号分隔'
-            className='h-7 rounded-[6px] text-xs'
-          />
-          <Input
-            value={tags}
-            onChange={(event) => setTags(event.target.value)}
-            placeholder='标签，逗号分隔'
-            className='h-7 rounded-[6px] text-xs'
-          />
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              输入字段
+            </span>
+            <Input
+              value={inputs}
+              onChange={(event) => setInputs(event.target.value)}
+              placeholder='页面数据, 商品明细'
+              className='h-7 rounded-[6px] text-xs'
+            />
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              输出字段
+            </span>
+            <Input
+              value={outputs}
+              onChange={(event) => setOutputs(event.target.value)}
+              placeholder='关键指标, 运营建议'
+              className='h-7 rounded-[6px] text-xs'
+            />
+          </div>
+
+          <div className='grid gap-1'>
+            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+              标签
+            </span>
+            <Input
+              value={tags}
+              onChange={(event) => setTags(event.target.value)}
+              placeholder='可选，逗号分隔'
+              className='h-7 rounded-[6px] text-xs'
+            />
+          </div>
+
           <Button
             type='button'
             size='sm'
@@ -2727,11 +2848,16 @@ function PaletteItem({
           <span className='block min-w-0 truncate text-xs font-medium'>
             {template.title}
           </span>
-          {isCustom && (
-            <span className='bg-amber-500/10 text-amber-700 rounded px-1 text-[9px]'>
-              自定义
-            </span>
-          )}
+          <span
+            className={cn(
+              'rounded px-1 text-[9px]',
+              isCustom
+                ? 'bg-amber-500/10 text-amber-700'
+                : 'bg-emerald-500/10 text-emerald-700'
+            )}
+          >
+            {isCustom ? '自定义' : '内置'}
+          </span>
         </span>
         <span className='text-muted-foreground line-clamp-2 block text-[10px] leading-snug break-words whitespace-normal'>
           {template.description}
@@ -2741,7 +2867,7 @@ function PaletteItem({
         <span
           role='button'
           tabIndex={0}
-          className='text-muted-foreground hover:text-destructive mt-1.5 shrink-0 rounded-[5px] p-1 opacity-0 transition-opacity group-hover:opacity-100'
+          className='text-muted-foreground hover:text-destructive mt-1.5 shrink-0 rounded-[5px] p-1 transition-colors'
           onClick={(event) => {
             event.stopPropagation()
             if (template.componentId) {
@@ -2759,9 +2885,45 @@ function PaletteItem({
           <Trash2Icon className='size-3' />
         </span>
       ) : (
-        <PlusIcon className='text-muted-foreground mt-2 size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100' />
+        <PlusIcon className='text-muted-foreground mt-2 size-3 shrink-0' />
       )}
     </button>
+  )
+}
+
+function CanvasToolbarButton({
+  children,
+  disabled,
+  label,
+  onClick,
+  variant = 'ghost',
+}: {
+  children: ReactNode
+  disabled?: boolean
+  label: string
+  onClick: () => void
+  variant?: 'ghost' | 'destructive'
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type='button'
+            size='icon-sm'
+            variant={variant}
+            className='size-8 rounded-[6px]'
+            disabled={disabled}
+            title={label}
+            onClick={onClick}
+          />
+        }
+      >
+        {children}
+        <span className='sr-only'>{label}</span>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -5392,8 +5554,10 @@ function SettingControl({
         <div className='space-y-2'>
           <div className='border-border/70 bg-muted/20 rounded-[8px] border p-2'>
             {bindings.length === 0 ? (
-              <div className='flex items-center gap-2'>
-                <FileTextIcon className='text-muted-foreground size-4 shrink-0' />
+              <div className='border-border/60 bg-background/80 flex min-h-12 items-center gap-2 rounded-[7px] border px-2.5 py-2'>
+                <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-[6px]'>
+                  <FileTextIcon className='size-4' />
+                </span>
                 <div className='min-w-0 flex-1'>
                   <div className='text-xs font-medium'>未上传模板文件</div>
                   <div className='text-muted-foreground truncate text-[11px]'>
@@ -5406,9 +5570,11 @@ function SettingControl({
                 {bindings.map((binding) => (
                   <div
                     key={binding.path}
-                    className='bg-background/70 flex max-w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] px-2 py-1.5'
+                    className='border-border/60 bg-background/80 flex max-w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2'
                   >
-                    <FileTextIcon className='text-muted-foreground size-3.5 shrink-0' />
+                    <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-[6px]'>
+                      <FileTextIcon className='size-4' />
+                    </span>
                     <div className='min-w-0 flex-1 overflow-hidden'>
                       <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
                         {binding.originalName}
@@ -5419,16 +5585,18 @@ function SettingControl({
                     </div>
                     <Button
                       type='button'
-                      size='sm'
+                      size='icon-sm'
                       variant='ghost'
-                      className='h-7 rounded-[6px] px-2 text-xs'
+                      className='size-7 shrink-0 rounded-[6px]'
+                      title='移除模板'
                       onClick={() =>
                         applyTemplateBindings(
                           bindings.filter((item) => item.path !== binding.path)
                         )
                       }
                     >
-                      移除
+                      <XIcon className='size-3.5' />
+                      <span className='sr-only'>移除模板</span>
                     </Button>
                   </div>
                 ))}
@@ -5437,12 +5605,15 @@ function SettingControl({
           </div>
 
           <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2'>
-            <div className='flex min-w-0 items-center gap-2 overflow-hidden'>
+            <div className='grid min-w-0 grid-cols-2 gap-2 overflow-hidden'>
               <label
                 aria-disabled={isUploadingTemplate}
-                className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-7 shrink-0 cursor-pointer items-center rounded-[6px] px-2.5 text-xs font-medium whitespace-nowrap aria-disabled:pointer-events-none aria-disabled:opacity-50'
+                className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-8 min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-[6px] px-2.5 text-xs font-medium whitespace-nowrap aria-disabled:pointer-events-none aria-disabled:opacity-50'
               >
-                {isUploadingTemplate ? '上传中' : '上传模板'}
+                <UploadIcon className='size-3.5 shrink-0' />
+                <span className='truncate'>
+                  {isUploadingTemplate ? '上传中' : '上传模板'}
+                </span>
                 <input
                   type='file'
                   multiple
@@ -5456,7 +5627,7 @@ function SettingControl({
                 type='button'
                 size='sm'
                 variant='outline'
-                className='h-7 min-w-0 rounded-[6px] px-2.5 text-xs'
+                className='h-8 min-w-0 rounded-[6px] px-2.5 text-xs'
                 onClick={() => {
                   const nextOpen = !isTemplateLibraryOpen
                   setIsTemplateLibraryOpen(nextOpen)
@@ -5473,7 +5644,7 @@ function SettingControl({
                 type='button'
                 size='sm'
                 variant='ghost'
-                className='h-7 shrink-0 rounded-[6px] px-2 text-xs'
+                className='h-8 shrink-0 rounded-[6px] px-2 text-xs'
                 onClick={() => applyTemplateBindings([])}
               >
                 清空
@@ -5482,7 +5653,7 @@ function SettingControl({
           </div>
 
           {isTemplateLibraryOpen && (
-            <div className='border-border/70 max-h-44 overflow-y-auto rounded-[8px] border p-2'>
+            <div className='border-border/70 bg-muted/20 max-h-44 overflow-y-auto rounded-[8px] border p-2'>
               {isLoadingTemplateLibrary ? (
                 <div className='text-muted-foreground py-2 text-center text-xs'>
                   正在加载模板…
@@ -5499,7 +5670,7 @@ function SettingControl({
                       <button
                         key={template.path}
                         type='button'
-                        className='hover:bg-accent/50 flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] px-2 py-1.5 text-left'
+                        className='border-border/60 bg-background/80 hover:bg-accent/50 flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2 text-left'
                         onClick={() =>
                           applyTemplateBindings(
                             mergeTemplateBindings(bindings, [
@@ -5508,7 +5679,9 @@ function SettingControl({
                           )
                         }
                       >
-                        <FileTextIcon className='text-muted-foreground size-3.5 shrink-0' />
+                        <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-[6px]'>
+                          <FileTextIcon className='size-4' />
+                        </span>
                         <div className='min-w-0 flex-1 overflow-hidden'>
                           <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
                             {template.original_name || template.filename}
@@ -5752,6 +5925,13 @@ function SkillManagerPanel({
 }) {
   const [activeTab, setActiveTab] = useState<SkillDraftSource>('github')
   const [githubUrl, setGithubUrl] = useState('')
+  const [skillStores, setSkillStores] = useState<SkillStore[]>(
+    readSavedSkillStores
+  )
+  const [storeName, setStoreName] = useState('')
+  const [storeUrl, setStoreUrl] = useState('')
+  const [activeStore, setActiveStore] = useState<SkillStore | null>(null)
+  const [storeSearch, setStoreSearch] = useState('')
   const [customName, setCustomName] = useState('')
   const [customDescription, setCustomDescription] = useState('')
   const [customModelGroup, setCustomModelGroup] = useState(
@@ -5786,6 +5966,14 @@ function SkillManagerPanel({
           .filter((value): value is string => Boolean(value))
       ),
     [skillChoices]
+  )
+  const visibleStoreSkills = useMemo(
+    () => filterMarketplaceSkills(marketplaceSkills, storeSearch),
+    [marketplaceSkills, storeSearch]
+  )
+  const hotStoreSkills = useMemo(
+    () => getHotMarketplaceSkills(marketplaceSkills, installedMarketplaceIds),
+    [installedMarketplaceIds, marketplaceSkills]
   )
 
   const handleAdd = async (skill?: SkillChoice) => {
@@ -5846,8 +6034,40 @@ function SkillManagerPanel({
     }
   }
 
+  const handleCreateStore = () => {
+    const name = storeName.trim()
+    if (!name) return
+    const url = storeUrl.trim()
+    const store: SkillStore = {
+      id: `store.${createStableId(`${name}:${url || Date.now()}`)}`,
+      name,
+      description: url || '本地添加的 Skill 商城入口。',
+      url: url || undefined,
+    }
+    setSkillStores((current) => {
+      const next = mergeSkillStores([...current, store])
+      writeSavedSkillStores(next.filter((item) => !item.builtin))
+      return next
+    })
+    setStoreName('')
+    setStoreUrl('')
+  }
+
+  const handleDeleteStore = (storeId: string) => {
+    setSkillStores((current) => {
+      const next = current.filter(
+        (store) => store.builtin || store.id !== storeId
+      )
+      writeSavedSkillStores(next.filter((item) => !item.builtin))
+      return next
+    })
+  }
+
   const builtinSkills = skillChoices.filter((s) => s.source === 'built-in')
-  const userSkills = skillChoices.filter((s) => s.source !== 'built-in')
+  const customSkills = skillChoices.filter((s) => s.source === 'custom')
+  const installedSkills = skillChoices.filter(
+    (s) => s.source === 'github' || s.source === 'marketplace'
+  )
 
   return (
     <div className='flex flex-col gap-3'>
@@ -5908,51 +6128,66 @@ function SkillManagerPanel({
 
         {/* 商城选择 */}
         {activeTab === 'marketplace' && (
-          <div className='flex flex-col gap-1.5'>
-            {isLoading && marketplaceSkills.length === 0 ? (
-              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
-                正在加载 Skill 商城...
-              </div>
-            ) : null}
-            {!isLoading && marketplaceSkills.length === 0 ? (
-              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
-                暂无可安装 Skill
-              </div>
-            ) : null}
-            {marketplaceSkills.map((skill) => {
-              const installed =
-                installedValues.has(skill.value) ||
-                Boolean(
-                  skill.marketplaceId &&
-                    installedMarketplaceIds.has(skill.marketplaceId)
-                )
-              const installing = submittingKey === skill.value
-              return (
-                <div
-                  key={skill.value}
-                  className='border-border/50 flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-2'
+          <div className='flex flex-col gap-2'>
+            <div className='grid grid-cols-[1fr_auto] gap-1.5'>
+              <Input
+                value={storeName}
+                onChange={(event) => setStoreName(event.target.value)}
+                placeholder='商城名称'
+                className='h-7 rounded-[6px] text-xs'
+              />
+              <Button
+                type='button'
+                size='sm'
+                className='h-7 rounded-[6px] px-2.5 text-xs'
+                disabled={!storeName.trim()}
+                onClick={handleCreateStore}
+              >
+                添加商城
+              </Button>
+            </div>
+            <Input
+              value={storeUrl}
+              onChange={(event) => setStoreUrl(event.target.value)}
+              placeholder='商城地址，可选'
+              className='h-7 rounded-[6px] text-xs'
+            />
+            {skillStores.map((store) => (
+              <div
+                key={store.id}
+                className='border-border/50 flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-2'
+              >
+                <button
+                  type='button'
+                  className='min-w-0 flex-1 text-left'
+                  onClick={() => {
+                    setStoreSearch('')
+                    setActiveStore(store)
+                  }}
                 >
-                  <div className='min-w-0 flex-1'>
-                    <div className='truncate text-[11px] font-medium'>
-                      {skill.label}
-                    </div>
-                    <div className='text-muted-foreground truncate text-[10px]'>
-                      {skill.description}
-                    </div>
+                  <div className='truncate text-[11px] font-medium'>
+                    {store.name}
                   </div>
-                  <Button
+                  <div className='text-muted-foreground truncate text-[10px]'>
+                    {store.description}
+                  </div>
+                </button>
+                {store.builtin ? (
+                  <span className='bg-emerald-500/10 text-emerald-600 shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium'>
+                    默认
+                  </span>
+                ) : (
+                  <button
                     type='button'
-                    size='sm'
-                    variant={installed ? 'ghost' : 'outline'}
-                    className='h-6 shrink-0 rounded-[5px] px-2 text-[10px]'
-                    disabled={installed || installing}
-                    onClick={() => !installed && void handleAdd(skill)}
+                    className='text-muted-foreground hover:text-destructive shrink-0 rounded-[5px] p-1'
+                    title='删除商城'
+                    onClick={() => handleDeleteStore(store.id)}
                   >
-                    {installed ? '已添加' : installing ? '安装中' : '+ 添加'}
-                  </Button>
-                </div>
-              )
-            })}
+                    <Trash2Icon className='size-3' />
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         )}
 
@@ -6014,68 +6249,29 @@ function SkillManagerPanel({
         )}
       </div>
 
-      {/* ── 已安装 Skill 列表 ── */}
-      {userSkills.length > 0 && (
-        <div>
-          <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold tracking-wider uppercase'>
-            已安装 ({userSkills.length})
-          </div>
-          <div className='flex flex-col gap-1'>
-            {userSkills.map((skill) => (
-              <div
-                key={skill.value}
-                className='bg-muted/30 hover:bg-muted/50 group flex items-center gap-2 rounded-[7px] px-2.5 py-2 transition-colors'
-              >
-                <div className='min-w-0 flex-1'>
-                  <div className='truncate text-[11px] font-medium'>
-                    {skill.label}
-                  </div>
-                  <div className='text-muted-foreground flex items-center gap-1 truncate text-[10px]'>
-                    <span
-                      className={cn(
-                        'rounded px-1 py-0 text-[9px] font-medium',
-                        skill.source === 'github' &&
-                          'bg-purple-500/10 text-purple-600',
-                        skill.source === 'marketplace' &&
-                          'bg-blue-500/10 text-blue-600',
-                        skill.source === 'custom' &&
-                          'bg-amber-500/10 text-amber-600'
-                      )}
-                    >
-                      {formatSkillSource(skill.source)}
-                    </span>
-                    {skill.reference && (
-                      <span className='truncate opacity-60'>
-                        {skill.reference}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <button
-                  type='button'
-                  className='text-muted-foreground hover:text-destructive shrink-0 rounded-[5px] p-1 opacity-0 transition-opacity group-hover:opacity-100'
-                  disabled={submittingKey === skill.value}
-                  onClick={() => {
-                    setSubmittingKey(skill.value)
-                    void onDeleteSkill(skill.value).finally(() =>
-                      setSubmittingKey(null)
-                    )
-                  }}
-                  title='删除'
-                >
-                  <Trash2Icon className='size-3' />
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <SkillListSection
+        title='自定义 Skill'
+        badge={`${customSkills.length}`}
+        skills={customSkills}
+        submittingKey={submittingKey}
+        onDeleteSkill={onDeleteSkill}
+        onSubmittingChange={setSubmittingKey}
+      />
+
+      <SkillListSection
+        title='已添加 Skill'
+        badge='GitHub / 商城'
+        skills={installedSkills}
+        submittingKey={submittingKey}
+        onDeleteSkill={onDeleteSkill}
+        onSubmittingChange={setSubmittingKey}
+      />
 
       {/* ── 内置 Skill ── */}
       {builtinSkills.length > 0 && (
         <div>
           <div className='text-muted-foreground mb-1.5 px-0.5 text-[10px] font-semibold tracking-wider uppercase'>
-            内置 ({builtinSkills.length})
+            内置 Skill ({builtinSkills.length})
           </div>
           <div className='flex flex-col gap-1'>
             {builtinSkills.map((skill) => {
@@ -6120,6 +6316,262 @@ function SkillManagerPanel({
           </div>
         </div>
       )}
+      <SkillStoreDialog
+        hotSkills={hotStoreSkills}
+        installedMarketplaceIds={installedMarketplaceIds}
+        installedValues={installedValues}
+        isLoading={isLoading}
+        open={Boolean(activeStore)}
+        search={storeSearch}
+        skills={visibleStoreSkills}
+        store={activeStore}
+        submittingKey={submittingKey}
+        onAddSkill={(skill) => void handleAdd(skill)}
+        onOpenChange={(open) => {
+          if (!open) setActiveStore(null)
+        }}
+        onSearchChange={setStoreSearch}
+      />
+    </div>
+  )
+}
+
+function SkillListSection({
+  badge,
+  skills,
+  submittingKey,
+  title,
+  onDeleteSkill,
+  onSubmittingChange,
+}: {
+  badge: string
+  skills: SkillChoice[]
+  submittingKey: string | null
+  title: string
+  onDeleteSkill: (skillValue: string) => Promise<void>
+  onSubmittingChange: (value: string | null) => void
+}) {
+  if (skills.length === 0) return null
+
+  return (
+    <div>
+      <div className='text-muted-foreground mb-1.5 flex items-center gap-1 px-0.5 text-[10px] font-semibold tracking-wider uppercase'>
+        <span>{title}</span>
+        <span className='bg-muted rounded-full px-1.5 py-0 text-[9px] tracking-normal'>
+          {badge}
+        </span>
+      </div>
+      <div className='flex flex-col gap-1'>
+        {skills.map((skill) => (
+          <SkillListItem
+            key={skill.value}
+            skill={skill}
+            submitting={submittingKey === skill.value}
+            onDeleteSkill={onDeleteSkill}
+            onSubmittingChange={onSubmittingChange}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SkillListItem({
+  skill,
+  submitting,
+  onDeleteSkill,
+  onSubmittingChange,
+}: {
+  skill: SkillChoice
+  submitting: boolean
+  onDeleteSkill: (skillValue: string) => Promise<void>
+  onSubmittingChange: (value: string | null) => void
+}) {
+  return (
+    <div className='bg-muted/30 hover:bg-muted/50 flex items-center gap-2 rounded-[7px] px-2.5 py-2 transition-colors'>
+      <div className='min-w-0 flex-1'>
+        <div className='flex items-center gap-1.5'>
+          <span className='truncate text-[11px] font-medium'>
+            {skill.label}
+          </span>
+          <span
+            className={cn(
+              'shrink-0 rounded px-1 py-0 text-[9px] font-medium',
+              getSkillSourceBadgeClass(skill.source)
+            )}
+          >
+            {formatSkillSource(skill.source)}
+          </span>
+        </div>
+        <div className='text-muted-foreground truncate text-[10px]'>
+          {skill.description}
+        </div>
+        {skill.reference ? (
+          <div className='text-muted-foreground truncate text-[10px] opacity-70'>
+            {skill.reference}
+          </div>
+        ) : null}
+      </div>
+      <button
+        type='button'
+        className='text-muted-foreground hover:text-destructive shrink-0 rounded-[5px] p-1 transition-colors disabled:opacity-50'
+        disabled={submitting}
+        onClick={() => {
+          onSubmittingChange(skill.value)
+          void onDeleteSkill(skill.value).finally(() => onSubmittingChange(null))
+        }}
+        title='删除 Skill'
+      >
+        <Trash2Icon className='size-3' />
+      </button>
+    </div>
+  )
+}
+
+function SkillStoreDialog({
+  hotSkills,
+  installedMarketplaceIds,
+  installedValues,
+  isLoading,
+  open,
+  search,
+  skills,
+  store,
+  submittingKey,
+  onAddSkill,
+  onOpenChange,
+  onSearchChange,
+}: {
+  hotSkills: SkillChoice[]
+  installedMarketplaceIds: Set<string>
+  installedValues: Set<string>
+  isLoading: boolean
+  open: boolean
+  search: string
+  skills: SkillChoice[]
+  store: SkillStore | null
+  submittingKey: string | null
+  onAddSkill: (skill: SkillChoice) => void
+  onOpenChange: (open: boolean) => void
+  onSearchChange: (value: string) => void
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className='max-w-[min(34rem,calc(100vw-2rem))] gap-3'>
+        <DialogHeader>
+          <DialogTitle>{store?.name ?? 'Skill 商城'}</DialogTitle>
+          <DialogDescription className='line-clamp-2 text-xs'>
+            {store?.description ?? '搜索并添加适合当前工作流的 Skill。'}
+          </DialogDescription>
+        </DialogHeader>
+        <div className='relative'>
+          <SearchIcon className='text-muted-foreground absolute top-1/2 left-2.5 size-3 -translate-y-1/2' />
+          <Input
+            value={search}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder='搜索 Skill...'
+            className='h-8 rounded-[7px] pl-7 text-xs'
+          />
+        </div>
+        {!search.trim() && hotSkills.length > 0 ? (
+          <div>
+            <div className='text-muted-foreground mb-1.5 text-[10px] font-semibold tracking-wider uppercase'>
+              热门 Skill
+            </div>
+            <div className='grid grid-cols-1 gap-1.5 sm:grid-cols-2'>
+              {hotSkills.map((skill) => (
+                <MarketplaceSkillCard
+                  key={skill.value}
+                  compact
+                  installed={isSkillInstalled(
+                    skill,
+                    installedValues,
+                    installedMarketplaceIds
+                  )}
+                  installing={submittingKey === skill.value}
+                  skill={skill}
+                  onAddSkill={onAddSkill}
+                />
+              ))}
+            </div>
+          </div>
+        ) : null}
+        <div>
+          <div className='text-muted-foreground mb-1.5 text-[10px] font-semibold tracking-wider uppercase'>
+            {search.trim() ? '搜索结果' : '全部 Skill'}
+          </div>
+          <div className='max-h-[22rem] space-y-1.5 overflow-y-auto pr-1'>
+            {isLoading && skills.length === 0 ? (
+              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
+                正在加载 Skill...
+              </div>
+            ) : null}
+            {!isLoading && skills.length === 0 ? (
+              <div className='text-muted-foreground rounded-[7px] border px-2.5 py-2 text-[11px]'>
+                没有找到可安装 Skill
+              </div>
+            ) : null}
+            {skills.map((skill) => (
+              <MarketplaceSkillCard
+                key={skill.value}
+                installed={isSkillInstalled(
+                  skill,
+                  installedValues,
+                  installedMarketplaceIds
+                )}
+                installing={submittingKey === skill.value}
+                skill={skill}
+                onAddSkill={onAddSkill}
+              />
+            ))}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function MarketplaceSkillCard({
+  compact = false,
+  installed,
+  installing,
+  skill,
+  onAddSkill,
+}: {
+  compact?: boolean
+  installed: boolean
+  installing: boolean
+  skill: SkillChoice
+  onAddSkill: (skill: SkillChoice) => void
+}) {
+  return (
+    <div className='border-border/50 flex items-center justify-between gap-2 rounded-[7px] border px-2.5 py-2'>
+      <div className='min-w-0 flex-1'>
+        <div className='truncate text-[11px] font-medium'>{skill.label}</div>
+        <div
+          className={cn(
+            'text-muted-foreground text-[10px]',
+            compact ? 'line-clamp-1' : 'line-clamp-2'
+          )}
+        >
+          {skill.description}
+        </div>
+        {!compact && skill.capabilities?.length ? (
+          <div className='text-muted-foreground mt-0.5 truncate text-[10px]'>
+            {skill.capabilities.slice(0, 3).join(' · ')}
+          </div>
+        ) : null}
+      </div>
+      <Button
+        type='button'
+        size='sm'
+        variant={installed ? 'ghost' : 'outline'}
+        className='h-6 shrink-0 rounded-[5px] px-2 text-[10px]'
+        disabled={installed || installing}
+        onClick={() => !installed && onAddSkill(skill)}
+      >
+        {installed ? '已添加' : installing ? '安装中' : '+ 添加'}
+      </Button>
     </div>
   )
 }
@@ -6306,6 +6758,98 @@ function writeSavedSkills(skills: SkillChoice[]) {
   }
 }
 
+function readSavedSkillStores(): SkillStore[] {
+  if (typeof window === 'undefined') return [DEFAULT_SKILL_STORE]
+
+  try {
+    const raw = window.localStorage.getItem(AGENT_SKILL_STORES_STORAGE_KEY)
+    if (!raw) return [DEFAULT_SKILL_STORE]
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return [DEFAULT_SKILL_STORE]
+    return mergeSkillStores([
+      DEFAULT_SKILL_STORE,
+      ...parsed.filter(isSkillStore),
+    ])
+  } catch {
+    return [DEFAULT_SKILL_STORE]
+  }
+}
+
+function writeSavedSkillStores(stores: SkillStore[]) {
+  if (typeof window === 'undefined') return
+
+  try {
+    window.localStorage.setItem(
+      AGENT_SKILL_STORES_STORAGE_KEY,
+      JSON.stringify(stores)
+    )
+  } catch {
+    /* localStorage may be unavailable or full. */
+  }
+}
+
+function mergeSkillStores(stores: SkillStore[]) {
+  const seen = new Set<string>()
+  return stores.filter((store) => {
+    const key = `${store.name.trim().toLowerCase()}|${store.url ?? ''}`
+    if (!store.name.trim() || seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function isSkillStore(value: unknown): value is SkillStore {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<SkillStore>
+  return (
+    typeof candidate.id === 'string' &&
+    typeof candidate.name === 'string' &&
+    typeof candidate.description === 'string'
+  )
+}
+
+function filterMarketplaceSkills(skills: SkillChoice[], search: string) {
+  const keyword = search.trim().toLowerCase()
+  if (!keyword) return skills
+  return skills.filter((skill) =>
+    [
+      skill.label,
+      skill.description,
+      skill.reference ?? '',
+      ...(skill.capabilities ?? []),
+      ...(skill.tags ?? []),
+    ]
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword)
+  )
+}
+
+function getHotMarketplaceSkills(
+  skills: SkillChoice[],
+  installedMarketplaceIds: Set<string>
+) {
+  return skills
+    .filter(
+      (skill) =>
+        !skill.marketplaceId || !installedMarketplaceIds.has(skill.marketplaceId)
+    )
+    .slice(0, 6)
+}
+
+function isSkillInstalled(
+  skill: SkillChoice,
+  installedValues: Set<string>,
+  installedMarketplaceIds: Set<string>
+) {
+  return (
+    installedValues.has(skill.value) ||
+    Boolean(
+      skill.marketplaceId && installedMarketplaceIds.has(skill.marketplaceId)
+    )
+  )
+}
+
 function isSkillChoice(value: unknown): value is SkillChoice {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Partial<SkillChoice>
@@ -6369,11 +6913,12 @@ function waitForAgentBackendPoll(ms: number) {
 }
 
 async function syncSavedBlueprintToBackend(
-  blueprint: SavedAgentBlueprint
+  blueprint: SavedAgentBlueprint,
+  options: BackendBlueprintFormOptions = {}
 ): Promise<SavedAgentBlueprint | null> {
   const agent = await ensureCreatorStudioAgent()
-  const payload = buildBackendBlueprintForm(blueprint)
-  const saved = blueprint.backendBlueprintId
+  const payload = buildBackendBlueprintForm(blueprint, options)
+  const saved = blueprint.backendBlueprintId && !options.forceCreate
     ? await updateBlueprint(agent.id, blueprint.backendBlueprintId, payload)
     : await createBlueprint(agent.id, payload)
 
@@ -6385,9 +6930,10 @@ async function syncSavedBlueprintToBackend(
 }
 
 async function runSavedBlueprintOnBackend(
-  blueprint: SavedAgentBlueprint
+  blueprint: SavedAgentBlueprint,
+  options: BackendBlueprintFormOptions = {}
 ): Promise<SavedAgentBlueprint | null> {
-  const synced = await syncSavedBlueprintToBackend(blueprint)
+  const synced = await syncSavedBlueprintToBackend(blueprint, options)
   if (!synced?.backendAgentId || !synced.backendBlueprintId) return synced
   await runBlueprint(synced.backendAgentId, synced.backendBlueprintId)
   return synced
@@ -6403,7 +6949,10 @@ async function ensureCreatorStudioAgent() {
   })
 }
 
-function buildBackendBlueprintForm(blueprint: SavedAgentBlueprint) {
+function buildBackendBlueprintForm(
+  blueprint: SavedAgentBlueprint,
+  options: BackendBlueprintFormOptions = {}
+) {
   const orderedNodes = orderNodes(blueprint.nodes, blueprint.edges)
   const firstNode = orderedNodes[0]
   const firstModelNode =
@@ -6418,7 +6967,7 @@ function buildBackendBlueprintForm(blueprint: SavedAgentBlueprint) {
       firstModelNode?.data.description ||
       firstNode?.data.description ||
       '创作台蓝图同步任务',
-    trigger: buildBackendTriggerConfig(orderedNodes),
+    trigger: buildBackendTriggerConfig(orderedNodes, options.triggerMode),
     model_group: firstModelNode?.data.group || 'default',
     model_name: firstModelNode?.data.model || 'gpt-4.1-mini',
     skills: Array.from(new Set(skills)),
@@ -6432,7 +6981,17 @@ function buildBackendBlueprintForm(blueprint: SavedAgentBlueprint) {
   }
 }
 
-function buildBackendTriggerConfig(nodes: AgentFlowNode[]) {
+function buildBackendTriggerConfig(
+  nodes: AgentFlowNode[],
+  mode: BackendBlueprintFormOptions['triggerMode'] = 'auto'
+) {
+  if (mode === 'manual') {
+    return {
+      type: 'manual',
+      timezone: 'Asia/Shanghai',
+    }
+  }
+
   const schedule = nodes.find((node) => node.data.kind === 'schedule')
   if (!schedule) {
     return {
@@ -6781,19 +7340,29 @@ function buildTemplates(
   })
   if (!components.length) return baseTemplates
 
+  const baseComponentIds = new Set(
+    baseTemplates.flatMap((template) => [
+      template.componentId ?? template.kind,
+      `component.${template.kind}`,
+    ])
+  )
   const dynamicTemplates = components
-    .filter(
-      (component) =>
-        component.enabled &&
-        (component.source === 'custom' ||
-          !baseTemplates.some(
-            (template) => template.componentId === component.id
-          ))
-    )
+    .filter((component) => shouldUseCatalogComponent(component, baseComponentIds))
     .map((component) =>
       componentToNodeTemplate(component, models, currentModel, currentGroup)
     )
   return [...baseTemplates, ...dynamicTemplates]
+}
+
+function shouldUseCatalogComponent(
+  component: AgentComponentItem,
+  baseComponentIds: Set<string>
+) {
+  if (!component.enabled) return false
+  if (component.source === 'custom') return true
+  if (baseComponentIds.has(component.id)) return false
+
+  return normalizeTemplateKind(component.kind) === 'custom'
 }
 
 function componentToNodeTemplate(
@@ -6908,6 +7477,13 @@ function formatSkillSource(source: SkillSource) {
     custom: '自定义',
   }
   return labels[source]
+}
+
+function getSkillSourceBadgeClass(source: SkillSource) {
+  if (source === 'github') return 'bg-purple-500/10 text-purple-600'
+  if (source === 'marketplace') return 'bg-blue-500/10 text-blue-600'
+  if (source === 'custom') return 'bg-amber-500/10 text-amber-600'
+  return 'bg-emerald-500/10 text-emerald-600'
 }
 
 function formatSkillNameFromReference(reference: string) {
@@ -7199,6 +7775,33 @@ function buildPaletteTemplateGroups(templates: NodeTemplate[]): PaletteTemplateG
   })).filter((group) => group.templates.length > 0)
 }
 
+function buildComponentPaletteSections(
+  groups: PaletteTemplateGroup[]
+): ComponentPaletteSection[] {
+  const templates = groups.flatMap((group) => group.templates)
+  const customTemplates = templates.filter((template) => template.source === 'custom')
+  const builtinSections = groups
+    .map((group) => ({
+      title: group.title,
+      badge: '内置',
+      templates: group.templates.filter((template) => template.source !== 'custom'),
+    }))
+    .filter((section) => section.templates.length > 0)
+
+  return [
+    ...(customTemplates.length
+      ? [
+          {
+            title: '自定义组件',
+            badge: '自定义',
+            templates: customTemplates,
+          },
+        ]
+      : []),
+    ...builtinSections,
+  ]
+}
+
 function filterPaletteTemplateGroups(
   groups: PaletteTemplateGroup[],
   search: string
@@ -7210,7 +7813,9 @@ function filterPaletteTemplateGroups(
     ...group,
     templates: group.templates.filter((template) => {
       const meta = NODE_META[template.kind]
-      return `${template.title} ${template.paletteGroup ?? meta.group} ${template.description}`
+      return `${template.title} ${template.paletteGroup ?? meta.group} ${template.description} ${
+        template.source === 'custom' ? '自定义' : '内置'
+      }`
         .toLowerCase()
         .includes(keyword)
     }),
@@ -7222,6 +7827,68 @@ function splitListInput(value: string) {
     .split(/[,，\n]+/)
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function buildManualPreviewGraph(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const nonScheduleIds = new Set(
+    nodes
+      .filter((node) => node.data.kind !== 'schedule')
+      .map((node) => node.id)
+  )
+  const startIds = nodes
+    .filter((node) => node.data.kind === 'start')
+    .map((node) => node.id)
+
+  if (startIds.length === 0) {
+    return filterGraphByNodeIds(nodes, edges, nonScheduleIds)
+  }
+
+  const outgoing = new Map<string, string[]>()
+  for (const edge of edges) {
+    if (!edge.source || !edge.target) continue
+    outgoing.set(edge.source, [
+      ...(outgoing.get(edge.source) ?? []),
+      edge.target,
+    ])
+  }
+
+  const reachable = new Set<string>()
+  const queue = [...startIds]
+  while (queue.length > 0) {
+    const id = queue.shift()
+    if (!id || reachable.has(id)) continue
+    const node = nodeById.get(id)
+    if (!node || node.data.kind === 'schedule') continue
+
+    reachable.add(id)
+    for (const targetId of outgoing.get(id) ?? []) {
+      if (!reachable.has(targetId)) {
+        queue.push(targetId)
+      }
+    }
+  }
+
+  const graph = filterGraphByNodeIds(nodes, edges, reachable)
+  return graph.nodes.length > 0
+    ? graph
+    : filterGraphByNodeIds(nodes, edges, nonScheduleIds)
+}
+
+function filterGraphByNodeIds(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[],
+  nodeIds: Set<string>
+) {
+  return {
+    nodes: nodes.filter((node) => nodeIds.has(node.id)),
+    edges: edges.filter(
+      (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)
+    ),
+  }
 }
 
 function orderNodes(nodes: AgentFlowNode[], edges: AgentFlowEdge[]) {
