@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -286,6 +287,17 @@ func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int6
 		CreatedTime:    now,
 		UpdatedTime:    now,
 	}
+	if err := s.validateBlueprintModels(ctx, b.ModelGroup, b.ModelName, b.Nodes); err != nil {
+		return nil, err
+	}
+	if isAgentScheduledBlueprint(b) {
+		b.Status = "running"
+		next, err := nextAgentScheduleTimeFromBlueprint(b, time.UnixMilli(now))
+		if err != nil {
+			return nil, err
+		}
+		b.NextExecutionTime = next
+	}
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO agent_blueprints
@@ -295,11 +307,11 @@ func (s *Store) CreateBlueprint(ctx context.Context, agentID string, userID int6
 		 created_time, updated_time,
 		 last_executed_time, next_execution_time,
 		 execution_count, failure_reason, execution_duration_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,'',0)`,
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,0,'',0)`,
 		b.ID, b.AgentID, b.UserID, b.Name, b.Description, b.Status,
 		b.TriggerConfig, b.ModelGroup, b.ModelName, b.Skills,
 		b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges,
-		b.CreatedTime, b.UpdatedTime)
+		b.CreatedTime, b.UpdatedTime, b.NextExecutionTime)
 	if err != nil {
 		return nil, err
 	}
@@ -349,25 +361,118 @@ func (s *Store) UpdateBlueprint(ctx context.Context, id string, userID int64, f 
 	if len(f.Edges) > 0 && string(f.Edges) != "null" {
 		b.Edges = f.Edges
 	}
+	if err := s.validateBlueprintModels(ctx, b.ModelGroup, b.ModelName, b.Nodes); err != nil {
+		return nil, err
+	}
 	b.UpdatedTime = now
+	if isAgentScheduledBlueprint(b) {
+		if b.Status != "paused" {
+			b.Status = "running"
+			next, err := nextAgentScheduleTimeFromBlueprint(b, time.UnixMilli(now))
+			if err != nil {
+				return nil, err
+			}
+			b.NextExecutionTime = next
+		}
+	} else {
+		b.NextExecutionTime = 0
+	}
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE agent_blueprints
 		SET name=?, description=?, trigger_config=?, model_group=?, model_name=?,
-		    skills=?, input_variables=?, archive_config=?, nodes=?, edges=?, updated_time=?
+		    skills=?, input_variables=?, archive_config=?, nodes=?, edges=?, status=?,
+		    next_execution_time=?, updated_time=?
 		WHERE id=? AND user_id=?`,
 		b.Name, b.Description, b.TriggerConfig, b.ModelGroup, b.ModelName,
-		b.Skills, b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges, b.UpdatedTime, id, userID)
+		b.Skills, b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges, b.Status,
+		b.NextExecutionTime, b.UpdatedTime, id, userID)
 	if err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
+func (s *Store) validateBlueprintModels(
+	ctx context.Context,
+	defaultGroup string,
+	defaultModel string,
+	nodesJSON json.RawMessage,
+) error {
+	channels, err := s.ListChannels(ctx, false)
+	if err != nil {
+		return err
+	}
+	modelsByGroup := make(map[string]map[string]struct{})
+	for _, channel := range channels {
+		if !channel.Enabled {
+			continue
+		}
+		group := normalizeGroupName(channel.Group)
+		models := modelsByGroup[group]
+		if models == nil {
+			models = make(map[string]struct{})
+			modelsByGroup[group] = models
+		}
+		for _, model := range modelList(channel.Models) {
+			models[model] = struct{}{}
+		}
+	}
+
+	validate := func(label, group, model string) error {
+		group = normalizeGroupName(group)
+		model = strings.TrimSpace(model)
+		models := modelsByGroup[group]
+		if len(models) == 0 {
+			return fmt.Errorf("model group %q has no available models", group)
+		}
+		if _, ok := models[model]; !ok {
+			return fmt.Errorf("%s model %q is not available in group %q", label, model, group)
+		}
+		return nil
+	}
+
+	if err := validate("blueprint", defaultGroup, defaultModel); err != nil {
+		return err
+	}
+	nodes, err := parseAgentBlueprintNodes(nodesJSON)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		group := firstNonEmpty(node.Data.Group, defaultGroup)
+		model := firstNonEmpty(node.Data.Model, defaultModel)
+		label := fmt.Sprintf("node %q", firstNonEmpty(node.Data.Title, node.ID))
+		if err := validate(label, group, model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) UpdateBlueprintStatus(ctx context.Context, id string, status string, failureReason string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE agent_blueprints SET status=?, failure_reason=?, updated_time=? WHERE id=?`,
 		status, failureReason, time.Now().UnixMilli(), id)
+	return err
+}
+
+func (s *Store) UpdateBlueprintScheduleState(ctx context.Context, id, status, failureReason string, nextExecutionTime int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE agent_blueprints
+		SET status=?, failure_reason=?, next_execution_time=?, updated_time=?
+		WHERE id=?`,
+		status, failureReason, nextExecutionTime, time.Now().UnixMilli(), id)
+	return err
+}
+
+func (s *Store) UpdateRecurringBlueprintAfterRun(ctx context.Context, id, failureReason string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE agent_blueprints
+		SET status=CASE WHEN status='paused' THEN 'paused' ELSE 'running' END,
+		    failure_reason=?, updated_time=?
+		WHERE id=?`,
+		failureReason, time.Now().UnixMilli(), id)
 	return err
 }
 
@@ -643,11 +748,13 @@ func (s *Store) ListExecutionLogs(ctx context.Context, blueprintID string, userI
 	var out []AgentExecutionLog
 	for rows.Next() {
 		var l AgentExecutionLog
+		var output []byte
 		if err := rows.Scan(&l.ID, &l.BlueprintID, &l.AgentID, &l.UserID,
 			&l.Status, &l.StartTime, &l.EndTime, &l.DurationMs,
-			&l.Output, &l.ErrorMsg, &l.ArchivePath); err != nil {
+			&output, &l.ErrorMsg, &l.ArchivePath); err != nil {
 			return nil, err
 		}
+		l.Output = json.RawMessage(output)
 		out = append(out, l)
 	}
 	if out == nil {
@@ -694,11 +801,13 @@ func (s *Store) ListExecutionLogsPage(ctx context.Context, userID, start, end in
 	out := make([]AgentExecutionLog, 0)
 	for rows.Next() {
 		var l AgentExecutionLog
+		var output []byte
 		if err := rows.Scan(&l.ID, &l.BlueprintID, &l.AgentID, &l.UserID,
 			&l.Status, &l.StartTime, &l.EndTime, &l.DurationMs,
-			&l.Output, &l.ErrorMsg, &l.ArchivePath); err != nil {
+			&output, &l.ErrorMsg, &l.ArchivePath); err != nil {
 			return nil, 0, err
 		}
+		l.Output = json.RawMessage(output)
 		out = append(out, l)
 	}
 	return out, total, rows.Err()

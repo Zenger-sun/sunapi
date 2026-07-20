@@ -105,6 +105,7 @@ func main() {
 		).
 		WithHooks(cliproxy.Hooks{
 			OnAfterStart: func(*cliproxy.Service) {
+				store.StartAgentScheduler()
 				url := browserURL(cfg)
 				homeURL := strings.TrimRight(url, "/") + "/home"
 				consoleURL := strings.TrimRight(url, "/") + "/dashboard"

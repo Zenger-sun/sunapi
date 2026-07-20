@@ -21,20 +21,23 @@ import (
 )
 
 const (
-	agentBrowserProfileDir       = "agent-browser-profile"
-	agentBrowserPortFile         = "agent-browser-devtools-port"
-	agentBrowserCaptureDir       = "agent-browser-captures"
-	agentBrowserCaptureMaxRunes  = 200000
-	agentBrowserCaptureMaxWait   = 30
-	agentBrowserCaptureMinWait   = 1
-	agentBrowserCaptureDefault   = 6
-	agentBrowserDevtoolsWaitTime = 12 * time.Second
+	agentBrowserProfileDir        = "agent-browser-profile"
+	agentBrowserPortFile          = "agent-browser-devtools-port"
+	agentBrowserCaptureDir        = "agent-browser-captures"
+	agentBrowserCaptureMaxRunes   = 200000
+	agentBrowserCaptureMaxWait    = 30
+	agentBrowserCaptureMinWait    = 1
+	agentBrowserCaptureDefault    = 6
+	agentBrowserDevtoolsWaitTime  = 12 * time.Second
+	agentBrowserProbeTimeout      = 3 * time.Second
+	agentBrowserScreenshotTimeout = 8 * time.Second
 )
 
 type AgentBrowserCaptureRequest struct {
-	URL         string `json:"url"`
-	LoginState  string `json:"login_state,omitempty"`
-	WaitSeconds int    `json:"wait_seconds,omitempty"`
+	URL              string `json:"url"`
+	LoginState       string `json:"login_state,omitempty"`
+	WaitSeconds      int    `json:"wait_seconds,omitempty"`
+	LoginWaitSeconds int    `json:"login_wait_seconds,omitempty"`
 }
 
 type AgentBrowserCaptureResult struct {
@@ -46,6 +49,7 @@ type AgentBrowserCaptureResult struct {
 	ScreenshotError string `json:"screenshot_error,omitempty"`
 	CapturedAt      int64  `json:"captured_at"`
 	ElapsedMS       int64  `json:"elapsed_ms"`
+	BrowserTargetID string `json:"browser_target_id,omitempty"`
 }
 
 type agentBrowserTarget struct {
@@ -67,7 +71,11 @@ func handleCaptureAgentBrowserPage(store *Store) gin.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 75*time.Second)
+		timeout := 75 * time.Second
+		if req.LoginWaitSeconds > 0 {
+			timeout += time.Duration(req.LoginWaitSeconds) * time.Second
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 		defer cancel()
 
 		result, err := captureAgentBrowserPage(ctx, store.DataDir(), req)
@@ -111,6 +119,11 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 	if _, err := agentBrowserCDPCall(ctx, conn, 3, "Page.navigate", map[string]any{"url": targetURL}); err != nil {
 		return AgentBrowserCaptureResult{}, err
 	}
+	if req.LoginWaitSeconds > 0 && !strings.Contains(req.LoginState, "无需登录") {
+		if err := waitAgentBrowserLogin(ctx, conn, req.LoginWaitSeconds); err != nil {
+			return AgentBrowserCaptureResult{}, err
+		}
+	}
 
 	waitSeconds := normalizeAgentBrowserWaitSeconds(req.WaitSeconds)
 	select {
@@ -153,6 +166,7 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		ScreenshotError: screenshotError,
 		CapturedAt:      capturedAt.Unix(),
 		ElapsedMS:       time.Since(started).Milliseconds(),
+		BrowserTargetID: target.ID,
 	}, nil
 }
 
@@ -217,6 +231,7 @@ func ensureAgentBrowserDevtools(ctx context.Context, dataDir string) (string, er
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-background-networking",
+		"--window-size=1280,900",
 		"about:blank",
 	}
 	cmd := exec.Command(browserPath, args...)
@@ -293,20 +308,120 @@ func waitAgentBrowserDevtools(ctx context.Context, endpoint string) error {
 }
 
 func openAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, error) {
-	if target, err := createAgentBrowserTarget(ctx, endpoint, targetURL); err == nil {
-		return target, nil
-	}
+	return createAgentBrowserTarget(ctx, endpoint, targetURL)
+}
 
+func findAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, bool, error) {
 	targets, err := listAgentBrowserTargets(ctx, endpoint)
 	if err != nil {
-		return agentBrowserTarget{}, err
+		return agentBrowserTarget{}, false, err
+	}
+	wantedHost := ""
+	if parsed, err := url.Parse(targetURL); err == nil {
+		wantedHost = strings.ToLower(parsed.Hostname())
 	}
 	for _, target := range targets {
-		if target.Type == "page" && target.WebSocketDebuggerURL != "" {
-			return target, nil
+		if target.Type != "page" || target.WebSocketDebuggerURL == "" {
+			continue
+		}
+		if strings.TrimSpace(target.URL) == strings.TrimSpace(targetURL) {
+			return target, true, nil
+		}
+		if wantedHost != "" {
+			if parsed, err := url.Parse(target.URL); err == nil && strings.EqualFold(parsed.Hostname(), wantedHost) {
+				return target, true, nil
+			}
 		}
 	}
-	return agentBrowserTarget{}, errors.New("未找到可连接的浏览器页面")
+	return agentBrowserTarget{}, false, nil
+}
+
+func findAgentBrowserTargetByID(ctx context.Context, endpoint, targetID string) (agentBrowserTarget, bool, error) {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return agentBrowserTarget{}, false, nil
+	}
+	targets, err := listAgentBrowserTargets(ctx, endpoint)
+	if err != nil {
+		return agentBrowserTarget{}, false, err
+	}
+	for _, target := range targets {
+		if target.ID == targetID && target.Type == "page" && target.WebSocketDebuggerURL != "" {
+			return target, true, nil
+		}
+	}
+	return agentBrowserTarget{}, false, nil
+}
+
+func listAgentBrowserTargets(ctx context.Context, endpoint string) ([]agentBrowserTarget, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/json/list", nil)
+	if err != nil {
+		return nil, err
+	}
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("读取浏览器页面列表失败: %s", resp.Status)
+	}
+	var targets []agentBrowserTarget
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
+func probeAgentBrowserTarget(ctx context.Context, target agentBrowserTarget) error {
+	probeCtx, cancel := context.WithTimeout(ctx, agentBrowserProbeTimeout)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(probeCtx, target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = agentBrowserCDPCall(probeCtx, conn, 9001, "Runtime.evaluate", map[string]any{
+		"expression":    "document.readyState",
+		"returnByValue": true,
+	})
+	return err
+}
+
+func closeAgentBrowserTarget(ctx context.Context, endpoint, targetID string) error {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/json/close/"+url.PathEscape(targetID), nil)
+	if err != nil {
+		return err
+	}
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("关闭浏览器页面失败: %s", resp.Status)
+	}
+	return nil
+}
+
+func captureAgentBrowserTargetScreenshot(ctx context.Context, target agentBrowserTarget) (string, error) {
+	screenshotCtx, cancel := context.WithTimeout(ctx, agentBrowserScreenshotTimeout)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(screenshotCtx, target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := agentBrowserCDPCall(screenshotCtx, conn, 9100, "Page.enable", nil); err != nil {
+		return "", err
+	}
+	return captureAgentBrowserScreenshot(screenshotCtx, conn, 9101)
 }
 
 func createAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, error) {
@@ -331,27 +446,6 @@ func createAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (
 		return agentBrowserTarget{}, errors.New("浏览器页面缺少调试地址")
 	}
 	return target, nil
-}
-
-func listAgentBrowserTargets(ctx context.Context, endpoint string) ([]agentBrowserTarget, error) {
-	client := http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/json/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("读取浏览器页面失败: %s", resp.Status)
-	}
-	var targets []agentBrowserTarget
-	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
-		return nil, err
-	}
-	return targets, nil
 }
 
 func agentBrowserCDPCall(ctx context.Context, conn *websocket.Conn, id int, method string, params map[string]any) (json.RawMessage, error) {
@@ -434,6 +528,53 @@ func evaluateAgentBrowserText(ctx context.Context, conn *websocket.Conn, id int)
 		return agentBrowserTextPayload{}, err
 	}
 	return payload, nil
+}
+
+func waitAgentBrowserLogin(ctx context.Context, conn *websocket.Conn, maxWaitSeconds int) error {
+	if maxWaitSeconds <= 0 {
+		return nil
+	}
+	if maxWaitSeconds > 300 {
+		maxWaitSeconds = 300
+	}
+	deadline := time.Now().Add(time.Duration(maxWaitSeconds) * time.Second)
+	callID := 50
+	for {
+		payload, err := evaluateAgentBrowserText(ctx, conn, callID)
+		callID++
+		if err == nil && strings.TrimSpace(payload.Text) != "" && !looksLikeAgentBrowserLogin(payload) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("等待浏览器登录超时；请在打开的小窗中完成登录后重试")
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+func looksLikeAgentBrowserLogin(payload agentBrowserTextPayload) bool {
+	location := strings.ToLower(strings.TrimSpace(payload.URL))
+	for _, marker := range []string{"/login", "login.", "signin", "passport", "/auth"} {
+		if strings.Contains(location, marker) {
+			return true
+		}
+	}
+	text := strings.Join([]string{payload.Title, payload.Text}, "\n")
+	if !strings.Contains(text, "登录") {
+		return false
+	}
+	for _, marker := range []string{"手机号", "验证码", "扫码登录", "密码登录", "立即登录"} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func captureAgentBrowserScreenshot(ctx context.Context, conn *websocket.Conn, id int) (string, error) {

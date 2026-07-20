@@ -197,7 +197,7 @@ func handlePauseBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
-		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, "paused", ""); err != nil {
+		if err := store.UpdateBlueprintScheduleState(c.Request.Context(), bpID, "paused", "", 0); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
@@ -216,14 +216,22 @@ func handleResumeBlueprint(store *Store) gin.HandlerFunc {
 			return
 		}
 		status := "pending"
-		if blueprintHasScheduleNode(bp) {
+		nextExecutionTime := int64(0)
+		if isAgentScheduledBlueprint(bp) {
 			status = "running"
+			var errNext error
+			nextExecutionTime, errNext = nextAgentScheduleTimeFromBlueprint(bp, time.Now())
+			if errNext != nil {
+				fail(c, http.StatusBadRequest, errNext)
+				return
+			}
 		}
-		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, status, ""); err != nil {
+		if err := store.UpdateBlueprintScheduleState(c.Request.Context(), bpID, status, "", nextExecutionTime); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
 		bp.Status = status
+		bp.NextExecutionTime = nextExecutionTime
 		ok(c, bp)
 	}
 }

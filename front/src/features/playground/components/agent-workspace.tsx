@@ -20,6 +20,7 @@ import {
   type DragEvent,
   type ReactNode,
 } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   addEdge,
   applyEdgeChanges,
@@ -84,17 +85,6 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import {
-  createAgent,
-  createBlueprint,
-  getAgents,
-  getBlueprintsByAgent,
-  listBlueprintExecutionLogs,
-  pauseBlueprint,
-  resumeBlueprint,
-  runBlueprint,
-  updateBlueprint,
-} from '@/features/agents/api'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -120,20 +110,30 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
+  createAgent,
+  createBlueprint,
+  deleteBlueprint,
+  getAgents,
+  getBlueprintsByAgent,
+  listBlueprintExecutionLogs,
+  pauseBlueprint,
+  resumeBlueprint,
+  runBlueprint,
+  updateBlueprint,
+} from '@/features/agents/api'
+import type { AgentExecutionLog, Blueprint } from '@/features/agents/types'
+import {
   createAgentComponent,
   createAgentSkill,
   deleteAgentComponent,
   deleteAgentSkill,
+  getUserModels,
   listAgentSkillMarketplace,
   listAgentSkills,
   listAgentFiles,
   listAgentComponents,
   uploadAgentFile,
 } from '../api'
-import type {
-  AgentSkillItem,
-  AgentSkillMarketplaceItem,
-} from '../types'
 import {
   AGENT_BLUEPRINT_COMMAND_EVENT,
   AGENT_BLUEPRINTS_CHANGED_EVENT,
@@ -143,9 +143,7 @@ import {
   type AgentBlueprintCommand,
   type AgentBlueprintStatus,
 } from '../lib/agent-blueprints'
-import type {
-  AgentExecutionLog,
-} from '@/features/agents/types'
+import type { AgentSkillItem, AgentSkillMarketplaceItem } from '../types'
 import type {
   AgentFileUpload,
   AgentFileUploadPurpose,
@@ -163,6 +161,7 @@ type AgentNodeKind =
   | 'transform'
   | 'image'
   | 'report'
+  | 'report_data'
   | 'webpage'
   | 'notify'
   | 'stop'
@@ -242,7 +241,6 @@ type ModelChoice = {
   value: string
   description?: string
   supportsImage?: boolean
-  source?: 'system' | 'current' | 'fallback'
 }
 
 type SkillChoice = {
@@ -319,6 +317,7 @@ type SavedAgentBlueprint = {
   executionLog?: AgentExecutionLogMap
   backendAgentId?: string
   backendBlueprintId?: string
+  syncState?: 'synced' | 'draft'
 }
 
 type AgentPreviewRunMode = 'default' | 'manual'
@@ -326,6 +325,7 @@ type AgentPreviewRunMode = 'default' | 'manual'
 type BackendBlueprintFormOptions = {
   forceCreate?: boolean
   triggerMode?: 'auto' | 'manual'
+  modelsValidated?: boolean
 }
 
 type AgentBlueprintHistorySnapshot = {
@@ -340,6 +340,8 @@ const DRAG_NODE_TYPE = 'application/sunapi-agent-node'
 const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
 const AGENT_SKILL_STORES_STORAGE_KEY = 'sunapi.playground.skill.stores.v1'
 const MAX_BLUEPRINT_HISTORY = 50
+const AGENT_BACKEND_POLL_INTERVAL_MS = 900
+const AGENT_BACKEND_POLL_TIMEOUT_MS = 10 * 60 * 1000 + 15 * 1000
 
 const CREATOR_FLOW_ARIA_LABEL_CONFIG: Partial<AriaLabelConfig> = {
   'controls.ariaLabel': '画布控制',
@@ -396,7 +398,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser'],
+    appliesTo: ['browser', 'report_data'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -541,6 +543,7 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   transform: 'skill.code-interpreter',
   image: 'skill.code-interpreter',
   report: 'skill.file-document',
+  report_data: 'skill.browser-automation',
   webpage: 'skill.file-document',
   notify: 'skill.api-function',
   stop: 'skill.mcp-workflow',
@@ -587,6 +590,7 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   触发方式: ['手动', '定时', 'Webhook', '对话触发'],
   运行模式: ['单次执行', '循环执行', '仅预览', '失败后重试'],
   登录态: ['使用当前设备浏览器', '使用已保存登录态', '无需登录'],
+  登录等待: ['30s', '60s', '120s', '180s'],
   权限: ['只读采集', '读写操作需确认', '禁止写入'],
   方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   超时: ['10s', '30s', '60s', '120s'],
@@ -629,6 +633,9 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
   日报模板: ['默认模板', '简洁版', '详细分析版', '自定义模板'],
   输出模式: ['输出网页 + 数据', '仅输出数据'],
+  采集周期: ['近1天', '近7天', '近30天'],
+  页面等待: ['2s', '4s', '6s', '10s'],
+  最大页数: ['5', '10', '20', '50'],
   组件来源: ['系统内置', '自定义'],
   执行策略: ['按描述执行', '结构化处理', '只读采集', '写入前确认'],
   模式: ['读取', '写入', '追加', '转换'],
@@ -637,71 +644,6 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   冲突处理: ['保留最新', '保留最早', '输出冲突记录', '请求人工确认'],
   条件: ['字段存在', '表达式为真', '数值比较', '文本包含'],
   未命中处理: ['跳过', '输出空数组', '中断流程', '请求人工确认'],
-}
-
-const MODEL_FALLBACKS: Record<ModelRole, ModelChoice[]> = {
-  system: [
-    {
-      label: 'SunAPI System Runner',
-      value: 'system.runner',
-      description: '本地编排执行器',
-    },
-    {
-      label: 'SunAPI Scheduler',
-      value: 'system.scheduler',
-      description: '定时任务执行器',
-    },
-  ],
-  browser: [
-    {
-      label: 'Claude Sonnet 4',
-      value: 'claude-sonnet-4',
-      description: '浏览器操作与页面理解',
-    },
-    {
-      label: 'GPT-4.1',
-      value: 'gpt-4.1',
-      description: '网页任务理解',
-    },
-  ],
-  fast: [
-    {
-      label: 'GPT-4.1 mini',
-      value: 'gpt-4.1-mini',
-      description: '低成本结构化处理',
-    },
-    {
-      label: 'Qwen Turbo',
-      value: 'qwen-turbo',
-      description: '快速文本处理',
-    },
-  ],
-  reasoning: [
-    {
-      label: 'GPT-4.1',
-      value: 'gpt-4.1',
-      description: '复杂整理与报告生成',
-    },
-    {
-      label: 'Claude Sonnet 4',
-      value: 'claude-sonnet-4',
-      description: '多步骤分析',
-    },
-  ],
-  image: [
-    {
-      label: 'GPT Image 1',
-      value: 'gpt-image-1',
-      description: '图像生成',
-      supportsImage: true,
-    },
-    {
-      label: 'Imagen',
-      value: 'imagen',
-      description: '图片生成模型',
-      supportsImage: true,
-    },
-  ],
 }
 
 const NODE_META: Record<
@@ -748,17 +690,19 @@ const NODE_META: Record<
     },
   },
   browser: {
-    label: '浏览器取数',
+    label: '打开浏览器',
     group: '采集',
     role: 'browser',
     icon: GlobeIcon,
     accent: 'bg-blue-500/12 text-blue-700 dark:text-blue-300',
-    description: '打开当前设备浏览器页面，读取登录态下的后台数据。',
-    inputs: ['网址', '任务描述'],
-    outputs: ['页面数据', '截图证据'],
+    description:
+      '打开独立浏览器窗口并等待用户完成登录，为后续数据处理提供复用会话。',
+    inputs: ['网址', '登录要求'],
+    outputs: ['浏览器会话', '登录状态'],
     settings: {
       网址: 'https://www.goofish.com/',
       登录态: '使用当前设备浏览器',
+      登录等待: '120s',
       权限: '只读采集',
       采集等待: '6s',
     },
@@ -837,6 +781,22 @@ const NODE_META: Record<
       输出目录: 'data/output/reports',
     },
   },
+  report_data: {
+    label: '处理数据',
+    group: '智能处理',
+    role: 'reasoning',
+    icon: Table2Icon,
+    accent: 'bg-indigo-500/12 text-indigo-700 dark:text-indigo-300',
+    description:
+      '读取日报模板计划，复用已登录浏览器重新采集商品数据、计算排行并输出日报。',
+    inputs: ['日报模板计划', '浏览器会话'],
+    outputs: ['商品明细', '商品排行', '日报文件'],
+    settings: {
+      采集周期: '近1天',
+      页面等待: '4s',
+      最大页数: '10',
+    },
+  },
   notify: {
     label: '发送通知',
     group: '输出',
@@ -906,7 +866,7 @@ const PALETTE_GROUPS: Array<{
 }> = [
   { title: '触发', kinds: ['start', 'schedule', 'stop'] },
   { title: '采集', kinds: ['browser', 'request'] },
-  { title: '智能处理', kinds: ['transform', 'image'] },
+  { title: '智能处理', kinds: ['transform', 'report_data', 'image'] },
   { title: '输出', kinds: ['report', 'webpage', 'notify'] },
 ]
 
@@ -928,7 +888,8 @@ const INITIAL_EDGES: AgentFlowEdge[] = [
   { id: 'e-transform-image', source: 'transform', target: 'image' },
   { id: 'e-transform-report', source: 'transform', target: 'report' },
   { id: 'e-image-report', source: 'image', target: 'report' },
-  { id: 'e-report-stop', source: 'report', target: 'stop' },
+  { id: 'e-report-report-data', source: 'report', target: 'report_data' },
+  { id: 'e-report-data-stop', source: 'report_data', target: 'stop' },
 ]
 
 export function AgentWorkspace({
@@ -957,13 +918,7 @@ export function AgentWorkspace({
     [currentGroup, groups]
   )
   const templates = useMemo(
-    () =>
-      buildTemplates(
-        models,
-        currentModel,
-        currentGroup,
-        componentCatalog
-      ),
+    () => buildTemplates(models, currentModel, currentGroup, componentCatalog),
     [componentCatalog, currentGroup, currentModel, models]
   )
   const initialBlueprints = useMemo(() => readSavedBlueprints(), [])
@@ -991,7 +946,9 @@ export function AgentWorkspace({
     initialBlueprint?.title ?? '自动化任务蓝图'
   )
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(
-    initialBlueprint?.updatedAt ?? null
+    initialBlueprint && !isLocalBlueprintDraft(initialBlueprint)
+      ? initialBlueprint.updatedAt
+      : null
   )
   const [nodes, setNodes] = useState<AgentFlowNode[]>(
     () => initialBlueprint?.nodes ?? createInitialNodes(templates)
@@ -1022,6 +979,32 @@ export function AgentWorkspace({
     [nodes, selectedNodeId]
   )
 
+  useEffect(() => {
+    if (models.length === 0) return
+    const availableModels = new Set(models.map((model) => model.value))
+
+    setNodes((current) => {
+      let changed = false
+      const next = current.map((node) => {
+        const nodeGroup = node.data.group || currentGroup
+        if (currentGroup && nodeGroup !== currentGroup) return node
+        if (
+          node.data.model &&
+          !node.data.model.startsWith('system.') &&
+          availableModels.has(node.data.model)
+        ) {
+          return node
+        }
+
+        const model = pickDefaultModel(node.data.kind, models, currentModel)
+        if (model === node.data.model) return node
+        changed = true
+        return { ...node, data: { ...node.data, model } }
+      })
+      return changed ? next : current
+    })
+  }, [currentGroup, currentModel, models])
+
   const executionNodes = useMemo(() => orderNodes(nodes, edges), [edges, nodes])
   const currentBlueprintStatus = useMemo(
     () =>
@@ -1035,6 +1018,7 @@ export function AgentWorkspace({
     [blueprints, currentBlueprintId, nodes]
   )
   const hasScheduledBlueprint = useMemo(() => hasScheduleNode(nodes), [nodes])
+  const hasManualTrigger = useMemo(() => hasManualTriggerNode(nodes), [nodes])
   const paletteGroups = useMemo(
     () => buildPaletteTemplateGroups(templates),
     [templates]
@@ -1079,9 +1063,16 @@ export function AgentWorkspace({
     []
   )
   const pollBackendExecutionLogs = useCallback(
-    async (agentId: string, blueprintId: string) => {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const logs = await refreshBackendExecutionLogs(agentId, blueprintId)
+    async (
+      agentId: string,
+      blueprintId: string,
+      isActive: () => boolean
+    ) => {
+      const deadline = Date.now() + AGENT_BACKEND_POLL_TIMEOUT_MS
+      let logs: AgentExecutionLog[] = []
+
+      while (isActive() && Date.now() < deadline) {
+        logs = await refreshBackendExecutionLogs(agentId, blueprintId)
         const latest = logs[0]
         if (
           latest &&
@@ -1090,9 +1081,10 @@ export function AgentWorkspace({
         ) {
           return logs
         }
-        await waitForAgentBackendPoll(900)
+        await waitForAgentBackendPoll(AGENT_BACKEND_POLL_INTERVAL_MS)
       }
-      return refreshBackendExecutionLogs(agentId, blueprintId)
+
+      return logs
     },
     [refreshBackendExecutionLogs]
   )
@@ -1161,7 +1153,11 @@ export function AgentWorkspace({
       statusOverride?: AgentBlueprintStatus,
       snapshotEdges: AgentFlowEdge[] = activeEdges
     ) => {
-      const preview = buildBackendExecutionPreview(log, activeNodes, activeEdges)
+      const preview = buildBackendExecutionPreview(
+        log,
+        activeNodes,
+        activeEdges
+      )
       if (!preview) return
 
       setExecutionLog(preview.executionLog)
@@ -1303,7 +1299,16 @@ export function AgentWorkspace({
     setSelectedNodeId('browser')
   }, [bumpHistoryVersion, cancelPreviewRun, templates])
 
-  const handleSaveBlueprint = useCallback(() => {
+  const handleSaveBlueprint = useCallback(async () => {
+    try {
+      await validateAgentNodeModels(nodes)
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : '节点模型校验失败'
+      )
+      return
+    }
+
     const now = Date.now()
     const title = blueprintTitle.trim() || '未命名蓝图'
     const id = currentBlueprintId ?? `blueprint-${now}`
@@ -1319,44 +1324,48 @@ export function AgentWorkspace({
       executionLog,
       backendAgentId: existing?.backendAgentId,
       backendBlueprintId: existing?.backendBlueprintId,
+      syncState: 'draft',
     }
-    const next = [
-      blueprint,
-      ...blueprints.filter((item) => item.id !== id),
-    ].sort((a, b) => b.updatedAt - a.updatedAt)
 
     setBlueprintTitle(title)
     setCurrentBlueprintId(id)
-    setLastSavedAt(now)
-    setBlueprints(next)
-    writeSavedBlueprints(next)
-    notifyAgentBlueprintsChanged()
 
-    void syncSavedBlueprintToBackend(blueprint)
-      .then((synced) => {
-        if (!synced) return
-        setBlueprints((current) => {
-          const syncedBlueprints = current.map((item) =>
-            item.id === synced.id ? synced : item
-          )
-          writeSavedBlueprints(syncedBlueprints)
-          notifyAgentBlueprintsChanged()
-          return syncedBlueprints
-        })
-        if (synced.backendAgentId && synced.backendBlueprintId) {
-          void refreshBackendExecutionLogs(
-            synced.backendAgentId,
-            synced.backendBlueprintId
-          ).catch(() => undefined)
-        }
+    try {
+      const synced = await syncSavedBlueprintToBackend(blueprint, {
+        modelsValidated: true,
       })
-      .catch((error) => {
-        toast.error(
-          error instanceof Error
-            ? `蓝图已本地保存，后端同步失败: ${error.message}`
-            : '蓝图已本地保存，后端同步失败'
-        )
-      })
+      if (!synced) throw new Error('后端未返回蓝图数据')
+
+      const next = [
+        synced,
+        ...blueprints.filter((item) => item.id !== id),
+      ].sort((a, b) => b.updatedAt - a.updatedAt)
+      setLastSavedAt(synced.updatedAt)
+      setBlueprints(next)
+      writeSavedBlueprints(next)
+      notifyAgentBlueprintsChanged()
+
+      if (synced.backendAgentId && synced.backendBlueprintId) {
+        void refreshBackendExecutionLogs(
+          synced.backendAgentId,
+          synced.backendBlueprintId
+        ).catch(() => undefined)
+      }
+    } catch (error) {
+      const drafts = [
+        blueprint,
+        ...blueprints.filter((item) => item.id !== id),
+      ].sort((a, b) => b.updatedAt - a.updatedAt)
+      setLastSavedAt(null)
+      setBlueprints(drafts)
+      writeSavedBlueprints(drafts)
+      notifyAgentBlueprintsChanged()
+      toast.error(
+        error instanceof Error
+          ? `数据库保存失败，已保留本地草稿: ${error.message}`
+          : '数据库保存失败，已保留本地草稿'
+      )
+    }
   }, [
     blueprintTitle,
     blueprints,
@@ -1380,7 +1389,9 @@ export function AgentWorkspace({
       bumpHistoryVersion()
       setCurrentBlueprintId(blueprint.id)
       setBlueprintTitle(blueprint.title)
-      setLastSavedAt(blueprint.updatedAt)
+      setLastSavedAt(
+        isLocalBlueprintDraft(blueprint) ? null : blueprint.updatedAt
+      )
       setNodes(normalizedNodes)
       setEdges(blueprint.edges)
       setExecutionLog(blueprint.executionLog ?? {})
@@ -1395,6 +1406,42 @@ export function AgentWorkspace({
     },
     [bumpHistoryVersion, cancelPreviewRun, refreshBackendExecutionLogs]
   )
+
+  useEffect(() => {
+    let active = true
+
+    const hydrateBlueprints = async () => {
+      try {
+        const agent = await ensureCreatorStudioAgent()
+        const backendBlueprints = await getBlueprintsByAgent(agent.id)
+        if (!active) return
+
+        const restored = mergeBackendBlueprints(
+          readSavedBlueprints(),
+          backendBlueprints,
+          agent.id
+        )
+        setBlueprints(restored)
+        writeSavedBlueprints(restored)
+        notifyAgentBlueprintsChanged()
+
+        const selected =
+          restored.find((item) => item.id === initialBlueprint?.id) ??
+          restored[0]
+        if (selected) {
+          handleLoadBlueprint(selected)
+        }
+      } catch (error) {
+        console.warn('Failed to restore creator studio blueprints', error)
+        toast.error('从数据库加载蓝图失败，已使用本地缓存')
+      }
+    }
+
+    void hydrateBlueprints()
+    return () => {
+      active = false
+    }
+  }, [handleLoadBlueprint, initialBlueprint?.id])
 
   const reloadComponents = useCallback(async () => {
     setIsComponentCatalogLoading(true)
@@ -1459,7 +1506,34 @@ export function AgentWorkspace({
   }, [reloadSkills])
 
   const handleDeleteBlueprint = useCallback(
-    (blueprintId: string) => {
+    async (blueprintId: string) => {
+      const blueprint = blueprints.find((item) => item.id === blueprintId)
+      if (blueprint?.backendAgentId && blueprint.backendBlueprintId) {
+        try {
+          const backendBlueprints = await getBlueprintsByAgent(
+            blueprint.backendAgentId
+          )
+          const matchingIds = new Set<string>([blueprint.backendBlueprintId])
+          backendBlueprints.forEach((item) => {
+            if (backendBlueprintLocalId(item) === blueprint.id) {
+              matchingIds.add(item.id)
+            }
+          })
+          await Promise.all(
+            Array.from(matchingIds).map((id) =>
+              deleteBlueprint(blueprint.backendAgentId!, id)
+            )
+          )
+        } catch (error) {
+          toast.error(
+            error instanceof Error
+              ? `删除数据库蓝图失败: ${error.message}`
+              : '删除数据库蓝图失败'
+          )
+          return
+        }
+      }
+
       const next = blueprints.filter((item) => item.id !== blueprintId)
       setBlueprints(next)
       writeSavedBlueprints(next)
@@ -1491,253 +1565,275 @@ export function AgentWorkspace({
     ]
   )
 
-  const handleRunPreview = useCallback((mode: AgentPreviewRunMode = 'default') => {
-    const isManualPreview = mode === 'manual'
+  const handleRunPreview = useCallback(
+    (mode: AgentPreviewRunMode = 'default') => {
+      const isManualPreview = mode === 'manual'
+      if (
+        (isManualPreview || !hasScheduledBlueprint) &&
+        !hasManualTriggerNode(nodes)
+      ) {
+        return
+      }
 
-    if (currentBlueprintStatus === 'paused' && !isManualPreview) {
-      const currentBlueprint = blueprints.find(
-        (item) => item.id === currentBlueprintId
-      )
-      if (currentBlueprint?.backendAgentId && currentBlueprint.backendBlueprintId) {
-        void resumeBlueprint(
-          currentBlueprint.backendAgentId,
-          currentBlueprint.backendBlueprintId
+      if (currentBlueprintStatus === 'paused' && !isManualPreview) {
+        const currentBlueprint = blueprints.find(
+          (item) => item.id === currentBlueprintId
         )
-          .then((backendBlueprint) => {
-            setBlueprints((current) => {
-              const next = current.map((item) =>
-                item.id === currentBlueprint.id
-                  ? { ...item, status: backendBlueprint.status ?? 'running' }
-                  : item
+        if (
+          currentBlueprint?.backendAgentId &&
+          currentBlueprint.backendBlueprintId
+        ) {
+          void resumeBlueprint(
+            currentBlueprint.backendAgentId,
+            currentBlueprint.backendBlueprintId
+          )
+            .then((backendBlueprint) => {
+              setBlueprints((current) => {
+                const next = current.map((item) =>
+                  item.id === currentBlueprint.id
+                    ? { ...item, status: backendBlueprint.status ?? 'running' }
+                    : item
+                )
+                writeSavedBlueprints(next)
+                notifyAgentBlueprintsChanged()
+                return next
+              })
+              persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
+              toast.success('定时蓝图已继续运行')
+            })
+            .catch((error) => {
+              toast.error(
+                error instanceof Error
+                  ? `继续失败: ${error.message}`
+                  : '继续失败'
               )
+            })
+          return
+        }
+        persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
+        toast.success('定时蓝图已继续运行')
+        return
+      }
+
+      const prepared = ensureTerminalStopNode(nodes, edges, templateByKind)
+      const runGraph = isManualPreview
+        ? buildManualPreviewGraph(prepared.nodes, prepared.edges)
+        : { nodes: prepared.nodes, edges: prepared.edges }
+      const runExecutionNodes = orderNodes(runGraph.nodes, runGraph.edges)
+      if (runExecutionNodes.length === 0) return
+
+      cancelPreviewRun()
+      const runId = previewRunIdRef.current
+      const statusAfterManualPreview: AgentBlueprintStatus | undefined =
+        isManualPreview && hasScheduledBlueprint
+          ? currentBlueprintStatus === 'paused'
+            ? 'paused'
+            : 'running'
+          : undefined
+
+      if (prepared.changed) {
+        setEdges(prepared.edges)
+      }
+
+      const backendBlueprint: SavedAgentBlueprint = {
+        id: currentBlueprintId ?? `blueprint-${Date.now()}`,
+        title: blueprintTitle.trim() || '未命名蓝图',
+        nodes: stripTransientNodeSettings(runGraph.nodes),
+        edges: runGraph.edges,
+        createdAt:
+          blueprints.find((item) => item.id === currentBlueprintId)
+            ?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+        status: 'running',
+        executionLog,
+        backendAgentId: blueprints.find(
+          (item) => item.id === currentBlueprintId
+        )?.backendAgentId,
+        backendBlueprintId: blueprints.find(
+          (item) => item.id === currentBlueprintId
+        )?.backendBlueprintId,
+      }
+      void runSavedBlueprintOnBackend(
+        backendBlueprint,
+        isManualPreview
+          ? { forceCreate: true, triggerMode: 'manual' }
+          : undefined
+      )
+        .then(async (synced) => {
+          if (!synced) return
+          if (previewRunIdRef.current !== runId) return
+          if (!isManualPreview) {
+            setBlueprints((current) => {
+              const exists = current.some((item) => item.id === synced.id)
+              const next = exists
+                ? current.map((item) =>
+                    item.id === synced.id
+                      ? {
+                          ...item,
+                          backendAgentId: synced.backendAgentId,
+                          backendBlueprintId: synced.backendBlueprintId,
+                        }
+                      : item
+                  )
+                : [synced, ...current]
               writeSavedBlueprints(next)
               notifyAgentBlueprintsChanged()
               return next
             })
-            persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
-            toast.success('定时蓝图已继续运行')
-          })
-          .catch((error) => {
-            toast.error(
-              error instanceof Error ? `继续失败: ${error.message}` : '继续失败'
-            )
-          })
-        return
-      }
-      persistCurrentBlueprintSnapshot(nodes, executionLog, 'running')
-      toast.success('定时蓝图已继续运行')
-      return
-    }
-
-    const prepared = ensureTerminalStopNode(nodes, edges, templateByKind)
-    const runGraph = isManualPreview
-      ? buildManualPreviewGraph(prepared.nodes, prepared.edges)
-      : { nodes: prepared.nodes, edges: prepared.edges }
-    const runExecutionNodes = orderNodes(runGraph.nodes, runGraph.edges)
-    if (runExecutionNodes.length === 0) return
-
-    cancelPreviewRun()
-    const runId = previewRunIdRef.current
-    const statusAfterManualPreview: AgentBlueprintStatus | undefined =
-      isManualPreview && hasScheduledBlueprint
-        ? currentBlueprintStatus === 'paused'
-          ? 'paused'
-          : 'running'
-        : undefined
-
-    if (prepared.changed) {
-      setEdges(prepared.edges)
-    }
-
-    const backendBlueprint: SavedAgentBlueprint = {
-      id: currentBlueprintId ?? `blueprint-${Date.now()}`,
-      title: blueprintTitle.trim() || '未命名蓝图',
-      nodes: stripTransientNodeSettings(runGraph.nodes),
-      edges: runGraph.edges,
-      createdAt:
-        blueprints.find((item) => item.id === currentBlueprintId)?.createdAt ??
-        Date.now(),
-      updatedAt: Date.now(),
-      status: 'running',
-      executionLog,
-      backendAgentId: blueprints.find((item) => item.id === currentBlueprintId)
-        ?.backendAgentId,
-      backendBlueprintId: blueprints.find(
-        (item) => item.id === currentBlueprintId
-      )?.backendBlueprintId,
-    }
-    void runSavedBlueprintOnBackend(
-      backendBlueprint,
-      isManualPreview
-        ? { forceCreate: true, triggerMode: 'manual' }
-        : undefined
-    )
-      .then(async (synced) => {
-        if (!synced) return
-        if (previewRunIdRef.current !== runId) return
-        if (!isManualPreview) {
-          setBlueprints((current) => {
-            const exists = current.some((item) => item.id === synced.id)
-            const next = exists
-              ? current.map((item) =>
-                  item.id === synced.id
-                    ? {
-                        ...item,
-                        backendAgentId: synced.backendAgentId,
-                        backendBlueprintId: synced.backendBlueprintId,
-                      }
-                    : item
+          }
+          if (synced.backendAgentId && synced.backendBlueprintId) {
+            try {
+              const logs = await pollBackendExecutionLogs(
+                synced.backendAgentId,
+                synced.backendBlueprintId,
+                () => previewRunIdRef.current === runId
+              )
+              const latestLog = logs[0]
+              if (previewRunIdRef.current !== runId) return
+              if (latestLog) {
+                applyBackendExecutionLogToPreview(
+                  latestLog,
+                  runExecutionNodes,
+                  runGraph.edges,
+                  statusAfterManualPreview,
+                  prepared.edges
                 )
-              : [synced, ...current]
-            writeSavedBlueprints(next)
-            notifyAgentBlueprintsChanged()
-            return next
-          })
-        }
-        if (synced.backendAgentId && synced.backendBlueprintId) {
-          try {
-            const logs = await pollBackendExecutionLogs(
-              synced.backendAgentId,
-              synced.backendBlueprintId
-            )
-            const latestLog = logs[0]
-            if (previewRunIdRef.current !== runId) return
-            if (latestLog) {
-              applyBackendExecutionLogToPreview(
-                latestLog,
-                runExecutionNodes,
-                runGraph.edges,
-                statusAfterManualPreview,
-                prepared.edges
+              }
+            } catch (error) {
+              toast.error(
+                error instanceof Error
+                  ? `后端执行日志同步失败: ${error.message}`
+                  : '后端执行日志同步失败'
               )
             }
-          } catch (error) {
-            toast.error(
-              error instanceof Error
-                ? `后端执行日志同步失败: ${error.message}`
-                : '后端执行日志同步失败'
-            )
           }
-        }
-      })
-      .catch((error) => {
-        if (previewRunIdRef.current !== runId) return
-        const message =
-          error instanceof Error ? error.message : '后端正式运行触发失败'
-        const statusById = new Map<string, AgentNodeStatus>()
-        runExecutionNodes.forEach((node, index) => {
-          statusById.set(node.id, index === 0 ? 'failed' : 'waiting')
         })
-        const failedLog = buildPreviewExecutionLog(
-          runExecutionNodes,
-          statusById,
-          skillChoices,
-          runGraph.edges
-        )
-        const firstNode = runExecutionNodes[0]
-        if (firstNode) {
-          failedLog[firstNode.id] = {
-            ...failedLog[firstNode.id],
-            status: 'failed',
-            message: '后端正式运行触发失败。',
-            error: message,
-          }
-        }
-        setExecutionLog(failedLog)
-        setNodes((current) => {
-          const nextNodes = current.map((node) => ({
-            ...node,
-            data: {
-              ...node.data,
-              status: statusById.get(node.id) ?? node.data.status,
-            },
-          }))
-          persistCurrentBlueprintSnapshot(
-            stripTransientNodeSettings(nextNodes),
-            failedLog,
-            statusAfterManualPreview ?? 'failed',
-            prepared.edges
+        .catch((error) => {
+          if (previewRunIdRef.current !== runId) return
+          const message =
+            error instanceof Error ? error.message : '后端正式运行触发失败'
+          const statusById = new Map<string, AgentNodeStatus>()
+          runExecutionNodes.forEach((node, index) => {
+            statusById.set(node.id, index === 0 ? 'failed' : 'waiting')
+          })
+          const failedLog = buildPreviewExecutionLog(
+            runExecutionNodes,
+            statusById,
+            skillChoices,
+            runGraph.edges
           )
-          return nextNodes
+          const firstNode = runExecutionNodes[0]
+          if (firstNode) {
+            failedLog[firstNode.id] = {
+              ...failedLog[firstNode.id],
+              status: 'failed',
+              message: '后端正式运行触发失败。',
+              error: message,
+            }
+          }
+          setExecutionLog(failedLog)
+          setNodes((current) => {
+            const nextNodes = current.map((node) => ({
+              ...node,
+              data: {
+                ...node.data,
+                status: statusById.get(node.id) ?? node.data.status,
+              },
+            }))
+            persistCurrentBlueprintSnapshot(
+              stripTransientNodeSettings(nextNodes),
+              failedLog,
+              statusAfterManualPreview ?? 'failed',
+              prepared.edges
+            )
+            return nextNodes
+          })
+          toast.error(
+            error instanceof Error
+              ? `后端正式运行触发失败: ${error.message}`
+              : '后端正式运行触发失败'
+          )
         })
-        toast.error(
-          error instanceof Error
-            ? `后端正式运行触发失败: ${error.message}`
-            : '后端正式运行触发失败'
-        )
-      })
 
-    const initialStatusById = buildPreviewStatusMap(runExecutionNodes, -1)
-    const initialExecutionLog = buildPreviewExecutionLog(
-      runExecutionNodes,
-      initialStatusById,
-      skillChoices,
-      runGraph.edges
-    )
-    setExecutionLog(initialExecutionLog)
-    setNodes((current) => {
-      const activeNodeById = new Map(
-        runExecutionNodes.map((node) => [node.id, node])
+      const initialStatusById = buildPreviewStatusMap(runExecutionNodes, -1)
+      const initialExecutionLog = buildPreviewExecutionLog(
+        runExecutionNodes,
+        initialStatusById,
+        skillChoices,
+        runGraph.edges
       )
-      const currentById = new Map(current.map((node) => [node.id, node]))
-      const nextNodes = current.map((node) => {
-        const activeNode = activeNodeById.get(node.id)
-        const status = initialStatusById.get(node.id)
-        if (!activeNode && !status) return node
-        return {
-          ...(activeNode ?? node),
-          data: {
-            ...(activeNode?.data ?? node.data),
-            status: status ?? activeNode?.data.status ?? node.data.status,
-          },
-        }
-      })
-      runExecutionNodes.forEach((activeNode) => {
-        if (currentById.has(activeNode.id)) return
-        nextNodes.push({
-          ...activeNode,
-          data: {
-            ...activeNode.data,
-            status: initialStatusById.get(activeNode.id) ?? activeNode.data.status,
-          },
+      setExecutionLog(initialExecutionLog)
+      setNodes((current) => {
+        const activeNodeById = new Map(
+          runExecutionNodes.map((node) => [node.id, node])
+        )
+        const currentById = new Map(current.map((node) => [node.id, node]))
+        const nextNodes = current.map((node) => {
+          const activeNode = activeNodeById.get(node.id)
+          const status = initialStatusById.get(node.id)
+          if (!activeNode && !status) return node
+          return {
+            ...(activeNode ?? node),
+            data: {
+              ...(activeNode?.data ?? node.data),
+              status: status ?? activeNode?.data.status ?? node.data.status,
+            },
+          }
         })
+        runExecutionNodes.forEach((activeNode) => {
+          if (currentById.has(activeNode.id)) return
+          nextNodes.push({
+            ...activeNode,
+            data: {
+              ...activeNode.data,
+              status:
+                initialStatusById.get(activeNode.id) ?? activeNode.data.status,
+            },
+          })
+        })
+        persistCurrentBlueprintSnapshot(
+          stripTransientNodeSettings(nextNodes),
+          initialExecutionLog,
+          statusAfterManualPreview ?? 'running',
+          prepared.edges
+        )
+        return nextNodes
       })
-      persistCurrentBlueprintSnapshot(
-        stripTransientNodeSettings(nextNodes),
-        initialExecutionLog,
-        statusAfterManualPreview ?? 'running',
-        prepared.edges
-      )
-      return nextNodes
-    })
-  }, [
-    applyBackendExecutionLogToPreview,
-    blueprintTitle,
-    blueprints,
-    cancelPreviewRun,
-    currentBlueprintId,
-    currentBlueprintStatus,
-    edges,
-    executionLog,
-    hasScheduledBlueprint,
-    nodes,
-    pollBackendExecutionLogs,
-    persistCurrentBlueprintSnapshot,
-    skillChoices,
-    templateByKind,
-  ])
+    },
+    [
+      applyBackendExecutionLogToPreview,
+      blueprintTitle,
+      blueprints,
+      cancelPreviewRun,
+      currentBlueprintId,
+      currentBlueprintStatus,
+      edges,
+      executionLog,
+      hasScheduledBlueprint,
+      nodes,
+      pollBackendExecutionLogs,
+      persistCurrentBlueprintSnapshot,
+      skillChoices,
+      templateByKind,
+    ]
+  )
 
   const handleStopPreview = useCallback(() => {
     const currentBlueprint = blueprints.find(
       (item) => item.id === currentBlueprintId
     )
-    if (currentBlueprint?.backendAgentId && currentBlueprint.backendBlueprintId) {
+    if (
+      currentBlueprint?.backendAgentId &&
+      currentBlueprint.backendBlueprintId
+    ) {
       void pauseBlueprint(
         currentBlueprint.backendAgentId,
         currentBlueprint.backendBlueprintId
       ).catch((error) => {
         toast.error(
-          error instanceof Error ? `暂停后端蓝图失败: ${error.message}` : '暂停后端蓝图失败'
+          error instanceof Error
+            ? `暂停后端蓝图失败: ${error.message}`
+            : '暂停后端蓝图失败'
         )
       })
     }
@@ -1817,9 +1913,7 @@ export function AgentWorkspace({
         void reloadSkills()
         toast.success('Skill 已安装')
       } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : 'Skill 安装失败'
-        )
+        toast.error(error instanceof Error ? error.message : 'Skill 安装失败')
         throw error
       }
     },
@@ -1838,9 +1932,7 @@ export function AgentWorkspace({
         void reloadSkills()
         toast.success('Skill 已删除')
       } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : 'Skill 删除失败'
-        )
+        toast.error(error instanceof Error ? error.message : 'Skill 删除失败')
         throw error
       }
     },
@@ -1868,7 +1960,10 @@ export function AgentWorkspace({
   }, [])
 
   const handleAddNode = useCallback(
-    (templateKey: AgentNodeKind | string, position?: { x: number; y: number }) => {
+    (
+      templateKey: AgentNodeKind | string,
+      position?: { x: number; y: number }
+    ) => {
       const template =
         templateById.get(templateKey) ??
         templateByKind.get(templateKey as AgentNodeKind)
@@ -1973,6 +2068,11 @@ export function AgentWorkspace({
         return
       }
 
+      if (command.type === 'delete') {
+        void handleDeleteBlueprint(command.id)
+        return
+      }
+
       const blueprint = readSavedBlueprints().find(
         (item) => item.id === command.id
       )
@@ -1988,7 +2088,12 @@ export function AgentWorkspace({
         currentBlueprintId &&
         !next.some((blueprint) => blueprint.id === currentBlueprintId)
       ) {
-        handleDeleteBlueprint(currentBlueprintId)
+        const fallback = next[0]
+        if (fallback) {
+          handleLoadBlueprint(fallback)
+        } else {
+          handleNewBlueprint()
+        }
       }
     }
 
@@ -2000,7 +2105,6 @@ export function AgentWorkspace({
     }
   }, [
     currentBlueprintId,
-    handleDeleteBlueprint,
     handleLoadBlueprint,
     handleNewBlueprint,
   ])
@@ -2052,6 +2156,7 @@ export function AgentWorkspace({
         search={search}
         selectedNode={selectedNode}
         currentBlueprintId={currentBlueprintId}
+        hasManualTrigger={hasManualTrigger}
         hasScheduledBlueprint={hasScheduledBlueprint}
       />
     </ReactFlowProvider>
@@ -2079,6 +2184,7 @@ type BlueprintWorkspaceProps = {
   currentBlueprintStatus: AgentBlueprintStatus
   currentBlueprintId: string | null
   currentGroup?: string
+  hasManualTrigger: boolean
   hasScheduledBlueprint: boolean
   lastSavedAt: number | null
   search: string
@@ -2087,7 +2193,10 @@ type BlueprintWorkspaceProps = {
   onEdgesChange: (changes: EdgeChange<AgentFlowEdge>[]) => void
   onConnect: (connection: Connection) => void
   onSelectNode: (nodeId: string) => void
-  onAddNode: (templateKey: AgentNodeKind | string, position?: { x: number; y: number }) => void
+  onAddNode: (
+    templateKey: AgentNodeKind | string,
+    position?: { x: number; y: number }
+  ) => void
   onDeleteNode: (nodeId: string) => void
   onDeleteEdge: (edgeId: string) => void
   onTitleChange: (value: string) => void
@@ -2127,6 +2236,7 @@ function BlueprintWorkspace({
   currentBlueprintStatus,
   currentBlueprintId,
   currentGroup,
+  hasManualTrigger,
   hasScheduledBlueprint,
   lastSavedAt,
   search,
@@ -2291,14 +2401,16 @@ function BlueprintWorkspace({
                         <PauseIcon className='size-3.5' />
                       </CanvasToolbarButton>
                     )}
-                    <CanvasToolbarButton
-                      label='手动试运行'
-                      onClick={() => onRunPreview('manual')}
-                    >
-                      <ZapIcon className='size-3.5' />
-                    </CanvasToolbarButton>
+                    {hasManualTrigger && (
+                      <CanvasToolbarButton
+                        label='立即运行一次'
+                        onClick={() => onRunPreview('manual')}
+                      >
+                        <ZapIcon className='size-3.5' />
+                      </CanvasToolbarButton>
+                    )}
                   </>
-                ) : currentBlueprintStatus === 'running' ? (
+                ) : hasManualTrigger && currentBlueprintStatus === 'running' ? (
                   <CanvasToolbarButton
                     label='停止'
                     variant='destructive'
@@ -2306,14 +2418,14 @@ function BlueprintWorkspace({
                   >
                     <StopCircleIcon className='size-3.5' />
                   </CanvasToolbarButton>
-                ) : (
+                ) : hasManualTrigger ? (
                   <CanvasToolbarButton
                     label={getRunPreviewButtonLabel(currentBlueprintStatus)}
                     onClick={() => onRunPreview()}
                   >
                     <ZapIcon className='size-3.5' />
                   </CanvasToolbarButton>
-                )}
+                ) : null}
               </div>
             </TooltipProvider>
           </div>
@@ -2382,9 +2494,9 @@ function BlueprintWorkspace({
 
         <div className='pointer-events-none absolute inset-x-0 bottom-0 z-20'>
           <div className='pointer-events-auto'>
-        <ExecutionPreviewDock
-          backendExecutionLogs={backendExecutionLogs}
-          executionLog={executionLog}
+            <ExecutionPreviewDock
+              backendExecutionLogs={backendExecutionLogs}
+              executionLog={executionLog}
               executionNodes={executionNodes}
               isOpen={isPreviewOpen}
               selectedNode={selectedNode}
@@ -2396,7 +2508,7 @@ function BlueprintWorkspace({
         </div>
       </div>
 
-      <aside className='border-border/70 bg-background hidden w-[333px] shrink-0 flex-col border-l xl:flex'>
+      <aside className='border-border/70 bg-background hidden w-[333px] min-w-0 shrink-0 flex-col overflow-hidden border-l xl:flex'>
         <Inspector
           blueprintId={currentBlueprintId}
           currentGroup={currentGroup}
@@ -2449,7 +2561,7 @@ function Palette({
   onPanelChange: (panel: AgentToolPanel) => void
 }) {
   return (
-    <div className='flex min-h-0 flex-1 flex-col'>
+    <div className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
       <Tabs defaultValue='components' className='flex min-h-0 flex-1 flex-col'>
         {/* 顶部：标题 + Tab 导航 */}
         <div className='border-border/70 shrink-0 border-b px-3 pt-3'>
@@ -2875,7 +2987,10 @@ function PaletteItem({
             }
           }}
           onKeyDown={(event) => {
-            if ((event.key === 'Enter' || event.key === ' ') && template.componentId) {
+            if (
+              (event.key === 'Enter' || event.key === ' ') &&
+              template.componentId
+            ) {
               event.stopPropagation()
               void onDeleteComponent(template.componentId)
             }
@@ -3238,9 +3353,9 @@ function Inspector({
         </div>
       </div>
 
-      <div className='min-h-0 flex-1 overflow-y-auto'>
+      <div className='min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto'>
         {selectedNode ? (
-          <div className='space-y-4 p-3'>
+          <div className='min-w-0 space-y-4 overflow-hidden p-3'>
             <NodeConfigPanel
               blueprintId={blueprintId}
               currentGroup={currentGroup}
@@ -3340,7 +3455,8 @@ function ExecutionLogPanel({
                       'bg-emerald-500/12 text-emerald-700',
                     logStatus === 'pending' && 'bg-amber-500/12 text-amber-700',
                     logStatus === 'stopped' && 'bg-slate-500/12 text-slate-700',
-                    logStatus === 'failed' && 'bg-destructive/10 text-destructive'
+                    logStatus === 'failed' &&
+                      'bg-destructive/10 text-destructive'
                   )}
                 >
                   {formatLogStatus(logStatus)}
@@ -3630,13 +3746,11 @@ function buildBackendExecutionPreview(
   log: AgentExecutionLog,
   executionNodes: AgentFlowNode[],
   edges: AgentFlowEdge[]
-):
-  | {
-      executionLog: AgentExecutionLogMap
-      statusById: Map<string, AgentNodeStatus>
-      blueprintStatus: AgentBlueprintStatus
-    }
-  | null {
+): {
+  executionLog: AgentExecutionLogMap
+  statusById: Map<string, AgentNodeStatus>
+  blueprintStatus: AgentBlueprintStatus
+} | null {
   const graph = parseBackendGraphOutput(log.output)
   if (!graph || !Array.isArray(graph.nodes)) return null
 
@@ -3672,7 +3786,9 @@ function buildBackendExecutionPreview(
   }
 }
 
-function parseBackendGraphOutput(value: unknown): BackendAgentGraphOutput | null {
+function parseBackendGraphOutput(
+  value: unknown
+): BackendAgentGraphOutput | null {
   const parsed =
     typeof value === 'string'
       ? parseMaybeJSON(value)
@@ -3783,7 +3899,9 @@ function backendInputSummary(
     }
   }
   if (summaries.length === 0 && upstreamLogs.length > 0) {
-    summaries.push(`上游日志: ${upstreamLogs.map((log) => log.nodeId).join('、')}`)
+    summaries.push(
+      `上游日志: ${upstreamLogs.map((log) => log.nodeId).join('、')}`
+    )
   }
   if (summaries.length === 0 && input !== undefined && input !== null) {
     summaries.push(truncateText(formatBackendValue(input), 180))
@@ -3828,7 +3946,9 @@ function backendOutputSummary(result: BackendAgentNodeResult) {
   }
   if (summaries.length === 0) {
     const keys = Object.keys(output)
-    summaries.push(keys.length > 0 ? `输出字段: ${keys.join('、')}` : '无显式输出')
+    summaries.push(
+      keys.length > 0 ? `输出字段: ${keys.join('、')}` : '无显式输出'
+    )
   }
   return summaries
 }
@@ -3878,6 +3998,7 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     transform: 980,
     image: 2600,
     report: 1600,
+    report_data: 5200,
     webpage: 1400,
     notify: 720,
     stop: 240,
@@ -3981,7 +4102,9 @@ function buildNodeOutputSummary(
   }
 
   if (
-    (node.data.kind === 'transform' || node.data.kind === 'report') &&
+    (node.data.kind === 'transform' ||
+      node.data.kind === 'report' ||
+      node.data.kind === 'report_data') &&
     hasMissingBrowserData(upstreamLogs) &&
     status === 'completed'
   ) {
@@ -4105,6 +4228,15 @@ function buildNodeModelOutput(
         ...previewPaths.map((path) => `预览文件: ${path}`),
       ].join('\n')
     }
+    case 'report_data':
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '处理方式: 读取上游日报模板计划并复用浏览器登录会话。',
+        `采集周期: ${node.data.settings['采集周期'] || '近1天'}`,
+        `最大页数: ${node.data.settings['最大页数'] || '10'}`,
+        '输出: 商品明细、曝光/支付/转化排行及最终日报文件。',
+        '限制: 仅执行只读页面采集，不发布商品、不修改数据、不执行交易操作。',
+      ].join('\n')
     case 'webpage': {
       const templateBindings = parseTemplateBindings(
         node.data.settings['网页模板'] || '',
@@ -4170,7 +4302,8 @@ function buildRequestNodeModelOutput(node: AgentFlowNode, skillLine: string) {
   const response = node.data.settings[HTTP_RESPONSE_SETTING] || ''
   const statusCode = node.data.settings[HTTP_STATUS_SETTING] || ''
   const error = node.data.settings[HTTP_ERROR_SETTING] || ''
-  const finalUrl = node.data.settings['HTTP 最终网址'] || node.data.settings['网址'] || ''
+  const finalUrl =
+    node.data.settings['HTTP 最终网址'] || node.data.settings['网址'] || ''
   const contentType = node.data.settings['HTTP 内容类型'] || ''
   const duration = node.data.settings['HTTP 耗时'] || ''
 
@@ -4515,6 +4648,12 @@ function buildNodeLogSteps(
     steps.push(`生成日报预览；正式执行时写入输出目录: ${outputDir}`)
   }
 
+  if (node.data.kind === 'report_data') {
+    steps.push('读取上游日报模板中的工作表、表头和采集字段。')
+    steps.push('复用浏览器登录会话，重新进入商品数据页并按页采集。')
+    steps.push('计算商品排行并将结构化数据写回日报模板。')
+  }
+
   if (node.data.kind === 'webpage') {
     const templateBindings = parseTemplateBindings(
       node.data.settings['网页模板'] || '',
@@ -4551,7 +4690,10 @@ function buildNodeLogSteps(
 function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
   if (status === 'completed') {
     if (node.data.kind === 'report') {
-      return `${node.data.title} 已生成日报预览；正式执行时会写入输出目录。`
+      return `${node.data.title} 已解析日报模板并生成数据采集计划。`
+    }
+    if (node.data.kind === 'report_data') {
+      return `${node.data.title} 已重新采集数据并输出最终日报。`
     }
     if (node.data.kind === 'stop') {
       return `${node.data.title} 已完成流程结束动作，输出目录以上游节点配置为准。`
@@ -4664,22 +4806,43 @@ function NodeCommonConfig({
 }) {
   const meta = NODE_META[node.data.kind]
   const Icon = meta.icon
-  const modelExists = modelChoices.some(
-    (model) => model.value === node.data.model
-  )
-  const choices = modelExists
-    ? modelChoices
-    : [
-        {
-          label: node.data.model,
-          value: node.data.model,
-          source: 'current' as const,
-        },
-        ...modelChoices,
-      ]
-  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
   const selectedGroup =
     node.data.group || currentGroup || groupChoices[0]?.value || 'default'
+  const { data: selectedGroupModels, isFetching: isFetchingGroupModels } =
+    useQuery({
+      queryKey: ['playground-models', selectedGroup],
+      queryFn: () => getUserModels(selectedGroup),
+      staleTime: 30_000,
+    })
+  const choices = useMemo(
+    () =>
+      selectedGroupModels
+        ? buildModelChoices(selectedGroupModels)
+        : selectedGroup === currentGroup
+          ? modelChoices
+          : [],
+    [currentGroup, modelChoices, selectedGroup, selectedGroupModels]
+  )
+  const selectedModelValue = choices.some(
+    (model) => model.value === node.data.model
+  )
+    ? node.data.model
+    : ''
+  const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
+
+  useEffect(() => {
+    if (selectedGroupModels === undefined) return
+    const nextModel = choices[0]?.value ?? ''
+    if (node.data.model !== nextModel && !selectedModelValue) {
+      onUpdateNode({ model: nextModel })
+    }
+  }, [
+    choices,
+    node.data.model,
+    onUpdateNode,
+    selectedGroupModels,
+    selectedModelValue,
+  ])
 
   return (
     <div className='space-y-3'>
@@ -4726,7 +4889,9 @@ function NodeCommonConfig({
           <NativeSelect
             size='sm'
             value={selectedGroup}
-            onChange={(event) => onUpdateNode({ group: event.target.value })}
+            onChange={(event) =>
+              onUpdateNode({ group: event.target.value, model: '' })
+            }
             className='w-full'
           >
             {groupChoices.map((group) => (
@@ -4740,37 +4905,25 @@ function NodeCommonConfig({
         <CompactField label='模型'>
           <NativeSelect
             size='sm'
-            value={node.data.model}
+            value={selectedModelValue}
             onChange={(event) => onUpdateNode({ model: event.target.value })}
             className='w-full'
           >
-            <NativeSelectOptGroup label={`节点分组: ${selectedGroup}`}>
-              {choices
-                .filter((model) => model.source === 'current')
-                .map((model) => (
+            {choices.length > 0 ? (
+              <NativeSelectOptGroup label={`渠道模型: ${selectedGroup}`}>
+                {choices.map((model) => (
                   <NativeSelectOption key={model.value} value={model.value}>
                     {model.label}
                   </NativeSelectOption>
                 ))}
-            </NativeSelectOptGroup>
-            <NativeSelectOptGroup label='系统执行器'>
-              {choices
-                .filter((model) => model.source === 'system')
-                .map((model) => (
-                  <NativeSelectOption key={model.value} value={model.value}>
-                    {model.label}
-                  </NativeSelectOption>
-                ))}
-            </NativeSelectOptGroup>
-            <NativeSelectOptGroup label='备用模型'>
-              {choices
-                .filter((model) => model.source === 'fallback')
-                .map((model) => (
-                  <NativeSelectOption key={model.value} value={model.value}>
-                    {model.label}
-                  </NativeSelectOption>
-                ))}
-            </NativeSelectOptGroup>
+              </NativeSelectOptGroup>
+            ) : (
+              <NativeSelectOption value='' disabled>
+                {isFetchingGroupModels
+                  ? '正在加载模型...'
+                  : '该分组暂无可用模型'}
+              </NativeSelectOption>
+            )}
           </NativeSelect>
         </CompactField>
 
@@ -4984,7 +5137,9 @@ function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
           归档 {log.archive_path}
         </span>
       )}
-      {log.error_msg && <span className='min-w-0 truncate'>{log.error_msg}</span>}
+      {log.error_msg && (
+        <span className='min-w-0 truncate'>{log.error_msg}</span>
+      )}
     </div>
   )
 }
@@ -5566,41 +5721,61 @@ function SettingControl({
                 </div>
               </div>
             ) : (
-              <div className='space-y-1.5'>
-                {bindings.map((binding) => (
-                  <div
-                    key={binding.path}
-                    className='border-border/60 bg-background/80 flex max-w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2'
-                  >
-                    <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-[6px]'>
-                      <FileTextIcon className='size-4' />
-                    </span>
-                    <div className='min-w-0 flex-1 overflow-hidden'>
-                      <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
-                        {binding.originalName}
-                      </div>
-                      <div className='text-muted-foreground max-w-full truncate overflow-hidden text-[11px] whitespace-nowrap'>
-                        {binding.path}
-                      </div>
-                    </div>
-                    <Button
-                      type='button'
-                      size='icon-sm'
-                      variant='ghost'
-                      className='size-7 shrink-0 rounded-[6px]'
-                      title='移除模板'
-                      onClick={() =>
-                        applyTemplateBindings(
-                          bindings.filter((item) => item.path !== binding.path)
-                        )
-                      }
+              <TooltipProvider delay={250}>
+                <div className='min-w-0 space-y-1.5 overflow-hidden'>
+                  {bindings.map((binding) => (
+                    <div
+                      key={binding.path}
+                      className='border-border/60 bg-background/80 grid w-full min-w-0 grid-cols-[2rem_minmax(0,1fr)_1.75rem] items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2'
                     >
-                      <XIcon className='size-3.5' />
-                      <span className='sr-only'>移除模板</span>
-                    </Button>
-                  </div>
-                ))}
-              </div>
+                      <span className='bg-muted text-muted-foreground flex size-8 items-center justify-center rounded-[6px]'>
+                        <FileTextIcon className='size-4' />
+                      </span>
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <div className='min-w-0 cursor-default overflow-hidden' />
+                          }
+                        >
+                          <div className='truncate text-xs font-medium'>
+                            {binding.originalName}
+                          </div>
+                          <div className='text-muted-foreground truncate text-[11px]'>
+                            {binding.path}
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent
+                          side='left'
+                          align='center'
+                          className='block max-w-80 space-y-1 break-all'
+                        >
+                          <div className='font-medium'>
+                            {binding.originalName}
+                          </div>
+                          <div className='opacity-80'>{binding.path}</div>
+                        </TooltipContent>
+                      </Tooltip>
+                      <Button
+                        type='button'
+                        size='icon-sm'
+                        variant='ghost'
+                        className='size-7 justify-self-end rounded-[6px]'
+                        title='移除模板'
+                        onClick={() =>
+                          applyTemplateBindings(
+                            bindings.filter(
+                              (item) => item.path !== binding.path
+                            )
+                          )
+                        }
+                      >
+                        <XIcon className='size-3.5' />
+                        <span className='sr-only'>移除模板</span>
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </TooltipProvider>
             )}
           </div>
 
@@ -5670,7 +5845,7 @@ function SettingControl({
                       <button
                         key={template.path}
                         type='button'
-                        className='border-border/60 bg-background/80 hover:bg-accent/50 flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2 text-left'
+                        className='border-border/60 bg-background/80 hover:bg-accent/50 grid w-full min-w-0 grid-cols-[2rem_minmax(0,1fr)_auto] items-center gap-2 overflow-hidden rounded-[7px] border px-2.5 py-2 text-left'
                         onClick={() =>
                           applyTemplateBindings(
                             mergeTemplateBindings(bindings, [
@@ -5682,11 +5857,14 @@ function SettingControl({
                         <span className='bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-[6px]'>
                           <FileTextIcon className='size-4' />
                         </span>
-                        <div className='min-w-0 flex-1 overflow-hidden'>
-                          <div className='max-w-full truncate overflow-hidden text-xs font-medium whitespace-nowrap'>
+                        <div
+                          className='min-w-0 overflow-hidden'
+                          title={`${template.original_name || template.filename}\n${template.path}`}
+                        >
+                          <div className='truncate text-xs font-medium'>
                             {template.original_name || template.filename}
                           </div>
-                          <div className='text-muted-foreground max-w-full truncate overflow-hidden text-[11px] whitespace-nowrap'>
+                          <div className='text-muted-foreground truncate text-[11px]'>
                             {template.path}
                           </div>
                         </div>
@@ -5809,7 +5987,9 @@ function SettingControl({
         <Textarea
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          placeholder={'select id, title, amount\nfilter amount>0\nsort -amount\nlimit 20'}
+          placeholder={
+            'select id, title, amount\nfilter amount>0\nsort -amount\nlimit 20'
+          }
           className='min-h-32 rounded-[8px] font-mono text-xs'
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
@@ -5925,9 +6105,8 @@ function SkillManagerPanel({
 }) {
   const [activeTab, setActiveTab] = useState<SkillDraftSource>('github')
   const [githubUrl, setGithubUrl] = useState('')
-  const [skillStores, setSkillStores] = useState<SkillStore[]>(
-    readSavedSkillStores
-  )
+  const [skillStores, setSkillStores] =
+    useState<SkillStore[]>(readSavedSkillStores)
   const [storeName, setStoreName] = useState('')
   const [storeUrl, setStoreUrl] = useState('')
   const [activeStore, setActiveStore] = useState<SkillStore | null>(null)
@@ -6173,7 +6352,7 @@ function SkillManagerPanel({
                   </div>
                 </button>
                 {store.builtin ? (
-                  <span className='bg-emerald-500/10 text-emerald-600 shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium'>
+                  <span className='shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[9px] font-medium text-emerald-600'>
                     默认
                   </span>
                 ) : (
@@ -6418,7 +6597,9 @@ function SkillListItem({
         disabled={submitting}
         onClick={() => {
           onSubmittingChange(skill.value)
-          void onDeleteSkill(skill.value).finally(() => onSubmittingChange(null))
+          void onDeleteSkill(skill.value).finally(() =>
+            onSubmittingChange(null)
+          )
         }}
         title='删除 Skill'
       >
@@ -6584,7 +6765,7 @@ function LabeledField({
   children: ReactNode
 }) {
   return (
-    <label className='grid gap-1.5'>
+    <label className='grid max-w-full min-w-0 gap-1.5 overflow-hidden'>
       <span className='text-muted-foreground text-xs'>{label}</span>
       {children}
     </label>
@@ -6612,29 +6793,12 @@ function FieldList({ values }: { values: string[] }) {
 }
 
 function buildModelChoices(models: ModelOption[]) {
-  const currentChoices: ModelChoice[] = models.map((model) => ({
+  const choices: ModelChoice[] = models.map((model) => ({
     label: model.label || model.value,
     value: model.value,
     description: model.description,
     supportsImage: model.supportsImage,
-    source: 'current',
   }))
-  const choices: ModelChoice[] = [
-    ...currentChoices,
-    ...MODEL_FALLBACKS.system.map((model) => ({
-      ...model,
-      source: 'system' as const,
-    })),
-    ...[
-      ...MODEL_FALLBACKS.browser,
-      ...MODEL_FALLBACKS.fast,
-      ...MODEL_FALLBACKS.reasoning,
-      ...MODEL_FALLBACKS.image,
-    ].map((model) => ({
-      ...model,
-      source: 'fallback' as const,
-    })),
-  ]
   const seen = new Set<string>()
   return choices.filter((choice) => {
     if (seen.has(choice.value)) return false
@@ -6832,7 +6996,8 @@ function getHotMarketplaceSkills(
   return skills
     .filter(
       (skill) =>
-        !skill.marketplaceId || !installedMarketplaceIds.has(skill.marketplaceId)
+        !skill.marketplaceId ||
+        !installedMarketplaceIds.has(skill.marketplaceId)
     )
     .slice(0, 6)
 }
@@ -6875,15 +7040,22 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
     return parsed
       .filter(isSavedBlueprint)
       .map((blueprint) => {
-        const nodes = normalizeSavedBlueprintNodes(
+        const normalizedNodes = normalizeSavedBlueprintNodes(
           blueprint.nodes.map((node) => normalizeNode(node)),
           blueprint.status
         )
+        const upgraded = upgradeSavedReportDataPipeline(
+          normalizedNodes,
+          blueprint.edges.map((edge) => normalizeEdge(edge))
+        )
         return {
           ...blueprint,
-          nodes,
-          edges: blueprint.edges.map((edge) => normalizeEdge(edge)),
-          status: normalizeSavedBlueprintStatus(nodes, blueprint.status),
+          nodes: upgraded.nodes,
+          edges: upgraded.edges,
+          status: normalizeSavedBlueprintStatus(
+            upgraded.nodes,
+            blueprint.status
+          ),
           executionLog: normalizeExecutionLog(blueprint.executionLog),
         }
       })
@@ -6891,6 +7063,189 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
   } catch {
     return []
   }
+}
+
+function mergeBackendBlueprints(
+  localBlueprints: SavedAgentBlueprint[],
+  backendBlueprints: Blueprint[],
+  agentId: string
+) {
+  const localById = new Map(
+    localBlueprints.map((blueprint) => [blueprint.id, blueprint])
+  )
+  const localByBackendId = new Map(
+    localBlueprints
+      .filter((blueprint) => blueprint.backendBlueprintId)
+      .map((blueprint) => [blueprint.backendBlueprintId!, blueprint])
+  )
+  const restored: SavedAgentBlueprint[] = []
+  const restoredIds = new Set<string>()
+
+  for (const backendBlueprint of [...backendBlueprints].sort(
+    (a, b) => b.updated_time - a.updated_time
+  )) {
+    if (backendBlueprintRecordType(backendBlueprint) === 'execution_snapshot') {
+      continue
+    }
+
+    const storedLocalId = backendBlueprintLocalId(backendBlueprint)
+    const local =
+      localByBackendId.get(backendBlueprint.id) ??
+      (storedLocalId ? localById.get(storedLocalId) : undefined)
+    const localId = storedLocalId ?? local?.id ?? backendBlueprint.id
+    if (restoredIds.has(localId)) continue
+
+    if (
+      local?.syncState === 'draft' &&
+      local.updatedAt > backendBlueprint.updated_time
+    ) {
+      restored.push({
+        ...local,
+        backendAgentId: agentId,
+        backendBlueprintId: backendBlueprint.id,
+      })
+    } else {
+      restored.push(
+        savedBlueprintFromBackend(backendBlueprint, agentId, localId, local)
+      )
+    }
+    restoredIds.add(localId)
+  }
+
+  for (const local of localBlueprints) {
+    if (isLocalBlueprintDraft(local) && !restoredIds.has(local.id)) {
+      restored.push({ ...local, syncState: 'draft' })
+      restoredIds.add(local.id)
+    }
+  }
+
+  return restored.sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+function isLocalBlueprintDraft(blueprint: SavedAgentBlueprint) {
+  return blueprint.syncState === 'draft' || !blueprint.backendBlueprintId
+}
+
+function savedBlueprintFromBackend(
+  backendBlueprint: Blueprint,
+  agentId: string,
+  localId: string,
+  local?: SavedAgentBlueprint
+): SavedAgentBlueprint {
+  const normalizedNodes = (backendBlueprint.nodes ?? [])
+    .filter(isSerializedAgentNode)
+    .map((node) => normalizeNode(node))
+  const normalizedEdges = (backendBlueprint.edges ?? [])
+    .filter(isSerializedAgentEdge)
+    .map((edge) => normalizeEdge(edge))
+  const upgraded = upgradeSavedReportDataPipeline(
+    normalizedNodes,
+    normalizedEdges
+  )
+  const status = normalizeSavedBlueprintStatus(
+    upgraded.nodes,
+    localBlueprintStatusFromBackend(backendBlueprint.status)
+  )
+
+  return {
+    id: localId,
+    title: backendBlueprint.name,
+    nodes: upgraded.nodes,
+    edges: upgraded.edges,
+    createdAt: backendBlueprint.created_time,
+    updatedAt: backendBlueprint.updated_time,
+    status,
+    executionLog: local?.executionLog ?? {},
+    backendAgentId: agentId,
+    backendBlueprintId: backendBlueprint.id,
+    syncState: 'synced',
+  }
+}
+
+function backendBlueprintLocalId(blueprint: Blueprint) {
+  const value = blueprint.input_variables?.local_blueprint_id
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function backendBlueprintRecordType(blueprint: Blueprint) {
+  const value = blueprint.input_variables?.record_type
+  return typeof value === 'string' ? value : undefined
+}
+
+function localBlueprintStatusFromBackend(
+  status: Blueprint['status']
+): AgentBlueprintStatus {
+  if (status === 'completed') return 'ended'
+  if (status === 'paused') return 'paused'
+  if (status === 'failed') return 'failed'
+  if (status === 'running') return 'running'
+  return 'pending'
+}
+
+function isSerializedAgentNode(value: unknown): value is AgentFlowNode {
+  if (!value || typeof value !== 'object') return false
+  const node = value as Partial<AgentFlowNode>
+  return typeof node.id === 'string' && Boolean(node.data)
+}
+
+function isSerializedAgentEdge(value: unknown): value is AgentFlowEdge {
+  if (!value || typeof value !== 'object') return false
+  const edge = value as Partial<AgentFlowEdge>
+  return typeof edge.source === 'string' && typeof edge.target === 'string'
+}
+
+function upgradeSavedReportDataPipeline(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+) {
+  if (nodes.some((node) => node.data.kind === 'report_data')) {
+    return { nodes, edges }
+  }
+  const report = nodes.find(
+    (node) =>
+      node.data.kind === 'report' &&
+      Boolean(node.data.settings['模板文件']?.trim())
+  )
+  if (!report) return { nodes, edges }
+
+  const meta = NODE_META.report_data
+  const processorId = `report-data-${report.id}`
+  const processor: AgentFlowNode = {
+    id: processorId,
+    type: 'agentNode',
+    position: { x: report.position.x + 350, y: report.position.y },
+    data: {
+      kind: 'report_data',
+      componentId: 'component.report-data',
+      title: meta.label,
+      description: meta.description,
+      group: report.data.group,
+      model: report.data.model,
+      skill: DEFAULT_SKILL_BY_NODE_KIND.report_data ?? NO_SKILL_VALUE,
+      inputs: [...meta.inputs],
+      outputs: [...meta.outputs],
+      settings: { ...meta.settings },
+      status: 'ready',
+    },
+  }
+  const outgoing = edges.filter((edge) => edge.source === report.id)
+  const retained = edges.filter((edge) => edge.source !== report.id)
+  const nextEdges = [
+    ...retained,
+    decorateEdge({
+      id: `e-${report.id}-${processorId}`,
+      source: report.id,
+      target: processorId,
+    }),
+    ...outgoing.map((edge) =>
+      decorateEdge({
+        ...edge,
+        id: `e-${processorId}-${edge.target}`,
+        source: processorId,
+      })
+    ),
+  ]
+  return { nodes: [...nodes, processor], edges: nextEdges }
 }
 
 function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
@@ -6916,16 +7271,53 @@ async function syncSavedBlueprintToBackend(
   blueprint: SavedAgentBlueprint,
   options: BackendBlueprintFormOptions = {}
 ): Promise<SavedAgentBlueprint | null> {
+  if (!options.modelsValidated) {
+    await validateAgentNodeModels(blueprint.nodes)
+  }
   const agent = await ensureCreatorStudioAgent()
   const payload = buildBackendBlueprintForm(blueprint, options)
-  const saved = blueprint.backendBlueprintId && !options.forceCreate
-    ? await updateBlueprint(agent.id, blueprint.backendBlueprintId, payload)
-    : await createBlueprint(agent.id, payload)
+  const saved =
+    blueprint.backendBlueprintId && !options.forceCreate
+      ? await updateBlueprint(agent.id, blueprint.backendBlueprintId, payload)
+      : await createBlueprint(agent.id, payload)
 
   return {
     ...blueprint,
+    createdAt: saved.created_time,
+    updatedAt: saved.updated_time,
     backendAgentId: agent.id,
     backendBlueprintId: saved.id,
+    syncState: 'synced',
+  }
+}
+
+async function validateAgentNodeModels(nodes: AgentFlowNode[]) {
+  const groups = Array.from(
+    new Set(nodes.map((node) => node.data.group?.trim() || 'default'))
+  )
+  const entries = await Promise.all(
+    groups.map(async (group) => [group, await getUserModels(group)] as const)
+  )
+  const modelsByGroup = new Map(
+    entries.map(([group, groupModels]) => [
+      group,
+      new Set(groupModels.map((model) => model.value)),
+    ])
+  )
+
+  for (const node of nodes) {
+    const group = node.data.group?.trim() || 'default'
+    const model = node.data.model.trim()
+    const availableModels = modelsByGroup.get(group)
+    if (!availableModels || availableModels.size === 0) {
+      throw new Error(`模型分组「${group}」没有可用模型`)
+    }
+    if (!model || !availableModels.has(model)) {
+      const modelLabel = model || '未选择'
+      throw new Error(
+        `节点「${node.data.title}」的模型「${modelLabel}」不属于分组「${group}」，请重新选择`
+      )
+    }
   }
 }
 
@@ -6935,6 +7327,9 @@ async function runSavedBlueprintOnBackend(
 ): Promise<SavedAgentBlueprint | null> {
   const synced = await syncSavedBlueprintToBackend(blueprint, options)
   if (!synced?.backendAgentId || !synced.backendBlueprintId) return synced
+  if (options.triggerMode !== 'manual' && hasScheduleNode(blueprint.nodes)) {
+    return synced
+  }
   await runBlueprint(synced.backendAgentId, synced.backendBlueprintId)
   return synced
 }
@@ -6956,8 +7351,7 @@ function buildBackendBlueprintForm(
   const orderedNodes = orderNodes(blueprint.nodes, blueprint.edges)
   const firstNode = orderedNodes[0]
   const firstModelNode =
-    orderedNodes.find((node) => !node.data.model.startsWith('system.')) ??
-    firstNode
+    orderedNodes.find((node) => node.data.model) ?? firstNode
   const skills = orderedNodes
     .map((node) => node.data.skill)
     .filter((skill): skill is string => Boolean(skill))
@@ -6969,9 +7363,9 @@ function buildBackendBlueprintForm(
       '创作台蓝图同步任务',
     trigger: buildBackendTriggerConfig(orderedNodes, options.triggerMode),
     model_group: firstModelNode?.data.group || 'default',
-    model_name: firstModelNode?.data.model || 'gpt-4.1-mini',
+    model_name: firstModelNode?.data.model || '',
     skills: Array.from(new Set(skills)),
-    input_variables: buildBackendInputVariables(blueprint),
+    input_variables: buildBackendInputVariables(blueprint, options),
     archive_config: {
       type: 'platform',
       triggerOn: 'success',
@@ -7014,9 +7408,13 @@ function backendFrequencyFromLabel(value?: string) {
   return 'daily'
 }
 
-function buildBackendInputVariables(blueprint: SavedAgentBlueprint) {
+function buildBackendInputVariables(
+  blueprint: SavedAgentBlueprint,
+  options: BackendBlueprintFormOptions = {}
+) {
   return {
     local_blueprint_id: blueprint.id,
+    record_type: options.forceCreate ? 'execution_snapshot' : 'blueprint',
     title: blueprint.title,
     saved_at: blueprint.updatedAt,
     nodes_count: blueprint.nodes.length,
@@ -7086,6 +7484,10 @@ function getCurrentBlueprintStatus(
 
 function hasScheduleNode(nodes: AgentFlowNode[]) {
   return nodes.some((node) => node.data.kind === 'schedule')
+}
+
+function hasManualTriggerNode(nodes: AgentFlowNode[]) {
+  return nodes.some((node) => node.data.kind === 'start')
 }
 
 function getRunPreviewButtonLabel(status: AgentBlueprintStatus) {
@@ -7217,11 +7619,11 @@ function normalizeNode(node: AgentFlowNode): AgentFlowNode {
     position: node.position ?? { x: 0, y: 0 },
     data: {
       kind,
+      componentId: data.componentId ?? `component.${kind.replace('_', '-')}`,
       title: data.title ?? meta.label,
       description: data.description ?? meta.description,
       group: data.group,
-      model:
-        data.model ?? MODEL_FALLBACKS[meta.role][0]?.value ?? 'gpt-4.1-mini',
+      model: data.model?.startsWith('system.') ? '' : (data.model ?? ''),
       skill: normalizeBuiltinSkillValue(data.skill ?? pickDefaultSkill(kind)),
       inputs: Array.isArray(data.inputs) ? data.inputs : meta.inputs,
       outputs: normalizedOutputs,
@@ -7262,6 +7664,9 @@ function normalizeNodeSettings(
     }
     if (!normalized['采集等待']) {
       normalized['采集等待'] = '6s'
+    }
+    if (!normalized['登录等待']) {
+      normalized['登录等待'] = '120s'
     }
   }
   if (kind === 'request') {
@@ -7321,33 +7726,36 @@ function buildTemplates(
   const baseTemplates = (Object.keys(NODE_META) as AgentNodeKind[])
     .filter((kind) => kind !== 'custom')
     .map((kind) => {
-    const meta = NODE_META[kind]
-    return {
-      kind,
-      componentId: kind,
-      source: 'builtin' as const,
-      title: meta.label,
-      description: meta.description,
-      paletteGroup: meta.group,
-      group: currentGroup || 'default',
-      model: pickDefaultModel(kind, models, currentModel),
-      skill: pickDefaultSkill(kind),
-      inputs: meta.inputs,
-      outputs: meta.outputs,
-      settings: meta.settings,
-      status: 'ready' as AgentNodeStatus,
-    }
-  })
+      const meta = NODE_META[kind]
+      return {
+        kind,
+        componentId: kind,
+        source: 'builtin' as const,
+        title: meta.label,
+        description: meta.description,
+        paletteGroup: meta.group,
+        group: currentGroup || 'default',
+        model: pickDefaultModel(kind, models, currentModel),
+        skill: pickDefaultSkill(kind),
+        inputs: meta.inputs,
+        outputs: meta.outputs,
+        settings: meta.settings,
+        status: 'ready' as AgentNodeStatus,
+      }
+    })
   if (!components.length) return baseTemplates
 
   const baseComponentIds = new Set(
     baseTemplates.flatMap((template) => [
       template.componentId ?? template.kind,
       `component.${template.kind}`,
+      `component.${template.kind.replace('_', '-')}`,
     ])
   )
   const dynamicTemplates = components
-    .filter((component) => shouldUseCatalogComponent(component, baseComponentIds))
+    .filter((component) =>
+      shouldUseCatalogComponent(component, baseComponentIds)
+    )
     .map((component) =>
       componentToNodeTemplate(component, models, currentModel, currentGroup)
     )
@@ -7374,6 +7782,12 @@ function componentToNodeTemplate(
   const kind = normalizeTemplateKind(component.kind)
   const meta = NODE_META[kind]
   const config = component.config ?? {}
+  const group = config.model_group || currentGroup || 'default'
+  const configuredModel =
+    group === (currentGroup || 'default') &&
+    models.some((model) => model.value === config.model_name)
+      ? config.model_name
+      : undefined
   const settings = {
     ...meta.settings,
     ...(config.settings ?? {}),
@@ -7386,10 +7800,11 @@ function componentToNodeTemplate(
     title: component.name || meta.label,
     description: component.description || meta.description,
     paletteGroup: componentPaletteGroup(component.group, meta.group),
-    group: config.model_group || currentGroup || 'default',
+    group,
     model:
-      config.model_name ||
-      pickDefaultModel(kind, models, currentModel),
+      group === (currentGroup || 'default')
+        ? configuredModel || pickDefaultModel(kind, models, currentModel)
+        : '',
     skill: config.skill || pickDefaultSkill(kind),
     inputs: config.inputs?.length ? config.inputs : meta.inputs,
     outputs: config.outputs?.length ? config.outputs : meta.outputs,
@@ -7438,14 +7853,8 @@ function pickDefaultModel(
   currentModel?: string
 ) {
   const meta = NODE_META[kind]
-
-  if (kind === 'schedule') return 'system.scheduler'
-  if (kind === 'start' || kind === 'stop') return 'system.runner'
-
   const model = chooseModelByRole(models, meta.role, currentModel)
-  if (model) return model.value
-
-  return MODEL_FALLBACKS[meta.role][0]?.value ?? currentModel ?? 'gpt-4.1-mini'
+  return model?.value ?? ''
 }
 
 function pickDefaultSkill(kind: AgentNodeKind) {
@@ -7507,23 +7916,30 @@ function chooseModelByRole(
   role: ModelRole,
   currentModel?: string
 ) {
-  if (role === 'system') return null
+  const selectedModel = models.find((model) => model.value === currentModel)
+  if (role === 'system') return selectedModel ?? models[0]
   if (role === 'image') {
     return (
       models.find((model) => model.supportsImage) ??
-      findByPatterns(models, ['gpt-image', 'image', 'imagen', 'dall'])
+      findByPatterns(models, ['gpt-image', 'image', 'imagen', 'dall']) ??
+      selectedModel ??
+      models[0]
     )
   }
   if (role === 'browser') {
-    return findByPatterns(models, [
-      'computer',
-      'browser',
-      'claude',
-      'sonnet',
-      'gpt-4.1',
-      'gpt-4o',
-      'gemini',
-    ])
+    return (
+      findByPatterns(models, [
+        'computer',
+        'browser',
+        'claude',
+        'sonnet',
+        'gpt-4.1',
+        'gpt-4o',
+        'gemini',
+      ]) ??
+      selectedModel ??
+      models[0]
+    )
   }
   if (role === 'reasoning') {
     return (
@@ -7535,12 +7951,15 @@ function chooseModelByRole(
         'sonnet',
         'deepseek',
         'qwen',
-      ]) ?? models.find((model) => model.value === currentModel)
+      ]) ??
+      selectedModel ??
+      models[0]
     )
   }
   return (
     findByPatterns(models, ['mini', 'flash', 'turbo', 'haiku', 'lite']) ??
-    models.find((model) => model.value === currentModel)
+    selectedModel ??
+    models[0]
   )
 }
 
@@ -7591,6 +8010,7 @@ function createInitialNodes(templates: NodeTemplate[]) {
         settings: {
           网址: 'https://www.baidu.com/',
           登录态: '使用当前设备浏览器',
+          登录等待: '120s',
           权限: '只读采集',
           采集等待: '6s',
         },
@@ -7622,13 +8042,23 @@ function createInitialNodes(templates: NodeTemplate[]) {
       patch: {
         title: '生成日报',
         description:
-          '根据上一节点给出的表格、结论和图片生成日报文档；标题、格式、语气和归档规则只以当前节点描述为准。',
+          '上传并解析日报模板，生成字段映射和浏览器采集计划，交给后续处理数据节点。',
+      },
+    },
+    {
+      kind: 'report_data',
+      id: 'report_data',
+      position: { x: 1050, y: 95 },
+      patch: {
+        title: '处理数据',
+        description:
+          '根据日报模板计划复用已登录浏览器，重新采集商品明细、计算排行并输出最终日报。',
       },
     },
     {
       kind: 'stop',
       id: 'stop',
-      position: { x: 1050, y: 95 },
+      position: { x: 1400, y: 95 },
       patch: {
         title: '结束',
         description:
@@ -7765,7 +8195,9 @@ function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
   } as AgentFlowEdge
 }
 
-function buildPaletteTemplateGroups(templates: NodeTemplate[]): PaletteTemplateGroup[] {
+function buildPaletteTemplateGroups(
+  templates: NodeTemplate[]
+): PaletteTemplateGroup[] {
   return PALETTE_GROUPS.map((group) => ({
     title: group.title,
     templates: templates.filter((template) => {
@@ -7779,12 +8211,16 @@ function buildComponentPaletteSections(
   groups: PaletteTemplateGroup[]
 ): ComponentPaletteSection[] {
   const templates = groups.flatMap((group) => group.templates)
-  const customTemplates = templates.filter((template) => template.source === 'custom')
+  const customTemplates = templates.filter(
+    (template) => template.source === 'custom'
+  )
   const builtinSections = groups
     .map((group) => ({
       title: group.title,
       badge: '内置',
-      templates: group.templates.filter((template) => template.source !== 'custom'),
+      templates: group.templates.filter(
+        (template) => template.source !== 'custom'
+      ),
     }))
     .filter((section) => section.templates.length > 0)
 
@@ -7809,17 +8245,19 @@ function filterPaletteTemplateGroups(
   const keyword = search.trim().toLowerCase()
   if (!keyword) return groups
 
-  return groups.map((group) => ({
-    ...group,
-    templates: group.templates.filter((template) => {
-      const meta = NODE_META[template.kind]
-      return `${template.title} ${template.paletteGroup ?? meta.group} ${template.description} ${
-        template.source === 'custom' ? '自定义' : '内置'
-      }`
-        .toLowerCase()
-        .includes(keyword)
-    }),
-  })).filter((group) => group.templates.length > 0)
+  return groups
+    .map((group) => ({
+      ...group,
+      templates: group.templates.filter((template) => {
+        const meta = NODE_META[template.kind]
+        return `${template.title} ${template.paletteGroup ?? meta.group} ${template.description} ${
+          template.source === 'custom' ? '自定义' : '内置'
+        }`
+          .toLowerCase()
+          .includes(keyword)
+      }),
+    }))
+    .filter((group) => group.templates.length > 0)
 }
 
 function splitListInput(value: string) {
@@ -7834,17 +8272,12 @@ function buildManualPreviewGraph(
   edges: AgentFlowEdge[]
 ) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const nonScheduleIds = new Set(
-    nodes
-      .filter((node) => node.data.kind !== 'schedule')
-      .map((node) => node.id)
-  )
   const startIds = nodes
     .filter((node) => node.data.kind === 'start')
     .map((node) => node.id)
 
   if (startIds.length === 0) {
-    return filterGraphByNodeIds(nodes, edges, nonScheduleIds)
+    return filterGraphByNodeIds(nodes, edges, new Set())
   }
 
   const outgoing = new Map<string, string[]>()
@@ -7872,10 +8305,7 @@ function buildManualPreviewGraph(
     }
   }
 
-  const graph = filterGraphByNodeIds(nodes, edges, reachable)
-  return graph.nodes.length > 0
-    ? graph
-    : filterGraphByNodeIds(nodes, edges, nonScheduleIds)
+  return filterGraphByNodeIds(nodes, edges, reachable)
 }
 
 function filterGraphByNodeIds(

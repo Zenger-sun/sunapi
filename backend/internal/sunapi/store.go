@@ -25,6 +25,11 @@ type Store struct {
 	dataDir                   string
 	playgroundImageHandlersMu sync.RWMutex
 	playgroundImageHandlers   *openai.OpenAIAPIHandler
+	agentSchedulerMu          sync.Mutex
+	agentSchedulerCancel      context.CancelFunc
+	agentSchedulerWG          sync.WaitGroup
+	agentScheduledRunsMu      sync.Mutex
+	agentScheduledRuns        map[string]struct{}
 }
 
 const (
@@ -44,7 +49,11 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db, dataDir: filepath.Dir(path)}
+	store := &Store{
+		db:                 db,
+		dataDir:            filepath.Dir(path),
+		agentScheduledRuns: make(map[string]struct{}),
+	}
 	if err := store.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -56,7 +65,28 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	s.agentSchedulerMu.Lock()
+	cancel := s.agentSchedulerCancel
+	s.agentSchedulerMu.Unlock()
+	if cancel != nil {
+		cancel()
+		s.agentSchedulerWG.Wait()
+	}
 	return s.db.Close()
+}
+
+// StartAgentScheduler starts the background worker that executes scheduled blueprints.
+// Calling it more than once is safe.
+func (s *Store) StartAgentScheduler() {
+	if s == nil || s.db == nil {
+		return
+	}
+	s.agentSchedulerMu.Lock()
+	defer s.agentSchedulerMu.Unlock()
+	if s.agentSchedulerCancel != nil {
+		return
+	}
+	s.startAgentScheduler()
 }
 
 func (s *Store) DataDir() string {

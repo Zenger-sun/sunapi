@@ -21,6 +21,7 @@ export type AgentBlueprintStatus =
 export type AgentBlueprintCommand =
   | { type: 'new' }
   | { type: 'load'; id: string }
+  | { type: 'delete'; id: string }
 
 export type AgentBlueprintSummary = {
   id: string

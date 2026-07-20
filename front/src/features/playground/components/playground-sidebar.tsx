@@ -52,7 +52,6 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   AGENT_BLUEPRINTS_CHANGED_EVENT,
-  deleteStoredAgentBlueprint,
   dispatchAgentBlueprintCommand,
   getAgentBlueprintStatusLabel,
   readAgentBlueprintSummaries,
@@ -422,7 +421,7 @@ function AgentBlueprintHistoryPanel({
   }
 
   const handleDeleteBlueprint = (blueprintId: string) => {
-    deleteStoredAgentBlueprint(blueprintId)
+    dispatchAgentBlueprintCommand({ type: 'delete', id: blueprintId })
   }
 
   return (

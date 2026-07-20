@@ -40,6 +40,9 @@ const (
 var (
 	agentTemplateIndexMu                  sync.Mutex
 	agentReportTemplatePlaceholderPattern = regexp.MustCompile(`\{\{(?:title|标题|output_format|输出格式|content|内容|generated_at|生成时间)\}\}`)
+	agentReportDatePattern                = regexp.MustCompile(`20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}日?`)
+	agentReportMetricValuePattern         = regexp.MustCompile(`^[¥￥]?\s*-?\d[\d,]*(?:\.\d+)?%?$|^[-—]$`)
+	agentReportCellTypeAttributePattern   = regexp.MustCompile(`\s+t="[^"]*"`)
 )
 
 var allowedAgentFileExtensions = map[string]bool{
@@ -91,11 +94,12 @@ type AgentReportWriteRequest struct {
 }
 
 type AgentReportOutputFile struct {
-	Label                string `json:"label"`
-	Extension            string `json:"extension"`
-	Content              string `json:"content"`
-	TemplatePath         string `json:"template_path,omitempty"`
-	TemplateOriginalName string `json:"template_original_name,omitempty"`
+	Label                string                 `json:"label"`
+	Extension            string                 `json:"extension"`
+	Content              string                 `json:"content"`
+	TemplatePath         string                 `json:"template_path,omitempty"`
+	TemplateOriginalName string                 `json:"template_original_name,omitempty"`
+	TemplateData         map[string]interface{} `json:"template_data,omitempty"`
 }
 
 type AgentReportWrittenFile struct {
@@ -426,7 +430,7 @@ func encodeAgentReportOutputFile(dataDir, ext, title, label, content string, fil
 	if templateBytes, ok := readMatchingAgentReportTemplate(dataDir, ext, file); ok {
 		switch ext {
 		case ".xlsx":
-			if fileBytes, err := buildAgentReportXLSXFromTemplate(templateBytes, title, label, content); err == nil {
+			if fileBytes, err := buildAgentReportXLSXFromTemplate(templateBytes, title, label, content, file.TemplateData); err == nil {
 				return fileBytes, nil
 			}
 			return buildAgentReportXLSX(title, label, content)
@@ -621,7 +625,13 @@ func buildAgentReportSheetDataXML(rows [][]string) string {
 	return sb.String()
 }
 
-func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, content string) ([]byte, error) {
+func buildAgentReportXLSXFromTemplate(
+	templateBytes []byte,
+	title string,
+	label string,
+	content string,
+	templateData ...map[string]interface{},
+) ([]byte, error) {
 	reader, err := zip.NewReader(bytes.NewReader(templateBytes), int64(len(templateBytes)))
 	if err != nil {
 		return nil, err
@@ -629,10 +639,11 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 
 	var buf bytes.Buffer
 	writer := zip.NewWriter(&buf)
-	rows := agentReportWorksheetRows(title, label, content)
 	hasPlaceholders := agentReportTemplateHasPlaceholders(reader)
-	worksheetUpdated := false
-	placeholderReplaced := false
+	worksheetUpdates := map[string]map[string]string{}
+	if !hasPlaceholders && len(templateData) > 0 && len(templateData[0]) > 0 {
+		worksheetUpdates = buildAgentReportTemplateWorksheetUpdates(reader, templateData[0])
+	}
 
 	for _, file := range reader.File {
 		rc, err := file.Open()
@@ -652,14 +663,11 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 		}
 
 		if strings.HasSuffix(strings.ToLower(file.Name), ".xml") {
-			var replaced bool
-			data, replaced = replaceAgentReportTemplatePlaceholders(data, title, label, content)
-			placeholderReplaced = placeholderReplaced || replaced
+			data, _ = replaceAgentReportTemplatePlaceholders(data, title, label, content)
 		}
 
-		if !worksheetUpdated && isAgentReportWorksheetEntry(file.Name) && !hasPlaceholders {
-			data = replaceAgentReportWorksheetData(data, []byte(buildAgentReportSheetDataXML(rows)))
-			worksheetUpdated = true
+		if updates := worksheetUpdates[filepath.ToSlash(file.Name)]; len(updates) > 0 {
+			data = applyAgentReportWorksheetCellUpdates(data, updates)
 		}
 
 		header := file.FileHeader
@@ -676,9 +684,6 @@ func buildAgentReportXLSXFromTemplate(templateBytes []byte, title, label, conten
 
 	if err := writer.Close(); err != nil {
 		return nil, err
-	}
-	if !worksheetUpdated && !placeholderReplaced {
-		return nil, errors.New("template worksheet not found")
 	}
 	return buf.Bytes(), nil
 }
@@ -749,6 +754,631 @@ func replaceAgentReportTemplatePlaceholders(data []byte, title, label, content s
 		return data, false
 	}
 	return []byte(source), true
+}
+
+type agentReportTemplateContext struct {
+	fields    map[string]string
+	date      string
+	sourceURL string
+	products  []map[string]string
+	rankings  []map[string]string
+}
+
+type agentReportWorksheetCell struct {
+	Reference string
+	Value     string
+}
+
+func buildAgentReportTemplateWorksheetUpdates(
+	reader *zip.Reader,
+	templateData map[string]interface{},
+) map[string]map[string]string {
+	context := buildAgentReportTemplateContext(templateData)
+	sharedStrings := []string{}
+	for _, file := range reader.File {
+		if strings.EqualFold(filepath.ToSlash(file.Name), "xl/sharedStrings.xml") {
+			if data, err := readAgentReportZipEntry(file); err == nil {
+				sharedStrings = parseAgentXLSXSharedStrings(data)
+			}
+			break
+		}
+	}
+
+	updates := map[string]map[string]string{}
+	for _, file := range reader.File {
+		name := filepath.ToSlash(file.Name)
+		if !isAgentReportWorksheetEntry(name) {
+			continue
+		}
+		data, err := readAgentReportZipEntry(file)
+		if err != nil {
+			continue
+		}
+		cells := parseAgentReportWorksheetCells(data, sharedStrings)
+		if sheetUpdates := buildAgentReportWorksheetFieldUpdates(cells, context); len(sheetUpdates) > 0 {
+			updates[name] = sheetUpdates
+		}
+	}
+	return updates
+}
+
+func readAgentReportZipEntry(file *zip.File) ([]byte, error) {
+	reader, err := file.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func parseAgentReportWorksheetCells(data []byte, sharedStrings []string) []agentReportWorksheetCell {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	cells := []agentReportWorksheetCell{}
+	current := agentReportWorksheetCell{}
+	cellType := ""
+	cellValue := ""
+	inCell := false
+	inValue := false
+
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return cells
+		}
+		switch typed := token.(type) {
+		case xml.StartElement:
+			switch strings.ToLower(typed.Name.Local) {
+			case "c":
+				inCell = true
+				cellType = ""
+				cellValue = ""
+				current = agentReportWorksheetCell{}
+				for _, attr := range typed.Attr {
+					switch strings.ToLower(attr.Name.Local) {
+					case "r":
+						current.Reference = strings.ToUpper(strings.TrimSpace(attr.Value))
+					case "t":
+						cellType = attr.Value
+					}
+				}
+			case "v", "t":
+				if inCell {
+					inValue = true
+				}
+			}
+		case xml.EndElement:
+			switch strings.ToLower(typed.Name.Local) {
+			case "v", "t":
+				inValue = false
+			case "c":
+				current.Value = resolveAgentXLSXCellValue(cellValue, cellType, sharedStrings)
+				if current.Reference != "" {
+					cells = append(cells, current)
+				}
+				inCell = false
+			}
+		case xml.CharData:
+			if inValue {
+				cellValue += string(typed)
+			}
+		}
+	}
+	return cells
+}
+
+func buildAgentReportTemplateContext(templateData map[string]interface{}) agentReportTemplateContext {
+	context := agentReportTemplateContext{
+		fields:   map[string]string{},
+		products: extractAgentReportTemplateRows(templateData, "products", "商品明细"),
+		rankings: extractAgentReportTemplateRows(templateData, "rankings", "商品排行"),
+	}
+	texts := []string{}
+	var walk func(string, interface{})
+	walk = func(key string, value interface{}) {
+		normalizedKey := normalizeAgentReportFieldName(key)
+		switch typed := value.(type) {
+		case map[string]interface{}:
+			for childKey, child := range typed {
+				childNormalized := normalizeAgentReportFieldName(childKey)
+				if childNormalized == "products" || childNormalized == normalizeAgentReportFieldName("商品明细") ||
+					childNormalized == "rankings" || childNormalized == normalizeAgentReportFieldName("商品排行") {
+					continue
+				}
+				walk(childKey, child)
+			}
+		case []interface{}:
+			for _, child := range typed {
+				walk(key, child)
+			}
+		case string:
+			trimmed := strings.TrimSpace(typed)
+			if trimmed == "" {
+				return
+			}
+			if normalizedKey != "" {
+				context.fields[normalizedKey] = trimmed
+			}
+			if normalizedKey == "text" || normalizedKey == "content" || normalizedKey == "body" {
+				texts = append(texts, trimmed)
+			}
+			if normalizedKey == "finalurl" || (normalizedKey == "url" && context.sourceURL == "") {
+				context.sourceURL = trimmed
+			}
+		case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+			if normalizedKey != "" {
+				context.fields[normalizedKey] = strings.TrimSpace(fmt.Sprint(typed))
+			}
+			if normalizedKey == "capturedat" && context.date == "" {
+				var timestamp int64
+				if _, err := fmt.Sscanf(fmt.Sprint(typed), "%d", &timestamp); err == nil && timestamp > 0 {
+					context.date = time.Unix(timestamp, 0).Format("2006-01-02")
+				}
+			}
+		}
+	}
+	walk("", templateData)
+
+	for _, text := range texts {
+		if date := extractAgentReportDate(text); date != "" {
+			context.date = date
+			break
+		}
+	}
+	for _, text := range texts {
+		collectAgentReportTextFields(context.fields, text)
+	}
+	addAgentReportDerivedFields(context.fields)
+	return context
+}
+
+func extractAgentReportTemplateRows(value interface{}, keys ...string) []map[string]string {
+	wanted := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		wanted[normalizeAgentReportFieldName(key)] = true
+	}
+	var walk func(interface{}) []map[string]string
+	walk = func(current interface{}) []map[string]string {
+		switch typed := current.(type) {
+		case map[string]interface{}:
+			for key, child := range typed {
+				if wanted[normalizeAgentReportFieldName(key)] {
+					if rows := agentReportStringRows(child); len(rows) > 0 {
+						return rows
+					}
+				}
+			}
+			for _, child := range typed {
+				if rows := walk(child); len(rows) > 0 {
+					return rows
+				}
+			}
+		case []interface{}:
+			for _, child := range typed {
+				if rows := walk(child); len(rows) > 0 {
+					return rows
+				}
+			}
+		}
+		return nil
+	}
+	return walk(value)
+}
+
+func agentReportStringRows(value interface{}) []map[string]string {
+	items, ok := value.([]interface{})
+	if !ok {
+		return nil
+	}
+	rows := make([]map[string]string, 0, len(items))
+	for _, item := range items {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		row := make(map[string]string, len(record))
+		for key, raw := range record {
+			value := strings.TrimSpace(fmt.Sprint(raw))
+			if value != "" && value != "<nil>" {
+				row[key] = value
+			}
+		}
+		if len(row) > 0 {
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+func collectAgentReportTextFields(fields map[string]string, text string) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for index, rawLabel := range lines {
+		label := normalizeAgentReportFieldName(rawLabel)
+		if label == "" || agentReportMetricValuePattern.MatchString(strings.TrimSpace(rawLabel)) {
+			continue
+		}
+		for offset := 1; offset <= 3 && index+offset < len(lines); offset++ {
+			candidate := strings.TrimSpace(lines[index+offset])
+			if candidate == "" || candidate == "?" || candidate == "前1日" {
+				continue
+			}
+			if !agentReportMetricValuePattern.MatchString(candidate) {
+				break
+			}
+			if _, exists := fields[label]; !exists {
+				fields[label] = normalizeAgentReportMetricValue(candidate)
+			}
+			break
+		}
+	}
+}
+
+func addAgentReportDerivedFields(fields map[string]string) {
+	derive := func(target, numerator, denominator string) {
+		if _, exists := fields[normalizeAgentReportFieldName(target)]; exists {
+			return
+		}
+		numeratorValue, numeratorOK := agentReportNumericField(fields, numerator)
+		denominatorValue, denominatorOK := agentReportNumericField(fields, denominator)
+		if !numeratorOK || !denominatorOK || denominatorValue == 0 {
+			return
+		}
+		fields[normalizeAgentReportFieldName(target)] = fmt.Sprintf("%.3f%%", numeratorValue/denominatorValue*100)
+	}
+	derive("曝光支付转化率", "支付笔数", "商品曝光次数")
+	derive("曝光点击率", "商品浏览次数", "商品曝光次数")
+	derive("浏览支付转化率", "支付笔数", "商品浏览人数")
+}
+
+func agentReportNumericField(fields map[string]string, label string) (float64, bool) {
+	value, ok := lookupAgentReportField(fields, label)
+	if !ok {
+		return 0, false
+	}
+	value = strings.TrimSuffix(strings.ReplaceAll(strings.ReplaceAll(value, ",", ""), "¥", ""), "%")
+	value = strings.TrimPrefix(value, "￥")
+	var number float64
+	if _, err := fmt.Sscanf(value, "%f", &number); err != nil {
+		return 0, false
+	}
+	return number, true
+}
+
+func buildAgentReportWorksheetFieldUpdates(
+	cells []agentReportWorksheetCell,
+	context agentReportTemplateContext,
+) map[string]string {
+	updates := map[string]string{}
+	cellByReference := make(map[string]agentReportWorksheetCell, len(cells))
+	maxRow := 0
+	metricHeaderRow := 0
+	adviceRow := 0
+	headersByRow := map[int]map[string]bool{}
+	for _, cell := range cells {
+		cellByReference[cell.Reference] = cell
+		column, row, ok := splitAgentReportCellReference(cell.Reference)
+		if !ok {
+			continue
+		}
+		if row > maxRow {
+			maxRow = row
+		}
+		value := normalizeAgentReportFieldName(cell.Value)
+		if value == normalizeAgentReportFieldName("核心指标") {
+			metricHeaderRow = row
+		}
+		if value == normalizeAgentReportFieldName("运营建议") {
+			adviceRow = row
+		}
+		if value != "" {
+			if headersByRow[row] == nil {
+				headersByRow[row] = map[string]bool{}
+			}
+			headersByRow[row][value] = true
+		}
+		if column == "A" && context.date != "" && agentReportDatePattern.MatchString(cell.Value) {
+			updates[cell.Reference] = agentReportDatePattern.ReplaceAllString(cell.Value, context.date)
+		}
+	}
+
+	productHeaderRow := agentReportHeaderRow(headersByRow, "商品ID", "商品标题")
+	if productHeaderRow > 0 {
+		return buildAgentReportRepeatedRowUpdates(cells, productHeaderRow, context.products)
+	}
+	rankingHeaderRow := agentReportHeaderRow(headersByRow, "排行类型", "排名")
+	if rankingHeaderRow > 0 {
+		return buildAgentReportRepeatedRowUpdates(cells, rankingHeaderRow, context.rankings)
+	}
+
+	if metricHeaderRow > 0 {
+		endRow := adviceRow
+		if endRow == 0 {
+			endRow = maxRow + 1
+		}
+		for row := metricHeaderRow + 1; row < endRow; row++ {
+			labelCell, hasLabel := cellByReference[fmt.Sprintf("A%d", row)]
+			_, hasValueCell := cellByReference[fmt.Sprintf("B%d", row)]
+			if !hasLabel || !hasValueCell || strings.TrimSpace(labelCell.Value) == "" {
+				continue
+			}
+			value, found := lookupAgentReportField(context.fields, labelCell.Value)
+			if !found {
+				value = ""
+			}
+			updates[fmt.Sprintf("B%d", row)] = value
+			if _, exists := cellByReference[fmt.Sprintf("D%d", row)]; exists {
+				updates[fmt.Sprintf("D%d", row)] = agentReportMetricHealth(labelCell.Value, value)
+			}
+			if _, exists := cellByReference[fmt.Sprintf("E%d", row)]; exists {
+				updates[fmt.Sprintf("E%d", row)] = agentReportMetricPriority(labelCell.Value, value)
+			}
+		}
+		if adviceRow > 0 {
+			wroteAdvice := false
+			for row := adviceRow + 1; row <= maxRow; row++ {
+				if _, exists := cellByReference[fmt.Sprintf("B%d", row)]; !exists {
+					continue
+				}
+				if !wroteAdvice {
+					if len(context.products) > 0 {
+						updates[fmt.Sprintf("B%d", row)] = fmt.Sprintf("本次已重新采集 %d 条商品明细，并按曝光、支付和转化生成商品排行。", len(context.products))
+					} else {
+						updates[fmt.Sprintf("B%d", row)] = "本页仅按当前实际采集指标更新；未采集商品明细时不生成单品级建议。"
+					}
+					wroteAdvice = true
+				} else {
+					updates[fmt.Sprintf("B%d", row)] = ""
+				}
+			}
+		}
+	}
+
+	for _, cell := range cells {
+		column, row, ok := splitAgentReportCellReference(cell.Reference)
+		if !ok || column != "A" {
+			continue
+		}
+		targetReference := fmt.Sprintf("B%d", row)
+		if _, exists := cellByReference[targetReference]; !exists {
+			continue
+		}
+		switch normalizeAgentReportFieldName(cell.Value) {
+		case normalizeAgentReportFieldName("统计日期"):
+			if context.date != "" {
+				updates[targetReference] = context.date
+			}
+		case normalizeAgentReportFieldName("数据来源"):
+			if context.sourceURL != "" {
+				updates[targetReference] = "浏览器采集：" + context.sourceURL
+			}
+		case normalizeAgentReportFieldName("数据限制"):
+			updates[targetReference] = "仅写入当前浏览器会话重新采集的数据；未采集到的字段留空。"
+		default:
+			if value, found := lookupAgentReportField(context.fields, cell.Value); found {
+				updates[targetReference] = value
+			}
+		}
+	}
+	return updates
+}
+
+func agentReportHeaderRow(headersByRow map[int]map[string]bool, required ...string) int {
+	rows := make([]int, 0, len(headersByRow))
+	for row := range headersByRow {
+		rows = append(rows, row)
+	}
+	sort.Ints(rows)
+	for _, row := range rows {
+		headers := headersByRow[row]
+		matched := true
+		for _, label := range required {
+			if !headers[normalizeAgentReportFieldName(label)] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return row
+		}
+	}
+	return 0
+}
+
+func buildAgentReportRepeatedRowUpdates(
+	cells []agentReportWorksheetCell,
+	headerRow int,
+	rows []map[string]string,
+) map[string]string {
+	updates := map[string]string{}
+	headers := map[string]string{}
+	for _, cell := range cells {
+		column, row, ok := splitAgentReportCellReference(cell.Reference)
+		if !ok {
+			continue
+		}
+		if row == headerRow && strings.TrimSpace(cell.Value) != "" {
+			headers[column] = cell.Value
+		}
+	}
+	for _, cell := range cells {
+		column, row, ok := splitAgentReportCellReference(cell.Reference)
+		if !ok || row <= headerRow {
+			continue
+		}
+		value := ""
+		index := row - headerRow - 1
+		if index >= 0 && index < len(rows) {
+			value = lookupAgentReportRowValue(rows[index], headers[column])
+		}
+		updates[cell.Reference] = value
+	}
+	return updates
+}
+
+func lookupAgentReportRowValue(row map[string]string, label string) string {
+	normalized := normalizeAgentReportFieldName(label)
+	if normalized == "" {
+		return ""
+	}
+	aliases := map[string][]string{
+		normalizeAgentReportFieldName("价格"):      {"价格", "价格(元)", "售价"},
+		normalizeAgentReportFieldName("支付订单数"):   {"支付订单数", "支付笔数", "订单数"},
+		normalizeAgentReportFieldName("支付金额"):    {"支付金额", "支付金额(元)", "成交金额"},
+		normalizeAgentReportFieldName("浏览支付转化率"): {"浏览支付转化率", "支付转化率"},
+	}
+	candidates := []string{label}
+	if values := aliases[normalized]; len(values) > 0 {
+		candidates = append(candidates, values...)
+	}
+	for _, candidate := range candidates {
+		candidateNormalized := normalizeAgentReportFieldName(candidate)
+		for key, value := range row {
+			keyNormalized := normalizeAgentReportFieldName(key)
+			if keyNormalized == candidateNormalized || strings.HasSuffix(keyNormalized, candidateNormalized) || strings.HasSuffix(candidateNormalized, keyNormalized) {
+				return normalizeAgentReportMetricValue(value)
+			}
+		}
+	}
+	return ""
+}
+
+func applyAgentReportWorksheetCellUpdates(worksheet []byte, updates map[string]string) []byte {
+	output := worksheet
+	references := make([]string, 0, len(updates))
+	for reference := range updates {
+		references = append(references, reference)
+	}
+	sort.Slice(references, func(i, j int) bool { return len(references[i]) > len(references[j]) })
+	for _, reference := range references {
+		output = replaceAgentReportWorksheetCellValue(output, reference, updates[reference])
+	}
+	return output
+}
+
+func replaceAgentReportWorksheetCellValue(worksheet []byte, reference, value string) []byte {
+	cellPattern := `<c\b[^>]*\br="` + regexp.QuoteMeta(reference) + `"[^>]*`
+	pattern := regexp.MustCompile(`(?s)(?:` + cellPattern + `/>|` + cellPattern + `>.*?</c>)`)
+	return pattern.ReplaceAllFunc(worksheet, func(cell []byte) []byte {
+		source := string(cell)
+		openingEnd := strings.Index(source, ">")
+		if openingEnd < 0 && strings.HasSuffix(source, "/>") {
+			openingEnd = len(source) - 2
+		}
+		if openingEnd < 0 {
+			return cell
+		}
+		opening := agentReportCellTypeAttributePattern.ReplaceAllString(source[:openingEnd], "")
+		opening = strings.TrimSuffix(strings.TrimSpace(opening), "/")
+		return []byte(opening + ` t="inlineStr"><is><t xml:space="preserve">` + xmlEscape(value) + `</t></is></c>`)
+	})
+}
+
+func splitAgentReportCellReference(reference string) (string, int, bool) {
+	reference = strings.ToUpper(strings.TrimSpace(reference))
+	index := 0
+	for index < len(reference) && reference[index] >= 'A' && reference[index] <= 'Z' {
+		index++
+	}
+	if index == 0 || index == len(reference) {
+		return "", 0, false
+	}
+	var row int
+	if _, err := fmt.Sscanf(reference[index:], "%d", &row); err != nil || row <= 0 {
+		return "", 0, false
+	}
+	return reference[:index], row, true
+}
+
+func lookupAgentReportField(fields map[string]string, label string) (string, bool) {
+	normalized := normalizeAgentReportFieldName(label)
+	if normalized == "" {
+		return "", false
+	}
+	if value, ok := fields[normalized]; ok {
+		return normalizeAgentReportMetricValue(value), true
+	}
+	for key, value := range fields {
+		if strings.HasSuffix(key, normalized) || strings.HasSuffix(normalized, key) {
+			return normalizeAgentReportMetricValue(value), true
+		}
+	}
+	return "", false
+}
+
+func normalizeAgentReportFieldName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	replacer := strings.NewReplacer(
+		"（元）", "", "(元)", "", "（%）", "", "(%)", "",
+		" ", "", "\t", "", "\r", "", "\n", "",
+		"：", "", ":", "", "？", "", "?", "", "_", "", "-", "",
+	)
+	return replacer.Replace(value)
+}
+
+func normalizeAgentReportMetricValue(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "¥")
+	value = strings.TrimPrefix(value, "￥")
+	return strings.ReplaceAll(value, ",", "")
+}
+
+func extractAgentReportDate(value string) string {
+	raw := agentReportDatePattern.FindString(value)
+	if raw == "" {
+		return ""
+	}
+	normalized := strings.NewReplacer("年", "-", "月", "-", "日", "", "/", "-", ".", "-").Replace(raw)
+	var year, month, day int
+	if _, err := fmt.Sscanf(normalized, "%d-%d-%d", &year, &month, &day); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%04d-%02d-%02d", year, month, day)
+}
+
+func agentReportMetricHealth(label, value string) string {
+	if strings.TrimSpace(value) == "" || value == "-" || value == "—" {
+		return ""
+	}
+	normalized := normalizeAgentReportFieldName(label)
+	number, hasNumber := agentReportNumericField(map[string]string{normalized: value}, normalized)
+	if !hasNumber {
+		return "参考"
+	}
+	if strings.Contains(normalized, "退款") {
+		if number == 0 {
+			return "正常"
+		}
+		return "关注"
+	}
+	if strings.Contains(normalized, "支付") && !strings.Contains(normalized, "转化率") {
+		if number == 0 {
+			return "无成交"
+		}
+		return "正常"
+	}
+	if strings.Contains(normalized, "转化率") || strings.Contains(normalized, "点击率") {
+		if number < 1 {
+			return "偏低"
+		}
+		if number >= 5 {
+			return "优秀"
+		}
+		return "正常"
+	}
+	return "参考"
+}
+
+func agentReportMetricPriority(label, value string) string {
+	health := agentReportMetricHealth(label, value)
+	if health == "偏低" || health == "无成交" || health == "关注" {
+		return "高"
+	}
+	if health == "" {
+		return ""
+	}
+	return "中"
 }
 
 func agentReportWorksheetRows(title, label, content string) [][]string {

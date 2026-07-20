@@ -28,7 +28,11 @@ const (
 // ── 蓝图执行入口（异步 goroutine 调用）────────────────────────────────────────
 
 func runBlueprintTask(store *Store, bp *AgentBlueprint) {
-	ctx, cancel := context.WithTimeout(context.Background(), agentBlueprintRunTimeout)
+	runBlueprintTaskWithContext(context.Background(), store, bp)
+}
+
+func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *AgentBlueprint) {
+	ctx, cancel := context.WithTimeout(parent, agentBlueprintRunTimeout)
 	defer cancel()
 
 	startedAt := time.Now()
@@ -47,28 +51,38 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 		"model":        bp.ModelName,
 	}).Info("agent: blueprint execution started")
 
-	// 执行蓝图核心逻辑
-	output, archivePath, execErr := executeBlueprintCore(ctx, store, bp)
+	// 渠道配置可能在蓝图保存后发生变化，执行前必须再次校验。
+	var output json.RawMessage
+	var archivePath string
+	execErr := store.validateBlueprintModels(ctx, bp.ModelGroup, bp.ModelName, bp.Nodes)
+	if execErr == nil {
+		output, archivePath, execErr = executeBlueprintCore(ctx, store, bp)
+	}
 
 	// 计算耗时
 	durationMs := time.Since(startedAt).Milliseconds()
 
-	// 更新蓝图状态。包含定时触发节点的蓝图代表一个持续运行的计划，
-	// 单次执行成功后仍保持 running，直到用户显式暂停。
-	finalStatus := "completed"
+	// Keep the execution result separate from the persistent schedule state.
+	executionStatus := "completed"
 	failureReason := ""
 	if execErr != nil {
-		finalStatus = "failed"
+		executionStatus = "failed"
 		failureReason = execErr.Error()
 		log.WithError(execErr).WithField("blueprint_id", bp.ID).
 			Warn("agent: blueprint execution failed")
-	} else if blueprintHasScheduleNode(bp) {
-		finalStatus = "running"
+	}
+	blueprintStatus := executionStatus
+	if isRecurringAgentScheduledBlueprint(bp) {
+		blueprintStatus = "running"
 	}
 
 	// 更新蓝图执行次数和时间
 	now := time.Now().UnixMilli()
-	_ = store.UpdateBlueprintStatus(ctx, bp.ID, finalStatus, failureReason)
+	if isRecurringAgentScheduledBlueprint(bp) {
+		_ = store.UpdateRecurringBlueprintAfterRun(ctx, bp.ID, failureReason)
+	} else {
+		_ = store.UpdateBlueprintStatus(ctx, bp.ID, blueprintStatus, failureReason)
+	}
 	_, _ = store.db.ExecContext(ctx, `
 		UPDATE agent_blueprints
 		SET execution_count = execution_count + 1,
@@ -84,11 +98,11 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 		WHERE id = ?`, now, now, bp.AgentID)
 
 	// 完成执行日志
-	_ = store.FinishExecutionLog(ctx, execLog.ID, finalStatus, failureReason, archivePath, output)
+	_ = store.FinishExecutionLog(ctx, execLog.ID, executionStatus, failureReason, archivePath, output)
 
 	log.WithFields(log.Fields{
 		"blueprint_id": bp.ID,
-		"status":       finalStatus,
+		"status":       executionStatus,
 		"duration_ms":  durationMs,
 	}).Info("agent: blueprint execution finished")
 }
@@ -242,7 +256,8 @@ func executeBlueprintNodeGraph(
 
 	for _, node := range ordered {
 		upstream := upstreamAgentNodeOutputs(node.ID, edges, outputsByNodeID)
-		result := executeAgentBlueprintNode(ctx, store, bp, node, upstream, inputVars)
+		reportPlanOnly := node.Data.Kind == "report" && agentNodeHasDownstreamReportData(node.ID, nodes, edges)
+		result := executeAgentBlueprintNode(ctx, store, bp, node, upstream, inputVars, reportPlanOnly)
 		results = append(results, result)
 		if result.Status == "failed" {
 			warnings = append(warnings, fmt.Sprintf("%s: %s", node.ID, result.Error))
@@ -419,6 +434,7 @@ func executeAgentBlueprintNode(
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	inputVars map[string]interface{},
+	reportPlanOnly bool,
 ) agentBlueprintNodeResult {
 	started := time.Now()
 	result := agentBlueprintNodeResult{
@@ -464,7 +480,9 @@ func executeAgentBlueprintNode(
 	case "image":
 		result = executeAgentImageGraphNode(ctx, store, bp, node, upstream, result)
 	case "report":
-		result = executeAgentReportGraphNode(store, node, upstream, result)
+		result = executeAgentReportGraphNode(store, node, upstream, result, reportPlanOnly)
+	case "report_data":
+		result = executeAgentReportDataGraphNode(ctx, store, node, upstream, result)
 	case "webpage":
 		result = executeAgentWebpageGraphNode(store, node, upstream, result)
 	case "notify":
@@ -571,12 +589,14 @@ func executeAgentBrowserGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	captureCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
+	loginWaitSeconds := parseAgentPositiveSetting(node.Data.Settings["登录等待"], 120, 300)
+	captureCtx, cancel := context.WithTimeout(ctx, time.Duration(loginWaitSeconds+75)*time.Second)
 	defer cancel()
 	captured, err := captureAgentBrowserPage(captureCtx, store.DataDir(), AgentBrowserCaptureRequest{
-		URL:         url,
-		LoginState:  node.Data.Settings["登录态"],
-		WaitSeconds: parseAgentDurationSeconds(node.Data.Settings["采集等待"], agentBrowserCaptureDefault),
+		URL:              url,
+		LoginState:       node.Data.Settings["登录态"],
+		WaitSeconds:      parseAgentDurationSeconds(node.Data.Settings["采集等待"], agentBrowserCaptureDefault),
+		LoginWaitSeconds: loginWaitSeconds,
 	})
 	if err != nil {
 		result.Status = "failed"
@@ -587,15 +607,18 @@ func executeAgentBrowserGraphNode(
 	}
 	result.Message = fmt.Sprintf("浏览器真实采集完成，获取 %d 个字符。", len([]rune(captured.Text)))
 	result.Output = map[string]interface{}{
-		"url":              captured.URL,
-		"final_url":        captured.FinalURL,
-		"title":            captured.Title,
-		"text":             captured.Text,
-		"text_length":      len([]rune(captured.Text)),
-		"screenshot_path":  captured.ScreenshotPath,
-		"screenshot_error": captured.ScreenshotError,
-		"captured_at":      captured.CapturedAt,
-		"elapsed_ms":       captured.ElapsedMS,
+		"url":               captured.URL,
+		"final_url":         captured.FinalURL,
+		"title":             captured.Title,
+		"text":              captured.Text,
+		"text_length":       len([]rune(captured.Text)),
+		"screenshot_path":   captured.ScreenshotPath,
+		"screenshot_error":  captured.ScreenshotError,
+		"captured_at":       captured.CapturedAt,
+		"elapsed_ms":        captured.ElapsedMS,
+		"browser_session":   "agent-browser-profile",
+		"browser_target_id": captured.BrowserTargetID,
+		"login_ready":       true,
 	}
 	return result
 }
@@ -619,6 +642,7 @@ func executeAgentTransformGraphNode(
 		"table":       markdown,
 		"summary":     agentSummarizeUpstream(upstream, 2000),
 		"description": node.Data.Description,
+		"source":      upstream,
 	}
 	return result
 }
@@ -1268,6 +1292,7 @@ func executeAgentReportGraphNode(
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	result agentBlueprintNodeResult,
+	planOnly ...bool,
 ) agentBlueprintNodeResult {
 	if len(upstream) == 0 {
 		result.Status = "failed"
@@ -1276,8 +1301,13 @@ func executeAgentReportGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
+	if len(planOnly) > 0 && planOnly[0] {
+		result.Message = "日报模板已解析，数据采集计划已传递给处理数据节点。"
+		result.Output = buildAgentReportPlan(node, upstream)
+		return result
+	}
 	content := buildAgentGraphReportContent(node, upstream)
-	files := agentGraphReportFiles(node, content)
+	files := agentGraphReportFiles(node, content, upstream)
 	writeResult, err := writeAgentReportFiles(store.DataDir(), AgentReportWriteRequest{
 		Title:           firstNonEmpty(node.Data.Title, "生成日报"),
 		OutputDirectory: firstNonEmpty(node.Data.Settings["输出目录"], "data/output/reports"),
@@ -1298,6 +1328,36 @@ func executeAgentReportGraphNode(
 		"files":            writeResult.Files,
 	}
 	return result
+}
+
+func agentNodeHasDownstreamReportData(
+	nodeID string,
+	nodes []agentBlueprintGraphNode,
+	edges []agentBlueprintGraphEdge,
+) bool {
+	kindByID := make(map[string]string, len(nodes))
+	componentByID := make(map[string]string, len(nodes))
+	for _, node := range nodes {
+		kindByID[node.ID] = node.Data.Kind
+		componentByID[node.ID] = node.Data.ComponentID
+	}
+	queue := []string{nodeID}
+	seen := map[string]bool{nodeID: true}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, edge := range edges {
+			if edge.Source != current || seen[edge.Target] {
+				continue
+			}
+			if kindByID[edge.Target] == "report_data" || componentByID[edge.Target] == "component.report-data" {
+				return true
+			}
+			seen[edge.Target] = true
+			queue = append(queue, edge.Target)
+		}
+	}
+	return false
 }
 
 func executeAgentWebpageGraphNode(
@@ -2890,7 +2950,15 @@ func buildAgentGraphReportContent(node agentBlueprintGraphNode, upstream map[str
 	}, "\n")
 }
 
-func agentGraphReportFiles(node agentBlueprintGraphNode, content string) []AgentReportOutputFile {
+func agentGraphReportFiles(
+	node agentBlueprintGraphNode,
+	content string,
+	templateData ...map[string]interface{},
+) []AgentReportOutputFile {
+	var data map[string]interface{}
+	if len(templateData) > 0 {
+		data = templateData[0]
+	}
 	templateBindings := parseAgentReportTemplateBindings(
 		firstNonEmpty(node.Data.Settings["模板文件"], node.Data.Settings["网页模板"]),
 		node.Data.Settings["模板原文件名"],
@@ -2908,6 +2976,7 @@ func agentGraphReportFiles(node agentBlueprintGraphNode, content string) []Agent
 				Content:              content,
 				TemplatePath:         binding.Path,
 				TemplateOriginalName: binding.OriginalName,
+				TemplateData:         data,
 			})
 		}
 		return files
@@ -2925,6 +2994,7 @@ func agentGraphReportFiles(node agentBlueprintGraphNode, content string) []Agent
 			Content:              content,
 			TemplatePath:         firstNonEmpty(node.Data.Settings["模板文件"], node.Data.Settings["网页模板"]),
 			TemplateOriginalName: node.Data.Settings["模板原文件名"],
+			TemplateData:         data,
 		})
 	}
 	return files
