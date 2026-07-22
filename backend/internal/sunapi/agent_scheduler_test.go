@@ -49,6 +49,26 @@ func TestNextAgentScheduleTimeWeeklyUsesSelectedWeekday(t *testing.T) {
 	}
 }
 
+func TestNextAgentScheduleTimeWeekdaysSkipsWeekend(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	friday := time.Date(2026, time.July, 24, 18, 0, 0, 0, location)
+	next, err := nextAgentScheduleTime(agentScheduleConfig{
+		Frequency: "weekdays",
+		Time:      "09:00",
+		Timezone:  "Asia/Shanghai",
+	}, friday, friday)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, time.July, 27, 9, 0, 0, 0, location)
+	if !next.Equal(want) {
+		t.Fatalf("next schedule = %s, want %s", next, want)
+	}
+}
+
 func TestBuildAgentTriggeredBlueprintKeepsOnlySchedulePath(t *testing.T) {
 	nodes := []agentBlueprintGraphNode{
 		newAgentSchedulerTestNode("manual", "start"),

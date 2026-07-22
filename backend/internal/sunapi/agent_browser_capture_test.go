@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestWriteAgentBrowserScreenshot(t *testing.T) {
@@ -45,14 +47,42 @@ func TestWriteAgentBrowserScreenshotRejectsInvalidData(t *testing.T) {
 	}
 }
 
-func TestOpenAgentBrowserTargetAlwaysCreatesNewPage(t *testing.T) {
+func TestResolveAgentBrowserSessionPathsKeepsLegacyDefaultProfile(t *testing.T) {
+	dataDir := t.TempDir()
+	session := resolveAgentBrowserSessionPaths(dataDir, agentBrowserProfileDir)
+	if session.Name != agentBrowserDefaultSession {
+		t.Fatalf("session name = %q, want %q", session.Name, agentBrowserDefaultSession)
+	}
+	if session.ProfileDir != filepath.Join(dataDir, agentBrowserProfileDir) {
+		t.Fatalf("profile path = %q", session.ProfileDir)
+	}
+	if session.PortPath != filepath.Join(dataDir, agentBrowserPortFile) {
+		t.Fatalf("port path = %q", session.PortPath)
+	}
+}
+
+func TestResolveAgentBrowserSessionPathsSeparatesNamedSessions(t *testing.T) {
+	dataDir := t.TempDir()
+	session := resolveAgentBrowserSessionPaths(dataDir, "日报 账号/一")
+	if session.Name != "日报-账号-一" {
+		t.Fatalf("session name = %q", session.Name)
+	}
+	if session.ProfileDir != filepath.Join(dataDir, agentBrowserSessionsDir, session.Name, "profile") {
+		t.Fatalf("profile path = %q", session.ProfileDir)
+	}
+	if session.PortPath != filepath.Join(dataDir, agentBrowserSessionsDir, session.Name, "devtools-port") {
+		t.Fatalf("port path = %q", session.PortPath)
+	}
+}
+
+func TestOpenAgentBrowserTargetCreatesPageWhenNoReusablePage(t *testing.T) {
 	listCalls := 0
 	newCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/json/list":
 			listCalls++
-			http.Error(w, "page reuse is disabled", http.StatusInternalServerError)
+			http.Error(w, "temporary target list failure", http.StatusInternalServerError)
 		case "/json/new":
 			newCalls++
 			_ = json.NewEncoder(w).Encode(agentBrowserTarget{
@@ -64,15 +94,78 @@ func TestOpenAgentBrowserTargetAlwaysCreatesNewPage(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	target, err := openAgentBrowserTarget(t.Context(), server.URL, "https://example.com")
+	target, reused, err := openAgentBrowserTarget(t.Context(), server.URL, "https://example.com")
 	if err != nil {
 		t.Fatalf("openAgentBrowserTarget error = %v", err)
 	}
 	if target.ID != "new-page" {
 		t.Fatalf("target ID = %q, want new-page", target.ID)
 	}
-	if listCalls != 0 || newCalls != 1 {
-		t.Fatalf("list calls = %d, new calls = %d; want 0 and 1", listCalls, newCalls)
+	if reused {
+		t.Fatal("newly created page was reported as reused")
+	}
+	if listCalls != 1 || newCalls != 1 {
+		t.Fatalf("list calls = %d, new calls = %d; want 1 and 1", listCalls, newCalls)
+	}
+}
+
+func TestOpenAgentBrowserTargetReusesHealthyMatchingPage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	browser := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var request struct {
+				ID int `json:"id"`
+			}
+			if err := conn.ReadJSON(&request); err != nil {
+				return
+			}
+			if err := conn.WriteJSON(map[string]interface{}{
+				"id":     request.ID,
+				"result": map[string]interface{}{},
+			}); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(browser.Close)
+	websocketURL := "ws" + strings.TrimPrefix(browser.URL, "http") + "/devtools/page/session"
+
+	newCalls := 0
+	devtools := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/json/list":
+			_ = json.NewEncoder(w).Encode([]agentBrowserTarget{{
+				ID:                   "persisted-page",
+				Type:                 "page",
+				URL:                  "https://seller.example.test/dashboard",
+				WebSocketDebuggerURL: websocketURL,
+			}})
+		case "/json/new":
+			newCalls++
+			http.Error(w, "should not create a page", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(devtools.Close)
+
+	target, reused, err := openAgentBrowserTarget(t.Context(), devtools.URL, "https://seller.example.test/data")
+	if err != nil {
+		t.Fatalf("openAgentBrowserTarget error = %v", err)
+	}
+	if target.ID != "persisted-page" {
+		t.Fatalf("target ID = %q, want persisted-page", target.ID)
+	}
+	if !reused {
+		t.Fatal("persisted page was reported as newly created")
+	}
+	if newCalls != 0 {
+		t.Fatalf("new target calls = %d, want 0", newCalls)
 	}
 }
 

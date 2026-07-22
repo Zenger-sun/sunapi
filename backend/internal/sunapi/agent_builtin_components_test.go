@@ -65,6 +65,135 @@ func TestExecuteAgentBranchLoopAndDedupeSortComponents(t *testing.T) {
 	}
 }
 
+func TestExecuteBlueprintNodeGraphFollowsBranchHandles(t *testing.T) {
+	start := agentBlueprintGraphNode{ID: "start"}
+	start.Data.Kind = "start"
+	start.Data.Title = "Start"
+
+	branch := agentBlueprintGraphNode{ID: "branch"}
+	branch.Data.Kind = "custom"
+	branch.Data.ComponentID = "component.branch"
+	branch.Data.Title = "Branch"
+	branch.Data.Settings = map[string]string{}
+
+	trueNode := agentBlueprintGraphNode{ID: "true-node"}
+	trueNode.Data.Kind = "start"
+	trueNode.Data.Title = "True path"
+
+	falseNode := agentBlueprintGraphNode{ID: "false-node"}
+	falseNode.Data.Kind = "start"
+	falseNode.Data.Title = "False path"
+
+	nodes, err := json.Marshal([]agentBlueprintGraphNode{start, branch, trueNode, falseNode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := json.Marshal([]agentBlueprintGraphEdge{
+		{Source: "start", Target: "branch"},
+		{Source: "branch", Target: "true-node", SourceHandle: agentBranchTrueHandle},
+		{Source: "branch", Target: "false-node", SourceHandle: agentBranchFalseHandle},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, _, err := executeBlueprintNodeGraph(
+		context.Background(),
+		nil,
+		&AgentBlueprint{ID: "branch-routing", Nodes: nodes, Edges: edges},
+		nil,
+		map[string]interface{}{"type": "disabled"},
+	)
+	if err != nil {
+		t.Fatalf("executeBlueprintNodeGraph error = %v", err)
+	}
+
+	var graph agentBlueprintGraphExecution
+	if err := json.Unmarshal(output, &graph); err != nil {
+		t.Fatalf("failed to parse graph output: %v", err)
+	}
+	if len(graph.Nodes) != 4 {
+		t.Fatalf("graph nodes = %d, want 4", len(graph.Nodes))
+	}
+	if graph.Nodes[2].NodeID != "true-node" || graph.Nodes[2].Output["skipped"] == true {
+		t.Fatalf("true branch result = %#v", graph.Nodes[2])
+	}
+	if graph.Nodes[3].NodeID != "false-node" || graph.Nodes[3].Output["skipped"] != true {
+		t.Fatalf("false branch result = %#v", graph.Nodes[3])
+	}
+}
+
+func TestExecuteBlueprintNodeGraphRoutesSwitchFromBlueprintVariable(t *testing.T) {
+	start := agentBlueprintGraphNode{ID: "start"}
+	start.Data.Kind = "start"
+
+	setVariable := agentBlueprintGraphNode{ID: "set-variable"}
+	setVariable.Data.Kind = "custom"
+	setVariable.Data.ComponentID = "component.set_variable"
+	setVariable.Data.Settings = map[string]string{
+		"变量名": "status",
+		"变量值": "ok",
+	}
+
+	switchNode := agentBlueprintGraphNode{ID: "switch"}
+	switchNode.Data.Kind = "custom"
+	switchNode.Data.ComponentID = "component.switch"
+	switchNode.Data.Settings = map[string]string{
+		"判断字段": "variables.status",
+		"分支配置": "ok=正常\nerror=异常",
+		"默认分支": "其他",
+	}
+
+	matchedNode := agentBlueprintGraphNode{ID: "matched"}
+	matchedNode.Data.Kind = "start"
+	defaultNode := agentBlueprintGraphNode{ID: "default"}
+	defaultNode.Data.Kind = "start"
+
+	nodes, err := json.Marshal([]agentBlueprintGraphNode{
+		start, setVariable, switchNode, matchedNode, defaultNode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges, err := json.Marshal([]agentBlueprintGraphEdge{
+		{Source: "start", Target: "set-variable"},
+		{Source: "set-variable", Target: "switch"},
+		{Source: "switch", Target: "matched", SourceHandle: "switch-0"},
+		{Source: "switch", Target: "default", SourceHandle: agentSwitchDefaultHandle},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, _, err := executeBlueprintNodeGraph(
+		context.Background(),
+		nil,
+		&AgentBlueprint{ID: "switch-routing", Nodes: nodes, Edges: edges},
+		nil,
+		map[string]interface{}{"type": "disabled"},
+	)
+	if err != nil {
+		t.Fatalf("executeBlueprintNodeGraph error = %v", err)
+	}
+
+	var graph agentBlueprintGraphExecution
+	if err := json.Unmarshal(output, &graph); err != nil {
+		t.Fatalf("failed to parse graph output: %v", err)
+	}
+	if len(graph.Nodes) != 5 {
+		t.Fatalf("graph nodes = %d, want 5", len(graph.Nodes))
+	}
+	if graph.InputVars["status"] != "ok" {
+		t.Fatalf("blueprint status variable = %#v, want ok", graph.InputVars["status"])
+	}
+	if graph.Nodes[3].NodeID != "matched" || graph.Nodes[3].Output["skipped"] == true {
+		t.Fatalf("matched route result = %#v", graph.Nodes[3])
+	}
+	if graph.Nodes[4].NodeID != "default" || graph.Nodes[4].Output["skipped"] != true {
+		t.Fatalf("default route result = %#v", graph.Nodes[4])
+	}
+}
+
 func TestExecuteBlueprintNodeGraphStopsOnFailedNode(t *testing.T) {
 	start := agentBlueprintGraphNode{ID: "start-1"}
 	start.Data.Kind = "start"
@@ -117,6 +246,77 @@ func TestExecuteBlueprintNodeGraphStopsOnFailedNode(t *testing.T) {
 	}
 }
 
+func TestExecuteBlueprintNodeGraphStopsAfterStopNode(t *testing.T) {
+	start := agentBlueprintGraphNode{ID: "start"}
+	start.Data.Kind = "start"
+	stop := agentBlueprintGraphNode{ID: "stop"}
+	stop.Data.Kind = "stop"
+	after := agentBlueprintGraphNode{ID: "after"}
+	after.Data.Kind = "start"
+	nodes, _ := json.Marshal([]agentBlueprintGraphNode{start, stop, after})
+	edges, _ := json.Marshal([]agentBlueprintGraphEdge{
+		{Source: "start", Target: "stop"},
+		{Source: "stop", Target: "after"},
+	})
+
+	output, _, err := executeBlueprintNodeGraph(
+		context.Background(),
+		nil,
+		&AgentBlueprint{ID: "stop-flow", Nodes: nodes, Edges: edges},
+		nil,
+		map[string]interface{}{"type": "disabled"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph agentBlueprintGraphExecution
+	if err := json.Unmarshal(output, &graph); err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.Nodes) != 2 || graph.Nodes[1].NodeID != "stop" {
+		t.Fatalf("executed nodes = %#v, want start and stop", graph.Nodes)
+	}
+}
+
+func TestExecuteBlueprintNodeGraphFansOutOneOutputToMultipleNodes(t *testing.T) {
+	start := agentBlueprintGraphNode{ID: "start"}
+	start.Data.Kind = "start"
+	left := agentBlueprintGraphNode{ID: "left"}
+	left.Data.Kind = "start"
+	right := agentBlueprintGraphNode{ID: "right"}
+	right.Data.Kind = "start"
+	nodes, _ := json.Marshal([]agentBlueprintGraphNode{start, left, right})
+	edges, _ := json.Marshal([]agentBlueprintGraphEdge{
+		{Source: "start", Target: "left"},
+		{Source: "start", Target: "right"},
+	})
+
+	output, _, err := executeBlueprintNodeGraph(
+		context.Background(),
+		nil,
+		&AgentBlueprint{ID: "fan-out", Nodes: nodes, Edges: edges},
+		nil,
+		map[string]interface{}{"type": "disabled"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph agentBlueprintGraphExecution
+	if err := json.Unmarshal(output, &graph); err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.Nodes) != 3 {
+		t.Fatalf("executed nodes = %d, want 3", len(graph.Nodes))
+	}
+	executed := map[string]bool{}
+	for _, node := range graph.Nodes {
+		executed[node.NodeID] = true
+	}
+	if !executed["left"] || !executed["right"] {
+		t.Fatalf("fan-out execution = %#v", executed)
+	}
+}
+
 func TestExecuteAgentWaitComponentCanBeCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -130,6 +330,34 @@ func TestExecuteAgentWaitComponentCanBeCancelled(t *testing.T) {
 	}
 	if result.Error == "" {
 		t.Fatalf("expected cancellation error")
+	}
+}
+
+func TestValidateAgentBlueprintGraphRejectsCycle(t *testing.T) {
+	first := agentBlueprintGraphNode{ID: "first"}
+	second := agentBlueprintGraphNode{ID: "second"}
+	err := validateAgentBlueprintGraph(
+		[]agentBlueprintGraphNode{first, second},
+		[]agentBlueprintGraphEdge{
+			{ID: "a", Source: "first", Target: "second"},
+			{ID: "b", Source: "second", Target: "first"},
+		},
+	)
+	if err == nil {
+		t.Fatal("expected cycle validation error")
+	}
+}
+
+func TestAgentCodeConditionSupportsFieldExists(t *testing.T) {
+	condition, err := parseAgentCodeCondition("status exists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !condition.Match(map[string]interface{}{"status": "ok"}) {
+		t.Fatal("expected existing status field to match")
+	}
+	if condition.Match(map[string]interface{}{"status": ""}) {
+		t.Fatal("did not expect empty status field to match")
 	}
 }
 

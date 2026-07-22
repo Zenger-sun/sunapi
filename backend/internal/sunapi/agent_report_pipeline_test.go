@@ -15,6 +15,7 @@ func TestBuildAgentReportPlanRecognizesProductRequirements(t *testing.T) {
 	planOutput := buildAgentReportPlan(node, map[string]interface{}{
 		"browser": map[string]interface{}{
 			"final_url":         "https://seller.example.test/data",
+			"browser_session":   "daily-seller",
 			"browser_target_id": "target-current-run",
 		},
 	})
@@ -27,6 +28,9 @@ func TestBuildAgentReportPlanRecognizesProductRequirements(t *testing.T) {
 	}
 	if plan["source_url"] != "https://seller.example.test/data" {
 		t.Fatalf("source_url=%v", plan["source_url"])
+	}
+	if plan["browser_session"] != "daily-seller" {
+		t.Fatalf("browser_session=%v", plan["browser_session"])
 	}
 	if plan["browser_target_id"] != "target-current-run" {
 		t.Fatalf("browser_target_id=%v", plan["browser_target_id"])

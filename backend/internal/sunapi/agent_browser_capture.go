@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -23,6 +25,8 @@ import (
 const (
 	agentBrowserProfileDir        = "agent-browser-profile"
 	agentBrowserPortFile          = "agent-browser-devtools-port"
+	agentBrowserSessionsDir       = "agent-browser-sessions"
+	agentBrowserDefaultSession    = "default"
 	agentBrowserCaptureDir        = "agent-browser-captures"
 	agentBrowserCaptureMaxRunes   = 200000
 	agentBrowserCaptureMaxWait    = 30
@@ -36,6 +40,7 @@ const (
 type AgentBrowserCaptureRequest struct {
 	URL              string `json:"url"`
 	LoginState       string `json:"login_state,omitempty"`
+	SessionName      string `json:"session_name,omitempty"`
 	WaitSeconds      int    `json:"wait_seconds,omitempty"`
 	LoginWaitSeconds int    `json:"login_wait_seconds,omitempty"`
 }
@@ -49,6 +54,7 @@ type AgentBrowserCaptureResult struct {
 	ScreenshotError string `json:"screenshot_error,omitempty"`
 	CapturedAt      int64  `json:"captured_at"`
 	ElapsedMS       int64  `json:"elapsed_ms"`
+	BrowserSession  string `json:"browser_session"`
 	BrowserTargetID string `json:"browser_target_id,omitempty"`
 }
 
@@ -59,6 +65,16 @@ type agentBrowserTarget struct {
 	Title                string `json:"title"`
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
+
+type agentBrowserSessionPaths struct {
+	Name       string
+	ProfileDir string
+	PortPath   string
+}
+
+// Chromium only permits one process per user-data-dir. Serializing startup
+// prevents concurrent scheduled blueprints from racing into an empty profile.
+var agentBrowserDevtoolsMu sync.Mutex
 
 func handleCaptureAgentBrowserPage(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -94,12 +110,13 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		return AgentBrowserCaptureResult{}, err
 	}
 
-	endpoint, err := ensureAgentBrowserDevtools(ctx, dataDir)
+	session := resolveAgentBrowserSessionPaths(dataDir, req.SessionName)
+	endpoint, err := ensureAgentBrowserDevtoolsForSession(ctx, session)
 	if err != nil {
 		return AgentBrowserCaptureResult{}, err
 	}
 
-	target, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
+	target, _, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
 	if err != nil {
 		return AgentBrowserCaptureResult{}, err
 	}
@@ -166,6 +183,7 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		ScreenshotError: screenshotError,
 		CapturedAt:      capturedAt.Unix(),
 		ElapsedMS:       time.Since(started).Milliseconds(),
+		BrowserSession:  session.Name,
 		BrowserTargetID: target.ID,
 	}, nil
 }
@@ -199,7 +217,14 @@ func reserveAgentBrowserPort() (int, error) {
 }
 
 func ensureAgentBrowserDevtools(ctx context.Context, dataDir string) (string, error) {
-	portPath := filepath.Join(dataDir, agentBrowserPortFile)
+	return ensureAgentBrowserDevtoolsForSession(ctx, resolveAgentBrowserSessionPaths(dataDir, agentBrowserDefaultSession))
+}
+
+func ensureAgentBrowserDevtoolsForSession(ctx context.Context, session agentBrowserSessionPaths) (string, error) {
+	agentBrowserDevtoolsMu.Lock()
+	defer agentBrowserDevtoolsMu.Unlock()
+
+	portPath := session.PortPath
 	if raw, err := os.ReadFile(portPath); err == nil {
 		if port := strings.TrimSpace(string(raw)); port != "" {
 			endpoint := "http://127.0.0.1:" + port
@@ -220,14 +245,14 @@ func ensureAgentBrowserDevtools(ctx context.Context, dataDir string) (string, er
 		return "", err
 	}
 
-	profileDir := filepath.Join(dataDir, agentBrowserProfileDir)
-	if err := os.MkdirAll(profileDir, 0755); err != nil {
+	if err := os.MkdirAll(session.ProfileDir, 0755); err != nil {
 		return "", err
 	}
 
 	args := []string{
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--user-data-dir=" + profileDir,
+		"--user-data-dir=" + session.ProfileDir,
+		"--profile-directory=Default",
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-background-networking",
@@ -249,6 +274,53 @@ func ensureAgentBrowserDevtools(ctx context.Context, dataDir string) (string, er
 	_ = cmd.Process.Release()
 	_ = os.WriteFile(portPath, []byte(fmt.Sprintf("%d", port)), 0644)
 	return endpoint, nil
+}
+
+func resolveAgentBrowserSessionPaths(dataDir, requested string) agentBrowserSessionPaths {
+	name := normalizeAgentBrowserSessionName(requested)
+	if name == agentBrowserDefaultSession {
+		// Keep using the original paths so existing users retain their login cookies.
+		return agentBrowserSessionPaths{
+			Name:       name,
+			ProfileDir: filepath.Join(dataDir, agentBrowserProfileDir),
+			PortPath:   filepath.Join(dataDir, agentBrowserPortFile),
+		}
+	}
+	base := filepath.Join(dataDir, agentBrowserSessionsDir, name)
+	return agentBrowserSessionPaths{
+		Name:       name,
+		ProfileDir: filepath.Join(base, "profile"),
+		PortPath:   filepath.Join(base, "devtools-port"),
+	}
+}
+
+func normalizeAgentBrowserSessionName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "default") || strings.EqualFold(value, agentBrowserProfileDir) || value == "默认" || value == "默认会话" {
+		return agentBrowserDefaultSession
+	}
+	var builder strings.Builder
+	lastDash := false
+	for _, char := range value {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			builder.WriteRune(unicode.ToLower(char))
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	name := strings.Trim(builder.String(), "-")
+	if name == "" {
+		return agentBrowserDefaultSession
+	}
+	nameRunes := []rune(name)
+	if len(nameRunes) > 48 {
+		name = string(nameRunes[:48])
+	}
+	return name
 }
 
 func waitAgentBrowserDevtoolsQuick(ctx context.Context, endpoint string) error {
@@ -307,8 +379,18 @@ func waitAgentBrowserDevtools(ctx context.Context, endpoint string) error {
 	return errors.New("浏览器调试端口启动超时")
 }
 
-func openAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, error) {
-	return createAgentBrowserTarget(ctx, endpoint, targetURL)
+func openAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, bool, error) {
+	target, found, err := findAgentBrowserTarget(ctx, endpoint, targetURL)
+	if err == nil && found {
+		if probeAgentBrowserTarget(ctx, target) == nil {
+			return target, true, nil
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = closeAgentBrowserTarget(cleanupCtx, endpoint, target.ID)
+		cancel()
+	}
+	target, err = createAgentBrowserTarget(ctx, endpoint, targetURL)
+	return target, false, err
 }
 
 func findAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, bool, error) {

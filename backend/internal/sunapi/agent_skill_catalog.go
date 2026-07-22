@@ -2,6 +2,7 @@ package sunapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,13 @@ import (
 	"time"
 )
 
-const maxSkillManifestBytes = 512 * 1024
+const (
+	maxSkillManifestBytes        = 64 * 1024
+	maxSkillInstructionRunes     = 900
+	maxSkillInstructionItems     = 8
+	maxSkillInstructionsRunes    = 4_000
+	skillRuntimeModePromptPolicy = "prompt-policy"
+)
 
 type skillConfigPayload struct {
 	Tags         []string `json:"tags,omitempty"`
@@ -28,6 +35,9 @@ type skillConfigPayload struct {
 	InstallMode  string   `json:"install_mode,omitempty"`
 	Source       string   `json:"source,omitempty"`
 	EntryFile    string   `json:"entry_file,omitempty"`
+	NodeKinds    []string `json:"node_kinds,omitempty"`
+	RuntimeMode  string   `json:"runtime_mode,omitempty"`
+	SourceDigest string   `json:"source_digest,omitempty"`
 }
 
 type skillManifestPayload struct {
@@ -39,6 +49,7 @@ type skillManifestPayload struct {
 	Instructions []string           `json:"instructions"`
 	Permissions  []string           `json:"permissions"`
 	Config       skillConfigPayload `json:"config"`
+	SourceDigest string             `json:"-"`
 }
 
 var marketplaceSkillCatalog = []AgentSkillMarketplaceItem{
@@ -454,8 +465,13 @@ func prepareMarketplaceSkillForm(f SkillFormData) (SkillFormData, json.RawMessag
 			"marketplace_id": item.ID,
 			"install_mode":   "marketplace",
 			"source":         item.SourceURL,
+			"node_kinds":     inferSkillNodeKinds(item.Tags),
+			"runtime_mode":   skillRuntimeModePromptPolicy,
 		})
-		permissions := marshalStringSlice(item.Permissions)
+		permissions, err := marshalValidatedSkillPermissions(item.Permissions)
+		if err != nil {
+			return f, nil, nil, "", err
+		}
 		return f, config, permissions, item.Version, nil
 	}
 	return f, nil, nil, "", fmt.Errorf("marketplace skill %q not found", id)
@@ -483,13 +499,20 @@ func prepareGitHubSkillForm(ctx context.Context, f SkillFormData) (SkillFormData
 		f.Description = "从 GitHub 仓库导入的 Skill。"
 	}
 	tags := normalizeTags(append(manifest.Tags, f.Tags...))
+	instructions := sanitizeImportedSkillInstructions(manifest.Instructions)
+	if len(instructions) == 0 {
+		instructions = buildImportedSkillInstructions(f.Description, manifest.Capabilities)
+	}
 	config := mergeSkillConfig(mustSkillConfig(skillConfigPayload{
 		Tags:         tags,
 		Capabilities: manifest.Capabilities,
-		Instructions: manifest.Instructions,
+		Instructions: instructions,
 		InstallMode:  "github",
 		Source:       sourceURL,
 		EntryFile:    entryFile,
+		NodeKinds:    inferSkillNodeKinds(tags),
+		RuntimeMode:  skillRuntimeModePromptPolicy,
+		SourceDigest: manifest.SourceDigest,
 	}), map[string]any{
 		"github_url": sourceURL,
 	})
@@ -497,7 +520,10 @@ func prepareGitHubSkillForm(ctx context.Context, f SkillFormData) (SkillFormData
 	if strings.TrimSpace(version) == "" {
 		version = "1.0.0"
 	}
-	permissions := marshalStringSlice(manifest.Permissions)
+	permissions, err := marshalValidatedSkillPermissions(manifest.Permissions)
+	if err != nil {
+		return f, nil, nil, "", err
+	}
 	return f, config, permissions, version, nil
 }
 
@@ -518,6 +544,8 @@ func prepareCustomSkillForm(f SkillFormData) (SkillFormData, json.RawMessage, js
 		"model_group":  strings.TrimSpace(f.ModelGroup),
 		"model_name":   strings.TrimSpace(f.ModelName),
 		"install_mode": "custom",
+		"node_kinds":   inferSkillNodeKinds(tags),
+		"runtime_mode": skillRuntimeModePromptPolicy,
 	})
 	return f, config, json.RawMessage(`[]`), "1.0.0", nil
 }
@@ -556,6 +584,65 @@ func marshalStringSlice(values []string) json.RawMessage {
 		return json.RawMessage(`[]`)
 	}
 	return raw
+}
+
+var allowedSkillPermissions = map[string]struct{}{
+	"network:read":     {},
+	"network:write":    {},
+	"browser:read":     {},
+	"file:read":        {},
+	"file:write":       {},
+	"database:read":    {},
+	"code:execute":     {},
+	"workflow:execute": {},
+	"image:generate":   {},
+	"video:generate":   {},
+}
+
+func marshalValidatedSkillPermissions(values []string) (json.RawMessage, error) {
+	permissions := uniqueNonEmptyStrings(values)
+	for _, permission := range permissions {
+		if _, ok := allowedSkillPermissions[permission]; !ok {
+			return nil, fmt.Errorf("unsupported skill permission %q", permission)
+		}
+	}
+	return marshalStringSlice(permissions), nil
+}
+
+// inferSkillNodeKinds keeps prompt-only Skills from being offered on unrelated nodes.
+// An empty result is intentionally treated as unrestricted for backward compatibility.
+func inferSkillNodeKinds(tags []string) []string {
+	tagSet := map[string]bool{}
+	for _, tag := range normalizeTags(tags) {
+		tagSet[tag] = true
+	}
+	kinds := make([]string, 0, 6)
+	add := func(values ...string) { kinds = append(kinds, values...) }
+	if tagSet["browser"] || tagSet["web"] || tagSet["research"] {
+		add("browser", "request", "webpage", "report", "custom")
+	}
+	if tagSet["api"] || tagSet["integration"] {
+		add("request", "notify", "custom")
+	}
+	if tagSet["file"] || tagSet["spreadsheet"] || tagSet["document"] || tagSet["report"] {
+		add("transform", "report", "webpage", "custom")
+	}
+	if tagSet["data"] || tagSet["code"] || tagSet["database"] {
+		add("request", "transform", "report", "image", "custom")
+	}
+	if tagSet["workflow"] {
+		add("start", "schedule", "notify", "stop", "custom")
+	}
+	if tagSet["notification"] || tagSet["webhook"] {
+		add("notify", "custom")
+	}
+	if tagSet["image"] {
+		add("image", "custom")
+	}
+	if tagSet["video"] {
+		add("custom")
+	}
+	return uniqueNonEmptyStrings(kinds)
 }
 
 func normalizeTags(tags []string) []string {
@@ -658,6 +745,8 @@ func fetchGitHubSkillManifest(ctx context.Context, repoURL string) (skillManifes
 				lastErr = err
 				continue
 			}
+			digest := sha256.Sum256(body)
+			manifest.SourceDigest = fmt.Sprintf("sha256:%x", digest)
 			return manifest, filePath, nil
 		}
 	}
@@ -709,7 +798,14 @@ func fetchLimitedText(ctx context.Context, rawURL string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s returned %d", rawURL, resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxSkillManifestBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSkillManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxSkillManifestBytes {
+		return nil, fmt.Errorf("skill manifest exceeds %d KB limit", maxSkillManifestBytes/1024)
+	}
+	return body, nil
 }
 
 func parseSkillManifest(filename string, body []byte) (skillManifestPayload, error) {
@@ -728,6 +824,9 @@ func parseSkillManifest(filename string, body []byte) (skillManifestPayload, err
 	}
 	if len(manifest.Instructions) == 0 && len(manifest.Config.Instructions) > 0 {
 		manifest.Instructions = manifest.Config.Instructions
+	}
+	if len(manifest.Permissions) == 0 {
+		manifest.Permissions = nil
 	}
 	return manifest, nil
 }
@@ -773,7 +872,7 @@ func parseSkillMarkdown(body []byte) (skillManifestPayload, error) {
 	if strings.TrimSpace(manifest.Description) == "" {
 		manifest.Description = firstParagraph(text)
 	}
-	manifest.Instructions = []string{strings.TrimSpace(text)}
+	manifest.Instructions = extractSkillMarkdownInstructions(text)
 	manifest.Capabilities = inferSkillCapabilities(manifest.Description + "\n" + manifest.Name)
 	manifest.Tags = normalizeTags(append(manifest.Tags, inferSkillTags(manifest.Description+"\n"+manifest.Name)...))
 	return manifest, nil
@@ -810,6 +909,87 @@ func firstParagraph(text string) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(paragraph, " "))
+}
+
+var unsafeSkillInstructionPattern = regexp.MustCompile(`(?i)(<\|[^|]+\|>|ignore\s+(all|any|previous|prior|system|developer)\s+(instructions?|messages?)|override\s+(the\s+)?(system|developer)|act\s+as\s+(the\s+)?(system|developer)|system\s+prompt|developer\s+message|reveal\s+(the\s+)?(api.?key|token|password|secret)|exfiltrat)`)
+
+func extractSkillMarkdownInstructions(text string) []string {
+	lines := strings.Split(text, "\n")
+	var instructions []string
+	inInstructions := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			heading := strings.ToLower(strings.TrimSpace(strings.TrimLeft(trimmed, "#")))
+			inInstructions = strings.Contains(heading, "instruction") ||
+				strings.Contains(heading, "guideline") ||
+				strings.Contains(heading, "usage") ||
+				strings.Contains(heading, "rule") ||
+				strings.Contains(heading, "\u6307\u4ee4") ||
+				strings.Contains(heading, "\u89c4\u5219") ||
+				strings.Contains(heading, "\u7528\u6cd5")
+			continue
+		}
+		if !inInstructions || trimmed == "" || strings.HasPrefix(trimmed, "<!--") {
+			continue
+		}
+		trimmed = strings.TrimSpace(strings.TrimLeft(trimmed, "-*0123456789. )"))
+		if trimmed != "" {
+			instructions = append(instructions, trimmed)
+		}
+	}
+	return sanitizeImportedSkillInstructions(instructions)
+}
+
+func sanitizeImportedSkillInstructions(instructions []string) []string {
+	cleaned := make([]string, 0, len(instructions))
+	totalRunes := 0
+	for _, instruction := range instructions {
+		instruction = strings.Join(strings.Fields(strings.TrimSpace(instruction)), " ")
+		if instruction == "" || unsafeSkillInstructionPattern.MatchString(instruction) {
+			continue
+		}
+		instruction = truncateSkillText(instruction, maxSkillInstructionRunes)
+		remaining := maxSkillInstructionsRunes - totalRunes
+		if remaining <= 0 || len(cleaned) >= maxSkillInstructionItems {
+			break
+		}
+		instruction = truncateSkillText(instruction, remaining)
+		if instruction == "" {
+			continue
+		}
+		cleaned = append(cleaned, instruction)
+		totalRunes += len([]rune(instruction))
+	}
+	return uniqueNonEmptyStrings(cleaned)
+}
+
+func buildImportedSkillInstructions(description string, capabilities []string) []string {
+	description = truncateSkillText(strings.Join(strings.Fields(strings.TrimSpace(description)), " "), 360)
+	capabilities = sanitizeImportedSkillInstructions(capabilities)
+	instructions := []string{
+		"Use only the current node inputs and explicit upstream outputs. Do not request or infer hidden context.",
+		"Return the result, its evidence, and any missing inputs needed to complete the task.",
+	}
+	if description != "" {
+		instructions = append(instructions, "Skill scope: "+description)
+	}
+	if len(capabilities) > 0 {
+		instructions = append(instructions, "Declared capabilities: "+strings.Join(capabilities, ", "))
+	}
+	return sanitizeImportedSkillInstructions(instructions)
+}
+
+func truncateSkillText(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if maxRunes <= 0 || value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:maxRunes])) + "..."
 }
 
 func repoNameFromURL(raw string) string {

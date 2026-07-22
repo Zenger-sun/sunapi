@@ -37,6 +37,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
+  useUpdateNodeInternals,
   type AriaLabelConfig,
   type Connection,
   type Edge,
@@ -75,6 +76,7 @@ import {
   SparklesIcon,
   StopCircleIcon,
   Table2Icon,
+  TicketCheckIcon,
   Trash2Icon,
   Undo2Icon,
   UploadIcon,
@@ -208,11 +210,26 @@ type AgentNodeExecutionLog = {
 type AgentExecutionLogMap = Record<string, AgentNodeExecutionLog>
 
 type AgentFlowNode = Node<AgentNodeData, 'agentNode'>
-type AgentFlowEdge = Edge
+type AgentBranchRoute = 'true' | 'false'
+type AgentRouteKind = 'branch' | 'switch' | 'loop'
+type AgentFlowEdgeData = {
+  branchRoute?: AgentBranchRoute
+  routeKey?: string
+  routeKind?: AgentRouteKind
+  routeLabel?: string
+}
+type AgentFlowEdge = Edge<AgentFlowEdgeData>
 type AgentEdgeDraft = Partial<AgentFlowEdge> & {
   source?: string | null
   target?: string | null
 }
+
+const BRANCH_TRUE_HANDLE = 'branch-true'
+const BRANCH_FALSE_HANDLE = 'branch-false'
+const SWITCH_HANDLE_PREFIX = 'switch-'
+const SWITCH_DEFAULT_HANDLE = 'switch-default'
+const LOOP_ITEM_HANDLE = 'loop-item'
+const LOOP_DONE_HANDLE = 'loop-done'
 
 type BackendAgentNodeResult = {
   node_id?: string
@@ -254,6 +271,8 @@ type SkillChoice = {
   modelGroup?: string
   modelName?: string
   tags?: string[]
+  /** Undefined keeps legacy saved Skills available on every node. */
+  appliesTo?: AgentNodeKind[]
 }
 
 type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
@@ -282,13 +301,21 @@ type TemplateBinding = {
   hash?: string
 }
 
+type AgentPaletteGroup =
+  | '触发'
+  | '控制流'
+  | '采集'
+  | '智能处理'
+  | '输出'
+  | '业务模板'
+
 type NodeTemplate = {
   kind: AgentNodeKind
   componentId?: string
   source?: 'builtin' | 'custom'
   title: string
   description: string
-  paletteGroup?: '触发' | '采集' | '智能处理' | '输出'
+  paletteGroup?: AgentPaletteGroup
   group?: string
   model: string
   skill: string
@@ -318,6 +345,12 @@ type SavedAgentBlueprint = {
   backendAgentId?: string
   backendBlueprintId?: string
   syncState?: 'synced' | 'draft'
+}
+
+type BlueprintChoice = {
+  label: string
+  localId: string
+  value: string
 }
 
 type AgentPreviewRunMode = 'default' | 'manual'
@@ -372,7 +405,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.web-research',
     description: '检索、网页阅读和事实核验，适合资料收集与趋势调研。',
     source: 'built-in',
-    appliesTo: ['browser', 'request', 'webpage', 'report'],
+    appliesTo: ['browser', 'request', 'webpage', 'report', 'custom'],
     capabilities: ['关键词规划', '来源交叉验证', '引用摘要'],
     instructions: [
       '先把任务拆成 2-5 个可检索问题，再围绕当前节点输入进行查找和摘要。',
@@ -385,7 +418,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.file-document',
     description: '读取整理 Excel、CSV、PDF、Word、Markdown、HTML、TXT 等文件。',
     source: 'built-in',
-    appliesTo: ['transform', 'report', 'webpage'],
+    appliesTo: ['transform', 'report', 'webpage', 'custom'],
     capabilities: ['多格式解析', '模板遵循', '结构保真'],
     instructions: [
       '只使用当前上传或上游显式提供的文件内容，不猜测未提供的表格、标题或业务背景。',
@@ -398,7 +431,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser', 'report_data'],
+    appliesTo: ['browser', 'report_data', 'custom'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -411,7 +444,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.code-interpreter',
     description: '用于数据清洗、计算、图表、文件转换和可复现脚本化分析。',
     source: 'built-in',
-    appliesTo: ['transform', 'image', 'report'],
+    appliesTo: ['transform', 'image', 'report', 'custom'],
     capabilities: ['数据清洗', '计算分析', '文件生成'],
     instructions: [
       '优先用确定性的表格/脚本处理计算、清洗、去重、排序、转换和统计任务。',
@@ -424,7 +457,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.api-function',
     description: '组织 HTTP/API 调用、函数参数、重试策略和结构化响应解析。',
     source: 'built-in',
-    appliesTo: ['request', 'notify'],
+    appliesTo: ['request', 'notify', 'custom'],
     capabilities: ['参数校验', 'JSON 解析', '错误恢复'],
     instructions: [
       '根据节点中的 endpoint、method、headers、body、鉴权和超时配置组织请求。',
@@ -437,7 +470,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.rag-file-search',
     description: '知识库、文档检索、片段引用和问答总结的检索增强能力。',
     source: 'built-in',
-    appliesTo: ['browser', 'request', 'transform', 'report'],
+    appliesTo: ['browser', 'request', 'transform', 'report', 'custom'],
     capabilities: ['语义检索', '片段引用', '答案合成'],
     instructions: [
       '围绕问题检索最相关的文档片段，并基于片段回答，不使用未命中的外部背景补全。',
@@ -450,7 +483,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.database-sql',
     description: '结构化数据查询、SQL 生成、指标口径和结果解释。',
     source: 'built-in',
-    appliesTo: ['request', 'transform', 'report'],
+    appliesTo: ['request', 'transform', 'report', 'custom'],
     capabilities: ['Schema 理解', 'SQL 生成', '结果校验'],
     instructions: [
       '先确认表结构、字段含义、过滤条件和时间范围，再生成查询或解释结果。',
@@ -549,7 +582,7 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   stop: 'skill.mcp-workflow',
 }
 
-const FREQUENCY_OPTIONS = ['每天', '工作日', '每周', '每月', '每小时']
+const FREQUENCY_OPTIONS = ['每天', '工作日', '每周', '每月', '每小时', '仅一次']
 const TIMEZONE_OPTIONS = [
   'Asia/Shanghai',
   'Asia/Singapore',
@@ -589,7 +622,7 @@ const REPORT_OUTPUT_FORMAT_PRESETS = [
 const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   触发方式: ['手动', '定时', 'Webhook', '对话触发'],
   运行模式: ['单次执行', '循环执行', '仅预览', '失败后重试'],
-  登录态: ['使用当前设备浏览器', '使用已保存登录态', '无需登录'],
+  登录态: ['持久化登录会话（首次登录后复用）', '每次等待手动登录', '无需登录'],
   登录等待: ['30s', '60s', '120s', '180s'],
   权限: ['只读采集', '读写操作需确认', '禁止写入'],
   方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
@@ -636,6 +669,11 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   采集周期: ['近1天', '近7天', '近30天'],
   页面等待: ['2s', '4s', '6s', '10s'],
   最大页数: ['5', '10', '20', '50'],
+  轮询间隔: ['3s', '5s', '10s', '15s', '30s'],
+  最大轮询: ['24', '48', '96', '180', '360'],
+  最长运行: ['2m', '5m', '8m', '15m', '30m'],
+  找到后动作: ['进入确认页后停止', '仅提醒并停止'],
+  订单提交: ['必须人工确认'],
   组件来源: ['系统内置', '自定义'],
   执行策略: ['按描述执行', '结构化处理', '只读采集', '写入前确认'],
   模式: ['读取', '写入', '追加', '转换'],
@@ -644,13 +682,14 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   冲突处理: ['保留最新', '保留最早', '输出冲突记录', '请求人工确认'],
   条件: ['字段存在', '表达式为真', '数值比较', '文本包含'],
   未命中处理: ['跳过', '输出空数组', '中断流程', '请求人工确认'],
+  为空时: ['使用上游数据', '保留空值'],
 }
 
 const NODE_META: Record<
   AgentNodeKind,
   {
     label: string
-    group: '触发' | '采集' | '智能处理' | '输出'
+    group: AgentPaletteGroup
     role: ModelRole
     icon: LucideIcon
     accent: string
@@ -696,12 +735,13 @@ const NODE_META: Record<
     icon: GlobeIcon,
     accent: 'bg-blue-500/12 text-blue-700 dark:text-blue-300',
     description:
-      '打开独立浏览器窗口并等待用户完成登录，为后续数据处理提供复用会话。',
+      '使用持久化浏览器会话访问登录态页面。首次登录后，定时任务会复用 Cookie。',
     inputs: ['网址', '登录要求'],
     outputs: ['浏览器会话', '登录状态'],
     settings: {
       网址: 'https://www.goofish.com/',
-      登录态: '使用当前设备浏览器',
+      登录态: '持久化登录会话（首次登录后复用）',
+      会话名称: '默认',
       登录等待: '120s',
       权限: '只读采集',
       采集等待: '6s',
@@ -764,13 +804,13 @@ const NODE_META: Record<
     },
   },
   report: {
-    label: '生成日报',
+    label: '生成报告',
     group: '输出',
     role: 'reasoning',
     icon: FileTextIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
     description:
-      '把表格、结论和图片整理成日报文档；格式、语气、标题等要求写在任务描述里。',
+      '把表格、结论和图片整理成报告文档；格式、语气、标题等要求写在任务描述里。',
     inputs: ['标准表格', '关键结论', '图片 URL'],
     outputs: [...DEFAULT_REPORT_OUTPUT_FORMATS, REPORT_OUTPUT_PATH_LABEL],
     settings: {
@@ -782,8 +822,8 @@ const NODE_META: Record<
     },
   },
   report_data: {
-    label: '处理数据',
-    group: '智能处理',
+    label: '日报数据管线',
+    group: '业务模板',
     role: 'reasoning',
     icon: Table2Icon,
     accent: 'bg-indigo-500/12 text-indigo-700 dark:text-indigo-300',
@@ -847,7 +887,7 @@ const NODE_META: Record<
   },
   stop: {
     label: '停止',
-    group: '触发',
+    group: '控制流',
     role: 'system',
     icon: StopCircleIcon,
     accent: 'bg-slate-500/12 text-slate-700 dark:text-slate-300',
@@ -860,18 +900,121 @@ const NODE_META: Record<
   },
 }
 
+const COMPONENT_VISUAL_META: Record<
+  string,
+  {
+    label: string
+    group: AgentPaletteGroup
+    icon: LucideIcon
+    accent: string
+  }
+> = {
+  'component.webhook': {
+    label: 'Webhook 触发',
+    group: '触发',
+    icon: WebhookIcon,
+    accent: 'bg-cyan-500/12 text-cyan-700 dark:text-cyan-300',
+  },
+  'component.branch': {
+    label: '条件分支',
+    group: '控制流',
+    icon: ChartNetworkIcon,
+    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
+  },
+  'component.switch': {
+    label: '多路判断',
+    group: '控制流',
+    icon: MergeIcon,
+    accent: 'bg-sky-500/12 text-sky-700 dark:text-sky-300',
+  },
+  'component.set_variable': {
+    label: '设置变量',
+    group: '控制流',
+    icon: CpuIcon,
+    accent: 'bg-violet-500/12 text-violet-700 dark:text-violet-300',
+  },
+  'component.subflow': {
+    label: '调用子蓝图',
+    group: '控制流',
+    icon: ChartNetworkIcon,
+    accent: 'bg-pink-500/12 text-pink-700 dark:text-pink-300',
+  },
+  'component.wait': {
+    label: '等待延迟',
+    group: '控制流',
+    icon: ClockIcon,
+    accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
+  },
+  'component.loop': {
+    label: '列表循环',
+    group: '控制流',
+    icon: RotateCcwIcon,
+    accent: 'bg-indigo-500/12 text-indigo-700 dark:text-indigo-300',
+  },
+  'component.loop_collect': {
+    label: '汇总循环',
+    group: '控制流',
+    icon: RotateCcwIcon,
+    accent: 'bg-purple-500/12 text-purple-700 dark:text-purple-300',
+  },
+  'component.ticket_grab': {
+    label: '智能抢票',
+    group: '业务模板',
+    icon: TicketCheckIcon,
+    accent: 'bg-red-500/12 text-red-700 dark:text-red-300',
+  },
+  'component.filter': {
+    label: '条件过滤',
+    group: '智能处理',
+    icon: FilterIcon,
+    accent: 'bg-lime-500/12 text-lime-700 dark:text-lime-300',
+  },
+  'component.merge': {
+    label: '合并数据',
+    group: '智能处理',
+    icon: MergeIcon,
+    accent: 'bg-blue-500/12 text-blue-700 dark:text-blue-300',
+  },
+  'component.dedupe_sort': {
+    label: '去重排序',
+    group: '智能处理',
+    icon: Table2Icon,
+    accent: 'bg-teal-500/12 text-teal-700 dark:text-teal-300',
+  },
+  'component.database': {
+    label: '数据库查询',
+    group: '采集',
+    icon: CpuIcon,
+    accent: 'bg-slate-500/12 text-slate-700 dark:text-slate-300',
+  },
+  'component.file': {
+    label: '读写文件',
+    group: '智能处理',
+    icon: FileSpreadsheetIcon,
+    accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
+  },
+}
+
+function getAgentNodeVisualMeta(kind: AgentNodeKind, componentId?: string) {
+  return componentId
+    ? (COMPONENT_VISUAL_META[componentId] ?? NODE_META[kind])
+    : NODE_META[kind]
+}
+
 const PALETTE_GROUPS: Array<{
-  title: '触发' | '采集' | '智能处理' | '输出'
+  title: AgentPaletteGroup
   kinds: AgentNodeKind[]
 }> = [
-  { title: '触发', kinds: ['start', 'schedule', 'stop'] },
+  { title: '触发', kinds: ['start', 'schedule'] },
+  { title: '控制流', kinds: ['stop'] },
   { title: '采集', kinds: ['browser', 'request'] },
-  { title: '智能处理', kinds: ['transform', 'report_data', 'image'] },
+  { title: '智能处理', kinds: ['transform', 'image'] },
   { title: '输出', kinds: ['report', 'webpage', 'notify'] },
+  { title: '业务模板', kinds: ['report_data'] },
 ]
 
 type PaletteTemplateGroup = {
-  title: '触发' | '采集' | '智能处理' | '输出'
+  title: AgentPaletteGroup
   templates: NodeTemplate[]
 }
 
@@ -1063,11 +1206,7 @@ export function AgentWorkspace({
     []
   )
   const pollBackendExecutionLogs = useCallback(
-    async (
-      agentId: string,
-      blueprintId: string,
-      isActive: () => boolean
-    ) => {
+    async (agentId: string, blueprintId: string, isActive: () => boolean) => {
       const deadline = Date.now() + AGENT_BACKEND_POLL_TIMEOUT_MS
       let logs: AgentExecutionLog[] = []
 
@@ -1237,13 +1376,54 @@ export function AgentWorkspace({
 
   const onConnect = useCallback(
     (connection: Connection) => {
+      if (!isAgentConnectionValid(nodes, edges, connection)) {
+        toast.error('不能形成循环连线，请使用列表循环组件。')
+        return
+      }
       recordHistorySnapshot()
+      const sourceNode = nodes.find((node) => node.id === connection.source)
+      const routePort = sourceNode
+        ? getAgentRoutePorts(sourceNode.data).find(
+            (port) => port.id === connection.sourceHandle
+          )
+        : undefined
       setEdges((current) =>
-        addEdge(decorateEdge({ ...connection, id: `e-${Date.now()}` }), current)
+        addEdge(
+          decorateEdge({
+            ...connection,
+            id: `e-${Date.now()}`,
+            data: routePort ? { routeLabel: routePort.label } : undefined,
+          }),
+          current
+        )
       )
     },
-    [recordHistorySnapshot]
+    [edges, nodes, recordHistorySnapshot]
   )
+
+  useEffect(() => {
+    const nodeById = new Map(nodes.map((node) => [node.id, node]))
+    setEdges((current) => {
+      let changed = false
+      const next = current.map((edge) => {
+        const sourceNode = nodeById.get(edge.source)
+        const routePort = sourceNode
+          ? getAgentRoutePorts(sourceNode.data).find(
+              (port) => port.id === edge.sourceHandle
+            )
+          : undefined
+        if (!routePort || edge.data?.routeLabel === routePort.label) {
+          return edge
+        }
+        changed = true
+        return decorateEdge({
+          ...edge,
+          data: { ...edge.data, routeLabel: routePort.label },
+        })
+      })
+      return changed ? next : current
+    })
+  }, [nodes])
 
   const handleDeleteNode = useCallback(
     (nodeId: string) => {
@@ -1303,9 +1483,7 @@ export function AgentWorkspace({
     try {
       await validateAgentNodeModels(nodes)
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : '节点模型校验失败'
-      )
+      toast.error(error instanceof Error ? error.message : '节点模型校验失败')
       return
     }
 
@@ -2103,15 +2281,18 @@ export function AgentWorkspace({
       window.removeEventListener(AGENT_BLUEPRINT_COMMAND_EVENT, handleCommand)
       window.removeEventListener(AGENT_BLUEPRINTS_CHANGED_EVENT, handleChanged)
     }
-  }, [
-    currentBlueprintId,
-    handleLoadBlueprint,
-    handleNewBlueprint,
-  ])
+  }, [currentBlueprintId, handleLoadBlueprint, handleNewBlueprint])
 
   return (
     <ReactFlowProvider>
       <BlueprintWorkspace
+        blueprintChoices={blueprints
+          .filter((blueprint) => blueprint.backendBlueprintId)
+          .map((blueprint) => ({
+            label: blueprint.title,
+            localId: blueprint.id,
+            value: blueprint.backendBlueprintId!,
+          }))}
         blueprintTitle={blueprintTitle}
         backendExecutionLogs={backendExecutionLogs}
         canRedo={canRedoBlueprint}
@@ -2164,6 +2345,7 @@ export function AgentWorkspace({
 }
 
 type BlueprintWorkspaceProps = {
+  blueprintChoices: BlueprintChoice[]
   nodes: AgentFlowNode[]
   edges: AgentFlowEdge[]
   selectedNode: AgentFlowNode | null
@@ -2216,6 +2398,7 @@ type BlueprintWorkspaceProps = {
 }
 
 function BlueprintWorkspace({
+  blueprintChoices,
   nodes,
   edges,
   selectedNode,
@@ -2264,6 +2447,11 @@ function BlueprintWorkspace({
   onUndo,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
+  const isValidConnection = useCallback(
+    (connection: Connection | AgentFlowEdge) =>
+      isAgentConnectionValid(nodes, edges, connection),
+    [edges, nodes]
+  )
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
   const [activeToolPanel, setActiveToolPanel] =
     useState<AgentToolPanel>('components')
@@ -2452,6 +2640,7 @@ function BlueprintWorkspace({
             elementsSelectable
             fitView
             fitViewOptions={{ padding: 0.22 }}
+            isValidConnection={isValidConnection}
             maxZoom={1.25}
             minZoom={0.35}
             nodeTypes={nodeTypes}
@@ -2511,6 +2700,7 @@ function BlueprintWorkspace({
       <aside className='border-border/70 bg-background hidden w-[333px] min-w-0 shrink-0 flex-col overflow-hidden border-l xl:flex'>
         <Inspector
           blueprintId={currentBlueprintId}
+          blueprintChoices={blueprintChoices}
           currentGroup={currentGroup}
           groupChoices={groupChoices}
           modelChoices={modelChoices}
@@ -2829,9 +3019,11 @@ function ComponentManagerPanel({
               className='h-7 rounded-[6px] text-xs'
             >
               <NativeSelectOption value='trigger'>触发</NativeSelectOption>
+              <NativeSelectOption value='control'>控制流</NativeSelectOption>
               <NativeSelectOption value='collect'>采集</NativeSelectOption>
               <NativeSelectOption value='process'>智能处理</NativeSelectOption>
               <NativeSelectOption value='output'>输出</NativeSelectOption>
+              <NativeSelectOption value='template'>业务模板</NativeSelectOption>
             </NativeSelect>
           </div>
 
@@ -2897,7 +3089,7 @@ function CompactPalette({
   return (
     <div className='no-scrollbar flex min-w-0 gap-1 overflow-x-auto'>
       {templates.map((template) => {
-        const meta = NODE_META[template.kind]
+        const meta = getAgentNodeVisualMeta(template.kind, template.componentId)
         const Icon = meta.icon
         const templateKey = template.componentId ?? template.kind
         return (
@@ -2931,7 +3123,7 @@ function PaletteItem({
   onDeleteComponent: (componentId: string) => Promise<void>
 }) {
   const kind = template.kind
-  const meta = NODE_META[kind]
+  const meta = getAgentNodeVisualMeta(kind, template.componentId)
   const Icon = meta.icon
   const templateKey = template.componentId ?? kind
   const isCustom = template.source === 'custom'
@@ -3044,6 +3236,7 @@ function CanvasToolbarButton({
 
 function DeletableEdge({
   id,
+  data,
   sourceX,
   sourceY,
   targetX,
@@ -3079,6 +3272,28 @@ function DeletableEdge({
         onMouseLeave={() => setIsHovered(false)}
       />
       <EdgeLabelRenderer>
+        {data?.routeLabel && (
+          <span
+            className={cn(
+              'bg-background pointer-events-none absolute rounded-[5px] border px-1.5 py-0.5 text-[10px] font-medium shadow-sm',
+              data.branchRoute === 'true'
+                ? 'border-emerald-500/35 text-emerald-700 dark:text-emerald-300'
+                : data.branchRoute === 'false'
+                  ? 'border-rose-500/35 text-rose-700 dark:text-rose-300'
+                  : data.routeKey === SWITCH_DEFAULT_HANDLE ||
+                      data.routeKey === LOOP_DONE_HANDLE
+                    ? 'border-slate-500/35 text-slate-700 dark:text-slate-300'
+                    : data.routeKind === 'loop'
+                      ? 'border-indigo-500/35 text-indigo-700 dark:text-indigo-300'
+                      : 'border-sky-500/35 text-sky-700 dark:text-sky-300'
+            )}
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY - 15}px)`,
+            }}
+          >
+            {data.routeLabel}
+          </span>
+        )}
         <button
           type='button'
           className={cn(
@@ -3086,7 +3301,7 @@ function DeletableEdge({
             showButton ? 'opacity-100' : 'pointer-events-none opacity-0'
           )}
           style={{
-            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY + (data?.routeLabel ? 10 : 0)}px)`,
             pointerEvents: showButton ? 'all' : 'none',
           }}
           onMouseEnter={() => setIsHovered(true)}
@@ -3115,10 +3330,19 @@ function BlueprintNode({
   skillChoices: SkillChoice[]
   onSetSkill: (nodeId: string, skill: string) => void
 }) {
-  const meta = NODE_META[data.kind]
+  const meta = getAgentNodeVisualMeta(data.kind, data.componentId)
   const Icon = meta.icon
   const canReceive = data.inputs.length > 0
   const canSend = data.outputs.length > 0
+  const routePorts = getAgentRoutePorts(data)
+  const updateNodeInternals = useUpdateNodeInternals()
+  const routePortSignature = routePorts
+    .map((port) => `${port.id}:${port.label}`)
+    .join('|')
+
+  useEffect(() => {
+    updateNodeInternals(id)
+  }, [id, routePortSignature, updateNodeInternals])
 
   return (
     <div
@@ -3128,28 +3352,66 @@ function BlueprintNode({
       )}
     >
       {canReceive && (
-        <Handle
-          className='!border-background !bg-primary !size-3'
-          isConnectable={isConnectable}
-          position={Position.Left}
-          type='target'
-        />
+        <>
+          <Handle
+            className='!border-background !bg-primary !size-3'
+            isConnectable={isConnectable}
+            position={Position.Left}
+            type='target'
+          />
+          <span
+            className='bg-background text-muted-foreground border-border/70 pointer-events-none absolute left-[-8px] z-10 rounded-[5px] border px-1.5 py-0.5 text-[10px] whitespace-nowrap shadow-sm'
+            style={{ top: '50%', transform: 'translate(-100%, -50%)' }}
+          >
+            输入
+          </span>
+        </>
       )}
-      {canSend && (
-        <Handle
-          className='!border-background !bg-primary !size-3'
-          isConnectable={isConnectable}
-          position={Position.Right}
-          type='source'
-        />
-      )}
-      <Handle
-        className='!border-background !size-3 !bg-fuchsia-500'
-        id='skill'
-        isConnectable={isConnectable}
-        position={Position.Bottom}
-        type='source'
-      />
+      {routePorts.length > 0
+        ? routePorts.map((port, index) => {
+            const top = `${routePortTop(index, routePorts.length)}%`
+            return (
+              <div key={port.id}>
+                <Handle
+                  className={cn(
+                    '!border-background !size-3',
+                    routePortHandleClass(port)
+                  )}
+                  id={port.id}
+                  isConnectable={isConnectable}
+                  position={Position.Right}
+                  style={{ top }}
+                  type='source'
+                />
+                <span
+                  className={cn(
+                    'bg-background pointer-events-none absolute right-[-8px] z-10 max-w-36 truncate rounded-[5px] border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap shadow-sm',
+                    routePortLabelClass(port)
+                  )}
+                  style={{ top, transform: 'translate(100%, -50%)' }}
+                  title={port.label}
+                >
+                  {port.label}
+                </span>
+              </div>
+            )
+          })
+        : canSend && (
+            <>
+              <Handle
+                className='!border-background !bg-primary !size-3'
+                isConnectable={isConnectable}
+                position={Position.Right}
+                type='source'
+              />
+              <span
+                className='bg-background text-muted-foreground border-border/70 pointer-events-none absolute right-[-8px] z-10 rounded-[5px] border px-1.5 py-0.5 text-[10px] whitespace-nowrap shadow-sm'
+                style={{ top: '50%', transform: 'translate(100%, -50%)' }}
+              >
+                输出 · 可多连
+              </span>
+            </>
+          )}
 
       <div className='flex items-start gap-2 border-b px-3 py-2'>
         <div
@@ -3186,6 +3448,7 @@ function BlueprintNode({
         </div>
         <SkillLinkBadge
           skill={data.skill}
+          nodeKind={data.kind}
           skillChoices={skillChoices}
           onSelectSkill={(value) => onSetSkill(id, value)}
         />
@@ -3196,6 +3459,104 @@ function BlueprintNode({
       </div>
     </div>
   )
+}
+
+type AgentRoutePort = {
+  id: string
+  kind: AgentRouteKind
+  label: string
+  route?: AgentBranchRoute
+  isDefault?: boolean
+}
+
+function getAgentRoutePorts(data: AgentNodeData): AgentRoutePort[] {
+  if (data.componentId === 'component.branch') {
+    return [
+      {
+        id: BRANCH_TRUE_HANDLE,
+        kind: 'branch',
+        label: '条件成立',
+        route: 'true',
+      },
+      {
+        id: BRANCH_FALSE_HANDLE,
+        kind: 'branch',
+        label: '条件不成立',
+        route: 'false',
+      },
+    ]
+  }
+  if (data.componentId === 'component.loop') {
+    return [
+      { id: LOOP_ITEM_HANDLE, kind: 'loop', label: '逐项处理' },
+      {
+        id: LOOP_DONE_HANDLE,
+        kind: 'loop',
+        label: '循环完成',
+        isDefault: true,
+      },
+    ]
+  }
+  if (data.componentId !== 'component.switch') return []
+  const branches = parseSwitchBranchSettings(data.settings['分支配置'])
+  return [
+    ...branches.map((branch, index) => ({
+      id: `${SWITCH_HANDLE_PREFIX}${index}`,
+      kind: 'switch' as const,
+      label: branch.label,
+    })),
+    {
+      id: SWITCH_DEFAULT_HANDLE,
+      kind: 'switch' as const,
+      label: data.settings['默认分支']?.trim() || '其他',
+      isDefault: true,
+    },
+  ]
+}
+
+function parseSwitchBranchSettings(value?: string) {
+  return (value || '')
+    .split(/[\r\n;；]+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const separator = line.includes('=') ? '=' : ':'
+      const [rawValue, ...labelParts] = line.split(separator)
+      const branchValue = rawValue.trim()
+      const label = labelParts.join(separator).trim() || branchValue
+      return { value: branchValue, label }
+    })
+    .filter((branch) => branch.value)
+    .slice(0, 6)
+}
+
+function routePortTop(index: number, count: number) {
+  if (count <= 1) return 50
+  return 28 + (index * 52) / (count - 1)
+}
+
+function routePortHandleClass(port: AgentRoutePort) {
+  if (port.route === 'true') return '!bg-emerald-500'
+  if (port.route === 'false') return '!bg-rose-500'
+  if (port.isDefault) return '!bg-slate-500'
+  if (port.kind === 'loop') return '!bg-indigo-500'
+  return '!bg-sky-500'
+}
+
+function routePortLabelClass(port: AgentRoutePort) {
+  if (port.route === 'true') {
+    return 'border-emerald-500/35 text-emerald-700 dark:text-emerald-300'
+  }
+  if (port.route === 'false') {
+    return 'border-rose-500/35 text-rose-700 dark:text-rose-300'
+  }
+  if (port.isDefault) {
+    return 'border-slate-500/35 text-slate-700 dark:text-slate-300'
+  }
+  if (port.kind === 'loop') {
+    return 'border-indigo-500/35 text-indigo-700 dark:text-indigo-300'
+  }
+  return 'border-sky-500/35 text-sky-700 dark:text-sky-300'
 }
 
 function StatusDot({ status }: { status: AgentNodeStatus }) {
@@ -3234,10 +3595,12 @@ function StatusDot({ status }: { status: AgentNodeStatus }) {
 
 function SkillLinkBadge({
   skill,
+  nodeKind,
   skillChoices,
   onSelectSkill,
 }: {
   skill: string
+  nodeKind: AgentNodeKind
   skillChoices: SkillChoice[]
   onSelectSkill: (value: string) => void
 }) {
@@ -3287,7 +3650,7 @@ function SkillLinkBadge({
         title={hasSkill ? skillChoice.description : '点击添加 Skill'}
       >
         <option value={NO_SKILL_CHOICE.value}>{NO_SKILL_CHOICE.label}</option>
-        {skillChoices.map((choice) => (
+        {skillChoicesForNodeKind(skillChoices, nodeKind).map((choice) => (
           <option key={choice.value} value={choice.value}>
             {choice.label}
           </option>
@@ -3323,6 +3686,7 @@ function IoList({ label, values }: { label: string; values: string[] }) {
 function Inspector({
   selectedNode,
   blueprintId,
+  blueprintChoices,
   modelChoices,
   groupChoices,
   skillChoices,
@@ -3333,6 +3697,7 @@ function Inspector({
 }: {
   selectedNode: AgentFlowNode | null
   blueprintId: string | null
+  blueprintChoices: BlueprintChoice[]
   modelChoices: ModelChoice[]
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
@@ -3358,6 +3723,7 @@ function Inspector({
           <div className='min-w-0 space-y-4 overflow-hidden p-3'>
             <NodeConfigPanel
               blueprintId={blueprintId}
+              blueprintChoices={blueprintChoices}
               currentGroup={currentGroup}
               groupChoices={groupChoices}
               modelChoices={modelChoices}
@@ -3407,7 +3773,10 @@ function ExecutionLogPanel({
         </div>
       )}
       {executionNodes.map((node) => {
-        const meta = NODE_META[node.data.kind]
+        const meta = getAgentNodeVisualMeta(
+          node.data.kind,
+          node.data.componentId
+        )
         const Icon = meta.icon
         const status = node.data.status
         const log = executionLog[node.id]
@@ -4712,6 +5081,7 @@ function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
 function NodeConfigPanel({
   node,
   blueprintId,
+  blueprintChoices,
   modelChoices,
   groupChoices,
   skillChoices,
@@ -4722,6 +5092,7 @@ function NodeConfigPanel({
 }: {
   node: AgentFlowNode
   blueprintId: string | null
+  blueprintChoices: BlueprintChoice[]
   modelChoices: ModelChoice[]
   groupChoices: GroupOption[]
   skillChoices: SkillChoice[]
@@ -4730,6 +5101,9 @@ function NodeConfigPanel({
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
 }) {
+  const parameterEntries = Object.entries(node.data.settings).filter(
+    ([key]) => !EXECUTION_POLICY_SETTING_LABELS.has(key)
+  )
   return (
     <div className='space-y-3'>
       <ConfigCard title='基础信息'>
@@ -4755,17 +5129,18 @@ function NodeConfigPanel({
       </ConfigCard>
 
       <ConfigCard title='参数'>
-        {Object.keys(node.data.settings).length === 0 ? (
+        {parameterEntries.length === 0 ? (
           <div className='text-muted-foreground text-xs'>无参数</div>
         ) : (
           <div className='space-y-2'>
-            {Object.entries(node.data.settings).map(([key, value]) => (
+            {parameterEntries.map(([key, value]) => (
               <SettingControl
                 key={key}
                 label={key}
                 value={value}
                 nodeKind={node.data.kind}
                 blueprintId={blueprintId}
+                blueprintChoices={blueprintChoices}
                 settings={node.data.settings}
                 onChange={(nextValue) => onUpdateSetting(key, nextValue)}
                 onChangeSetting={onUpdateSetting}
@@ -4773,6 +5148,13 @@ function NodeConfigPanel({
             ))}
           </div>
         )}
+      </ConfigCard>
+
+      <ConfigCard title='执行策略'>
+        <ExecutionPolicyConfig
+          settings={node.data.settings}
+          onUpdateSetting={onUpdateSetting}
+        />
       </ConfigCard>
 
       <div className='grid grid-cols-2 gap-2'>
@@ -4783,6 +5165,69 @@ function NodeConfigPanel({
           <FieldList values={node.data.outputs} />
         </ConfigCard>
       </div>
+    </div>
+  )
+}
+
+const EXECUTION_POLICY_SETTING_LABELS = new Set([
+  '节点超时',
+  '失败重试',
+  '重试间隔',
+  '失败处理',
+])
+
+function ExecutionPolicyConfig({
+  settings,
+  onUpdateSetting,
+}: {
+  settings: Record<string, string>
+  onUpdateSetting: (key: string, value: string) => void
+}) {
+  const controls = [
+    {
+      key: '节点超时',
+      label: '节点超时',
+      value: settings['节点超时'] || '不限制',
+      options: ['不限制', '10s', '30s', '60s', '5m', '10m'],
+    },
+    {
+      key: '失败重试',
+      label: '失败重试',
+      value: settings['失败重试'] || '0 次',
+      options: ['0 次', '1 次', '2 次', '3 次', '5 次'],
+    },
+    {
+      key: '重试间隔',
+      label: '重试间隔',
+      value: settings['重试间隔'] || '1s',
+      options: ['0s', '1s', '3s', '5s', '10s'],
+    },
+    {
+      key: '失败处理',
+      label: '失败处理',
+      value: settings['失败处理'] || '中断流程',
+      options: ['中断流程', '继续执行', '跳过节点'],
+    },
+  ]
+  return (
+    <div className='grid grid-cols-2 gap-2'>
+      {controls.map((control) => (
+        <LabeledField key={control.key} label={control.label}>
+          <NativeSelect
+            value={control.value}
+            onChange={(event) =>
+              onUpdateSetting(control.key, event.target.value)
+            }
+            className='w-full'
+          >
+            {control.options.map((option) => (
+              <NativeSelectOption key={option} value={option}>
+                {option}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        </LabeledField>
+      ))}
     </div>
   )
 }
@@ -4804,7 +5249,7 @@ function NodeCommonConfig({
   onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
 }) {
-  const meta = NODE_META[node.data.kind]
+  const meta = getAgentNodeVisualMeta(node.data.kind, node.data.componentId)
   const Icon = meta.icon
   const selectedGroup =
     node.data.group || currentGroup || groupChoices[0]?.value || 'default'
@@ -4938,11 +5383,13 @@ function NodeCommonConfig({
             <NativeSelectOption value={NO_SKILL_CHOICE.value}>
               {NO_SKILL_CHOICE.label}
             </NativeSelectOption>
-            {skillChoices.map((skill) => (
-              <NativeSelectOption key={skill.value} value={skill.value}>
-                {skill.label}
-              </NativeSelectOption>
-            ))}
+            {skillChoicesForNodeKind(skillChoices, node.data.kind).map(
+              (skill) => (
+                <NativeSelectOption key={skill.value} value={skill.value}>
+                  {skill.label}
+                </NativeSelectOption>
+              )
+            )}
           </NativeSelect>
         </CompactField>
       </div>
@@ -5037,7 +5484,10 @@ function ExecutionPreviewDock({
               <div className='min-h-0 overflow-y-auto pr-1'>
                 <div className='grid gap-2 sm:grid-cols-2 2xl:grid-cols-3'>
                   {executionNodes.map((node, index) => {
-                    const meta = NODE_META[node.data.kind]
+                    const meta = getAgentNodeVisualMeta(
+                      node.data.kind,
+                      node.data.componentId
+                    )
                     const Icon = meta.icon
                     const selected = logNode?.id === node.id
                     return (
@@ -5484,6 +5934,7 @@ function SettingControl({
   value,
   nodeKind,
   blueprintId,
+  blueprintChoices = [],
   settings,
   onChange,
   onChangeSetting,
@@ -5492,6 +5943,7 @@ function SettingControl({
   value: string
   nodeKind: AgentNodeKind
   blueprintId?: string | null
+  blueprintChoices?: BlueprintChoice[]
   settings: Record<string, string>
   onChange: (value: string) => void
   onChangeSetting?: (key: string, value: string) => void
@@ -5501,6 +5953,36 @@ function SettingControl({
   const [isLoadingTemplateLibrary, setIsLoadingTemplateLibrary] =
     useState(false)
   const [templateLibrary, setTemplateLibrary] = useState<AgentFileUpload[]>([])
+
+  if (label === '条件') {
+    return <ConditionSettingControl value={value} onChange={onChange} />
+  }
+
+  if (label === '蓝图ID') {
+    const choices = blueprintChoices.filter(
+      (choice) => choice.localId !== blueprintId
+    )
+    const hasCurrentValue = choices.some((choice) => choice.value === value)
+    return (
+      <LabeledField label='子蓝图'>
+        <NativeSelect
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className='w-full'
+        >
+          <NativeSelectOption value=''>选择子蓝图</NativeSelectOption>
+          {value && !hasCurrentValue && (
+            <NativeSelectOption value={value}>{value}</NativeSelectOption>
+          )}
+          {choices.map((choice) => (
+            <NativeSelectOption key={choice.value} value={choice.value}>
+              {choice.label}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+      </LabeledField>
+    )
+  }
 
   // 请求 URL —— 文本输入，带描述提示
   if (label === '请求URL') {
@@ -5528,6 +6010,52 @@ function SettingControl({
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
           支持 key=value 或 JSON 格式，仅用于 POST/PUT 请求体或 URL 查询参数。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (label === '分支配置') {
+    return (
+      <LabeledField label='分支配置'>
+        <Textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={'ok=正常\nerror=异常'}
+          className='min-h-24 rounded-[8px] font-mono text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          每行填写“字段值=分支名称”，最多六条；没有匹配时进入默认分支。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (label === '输入映射') {
+    return (
+      <LabeledField label='输入映射'>
+        <Textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={'目标字段=$父变量\n目标字段=上游字段'}
+          className='min-h-20 rounded-[8px] font-mono text-sm'
+        />
+      </LabeledField>
+    )
+  }
+
+  if (label === '会话名称') {
+    return (
+      <LabeledField label='会话名称'>
+        <Input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder='默认'
+          className='h-8 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          同名浏览器节点共享已登录
+          Cookie；日报或抢票蓝图保持“默认”即可复用登录态。
         </div>
       </LabeledField>
     )
@@ -6080,6 +6608,102 @@ function SettingControl({
       />
     </LabeledField>
   )
+}
+
+function ConditionSettingControl({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
+  const condition = parseConditionSetting(value)
+  const update = (patch: Partial<typeof condition>) => {
+    const next = { ...condition, ...patch }
+    if (!next.field.trim()) {
+      onChange('')
+      return
+    }
+    onChange(
+      next.operator === 'exists'
+        ? `${next.field.trim()} exists`
+        : `${next.field.trim()} ${next.operator} ${next.comparison.trim()}`
+    )
+  }
+  return (
+    <LabeledField label='条件'>
+      <div className='grid grid-cols-[1fr_88px] gap-1.5'>
+        <Input
+          value={condition.field}
+          onChange={(event) => update({ field: event.target.value })}
+          placeholder='字段，例如 status'
+          className='h-8 rounded-[8px] text-sm'
+        />
+        <NativeSelect
+          value={condition.operator}
+          onChange={(event) =>
+            update({ operator: event.target.value as ConditionOperator })
+          }
+          className='w-full'
+        >
+          <NativeSelectOption value='exists'>存在</NativeSelectOption>
+          <NativeSelectOption value='='>等于</NativeSelectOption>
+          <NativeSelectOption value='!='>不等于</NativeSelectOption>
+          <NativeSelectOption value='>'>大于</NativeSelectOption>
+          <NativeSelectOption value='>='>大于等于</NativeSelectOption>
+          <NativeSelectOption value='<'>小于</NativeSelectOption>
+          <NativeSelectOption value='<='>小于等于</NativeSelectOption>
+          <NativeSelectOption value='contains'>包含</NativeSelectOption>
+        </NativeSelect>
+      </div>
+      {condition.operator !== 'exists' && (
+        <Input
+          value={condition.comparison}
+          onChange={(event) => update({ comparison: event.target.value })}
+          placeholder='比较值'
+          className='h-8 rounded-[8px] text-sm'
+        />
+      )}
+    </LabeledField>
+  )
+}
+
+type ConditionOperator =
+  | 'exists'
+  | '='
+  | '!='
+  | '>'
+  | '>='
+  | '<'
+  | '<='
+  | 'contains'
+
+function parseConditionSetting(value: string): {
+  field: string
+  operator: ConditionOperator
+  comparison: string
+} {
+  const normalized = value.trim()
+  if (!normalized || normalized === '字段存在') {
+    return { field: '', operator: 'exists', comparison: '' }
+  }
+  const wordMatch = normalized.match(/^(.+?)\s+(contains|exists)(?:\s+(.*))?$/)
+  if (wordMatch) {
+    return {
+      field: wordMatch[1].trim(),
+      operator: wordMatch[2] as ConditionOperator,
+      comparison: wordMatch[3]?.trim() || '',
+    }
+  }
+  const symbolMatch = normalized.match(/^(.+?)\s*(>=|<=|!=|=|>|<)\s*(.*)$/)
+  if (symbolMatch) {
+    return {
+      field: symbolMatch[1].trim(),
+      operator: symbolMatch[2] as ConditionOperator,
+      comparison: symbolMatch[3].trim(),
+    }
+  }
+  return { field: normalized, operator: 'exists', comparison: '' }
 }
 
 function SkillManagerPanel({
@@ -6841,6 +7465,44 @@ function mergeSkillChoices(...groups: SkillChoice[][]) {
   })
 }
 
+function skillChoicesForNodeKind(
+  skills: SkillChoice[],
+  nodeKind: AgentNodeKind
+): SkillChoice[] {
+  return skills.filter(
+    (skill) =>
+      !skill.appliesTo ||
+      skill.appliesTo.length === 0 ||
+      skill.appliesTo.includes(nodeKind)
+  )
+}
+
+function readSkillNodeKinds(
+  config?: Record<string, unknown>
+): AgentNodeKind[] | undefined {
+  const raw = config?.node_kinds
+  if (!Array.isArray(raw)) return undefined
+  const validKinds = new Set<AgentNodeKind>([
+    'start',
+    'schedule',
+    'browser',
+    'request',
+    'transform',
+    'image',
+    'report',
+    'report_data',
+    'webpage',
+    'notify',
+    'stop',
+    'custom',
+  ])
+  const kinds = raw.filter(
+    (item): item is AgentNodeKind =>
+      typeof item === 'string' && validKinds.has(item as AgentNodeKind)
+  )
+  return kinds.length > 0 ? kinds : undefined
+}
+
 function skillChoiceFromAgentSkill(skill: AgentSkillItem): SkillChoice | null {
   if (!skill.enabled) return null
   if (skill.source === 'builtin') return null
@@ -6867,6 +7529,7 @@ function skillChoiceFromAgentSkill(skill: AgentSkillItem): SkillChoice | null {
     reference: skill.source_url || marketplaceId,
     capabilities,
     marketplaceId,
+    appliesTo: readSkillNodeKinds(skill.config),
   }
 }
 
@@ -6881,6 +7544,7 @@ function skillChoiceFromMarketplaceItem(
     reference: skill.source_url,
     capabilities: skill.capabilities,
     marketplaceId: skill.id,
+    appliesTo: readSkillNodeKinds(skill.config),
   }
 }
 
@@ -7044,9 +7708,13 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
           blueprint.nodes.map((node) => normalizeNode(node)),
           blueprint.status
         )
-        const upgraded = upgradeSavedReportDataPipeline(
+        const normalizedEdges = normalizeLegacyBranchEdges(
           normalizedNodes,
           blueprint.edges.map((edge) => normalizeEdge(edge))
+        )
+        const upgraded = upgradeSavedReportDataPipeline(
+          normalizedNodes,
+          normalizedEdges
         )
         return {
           ...blueprint,
@@ -7138,9 +7806,13 @@ function savedBlueprintFromBackend(
   const normalizedEdges = (backendBlueprint.edges ?? [])
     .filter(isSerializedAgentEdge)
     .map((edge) => normalizeEdge(edge))
-  const upgraded = upgradeSavedReportDataPipeline(
+  const legacyCompatibleEdges = normalizeLegacyBranchEdges(
     normalizedNodes,
     normalizedEdges
+  )
+  const upgraded = upgradeSavedReportDataPipeline(
+    normalizedNodes,
+    legacyCompatibleEdges
   )
   const status = normalizeSavedBlueprintStatus(
     upgraded.nodes,
@@ -7403,8 +8075,10 @@ function buildBackendTriggerConfig(
 
 function backendFrequencyFromLabel(value?: string) {
   if (value === '每小时') return 'hourly'
+  if (value === '工作日') return 'weekdays'
   if (value === '每周') return 'weekly'
   if (value === '每月') return 'monthly'
+  if (value === '仅一次') return 'once'
   return 'daily'
 }
 
@@ -7668,6 +8342,15 @@ function normalizeNodeSettings(
     if (!normalized['登录等待']) {
       normalized['登录等待'] = '120s'
     }
+    if (!normalized['会话名称']) {
+      normalized['会话名称'] = '默认'
+    }
+    if (
+      normalized['登录态'] === '使用当前设备浏览器' ||
+      normalized['登录态'] === '使用已保存登录态'
+    ) {
+      normalized['登录态'] = '持久化登录会话（首次登录后复用）'
+    }
   }
   if (kind === 'request') {
     if (!normalized['网址'] && normalized['请求URL']) {
@@ -7706,6 +8389,33 @@ function normalizeNodeSettings(
 
 function normalizeEdge(edge: AgentFlowEdge): AgentFlowEdge {
   return decorateEdge(edge)
+}
+
+function normalizeLegacyBranchEdges(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+) {
+  const branchNodeIds = new Set(
+    nodes
+      .filter((node) => node.data.componentId === 'component.branch')
+      .map((node) => node.id)
+  )
+  const branchEdgeCounts = new Map<string, number>()
+  return edges.map((edge) => {
+    if (
+      !branchNodeIds.has(edge.source) ||
+      edge.sourceHandle ||
+      edge.targetHandle
+    ) {
+      return edge
+    }
+    const index = branchEdgeCounts.get(edge.source) ?? 0
+    branchEdgeCounts.set(edge.source, index + 1)
+    return normalizeEdge({
+      ...edge,
+      sourceHandle: index === 0 ? BRANCH_TRUE_HANDLE : BRANCH_FALSE_HANDLE,
+    })
+  })
 }
 
 function formatBlueprintTime(timestamp: number) {
@@ -7821,7 +8531,7 @@ function normalizeTemplateKind(kind: string): AgentNodeKind {
 
 function componentPaletteGroup(
   group: string | undefined,
-  fallback: '触发' | '采集' | '智能处理' | '输出'
+  fallback: AgentPaletteGroup
 ) {
   switch ((group ?? '').trim().toLowerCase()) {
     case 'trigger':
@@ -7832,6 +8542,17 @@ function componentPaletteGroup(
     case 'source':
     case '采集':
       return '采集'
+    case 'control':
+    case 'flow':
+    case 'workflow':
+    case '控制':
+    case '控制流':
+      return '控制流'
+    case 'template':
+    case 'recipe':
+    case '模板':
+    case '业务模板':
+      return '业务模板'
     case 'output':
     case 'sink':
     case '输出':
@@ -8006,10 +8727,11 @@ function createInitialNodes(templates: NodeTemplate[]) {
       patch: {
         title: '打开目标页面',
         description:
-          '使用当前设备浏览器登录态打开目标页面，按照节点描述读取需要的数据。',
+          '使用持久化登录会话打开目标页面；首次登录后会在后续定时任务中复用。',
         settings: {
           网址: 'https://www.baidu.com/',
-          登录态: '使用当前设备浏览器',
+          登录态: '持久化登录会话（首次登录后复用）',
+          会话名称: '默认',
           登录等待: '120s',
           权限: '只读采集',
           采集等待: '6s',
@@ -8174,6 +8896,21 @@ function findTerminalSourceNode(
 }
 
 function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
+  const route = agentRouteFromHandle(edge.sourceHandle)
+  const branchRoute = route?.kind === 'branch' ? route.branchRoute : undefined
+  const stroke =
+    branchRoute === 'true'
+      ? '#10b981'
+      : branchRoute === 'false'
+        ? '#f43f5e'
+        : route?.key === SWITCH_DEFAULT_HANDLE ||
+            route?.key === LOOP_DONE_HANDLE
+          ? '#64748b'
+          : route?.kind === 'loop'
+            ? '#6366f1'
+            : route?.kind === 'switch'
+              ? '#0ea5e9'
+              : 'var(--primary)'
   return {
     ...edge,
     id:
@@ -8188,11 +8925,66 @@ function decorateEdge(edge: AgentEdgeDraft): AgentFlowEdge {
     interactionWidth: 18,
     markerEnd: { type: MarkerType.ArrowClosed },
     selectable: true,
+    data: {
+      ...edge.data,
+      ...(route
+        ? {
+            routeKey: route.key,
+            routeKind: route.kind,
+            branchRoute,
+            routeLabel: edge.data?.routeLabel ?? defaultAgentRouteLabel(route),
+          }
+        : {}),
+    },
     style: {
-      stroke: 'var(--primary)',
+      ...edge.style,
+      stroke,
       strokeWidth: 1.8,
     },
   } as AgentFlowEdge
+}
+
+function agentRouteFromHandle(handle?: string | null) {
+  if (handle === BRANCH_TRUE_HANDLE) {
+    return {
+      key: BRANCH_TRUE_HANDLE,
+      kind: 'branch' as const,
+      branchRoute: 'true' as const,
+    }
+  }
+  if (handle === BRANCH_FALSE_HANDLE) {
+    return {
+      key: BRANCH_FALSE_HANDLE,
+      kind: 'branch' as const,
+      branchRoute: 'false' as const,
+    }
+  }
+  if (handle?.startsWith(SWITCH_HANDLE_PREFIX)) {
+    return { key: handle, kind: 'switch' as const }
+  }
+  if (handle === LOOP_ITEM_HANDLE || handle === LOOP_DONE_HANDLE) {
+    return { key: handle, kind: 'loop' as const }
+  }
+  return undefined
+}
+
+function defaultAgentRouteLabel(
+  route: NonNullable<ReturnType<typeof agentRouteFromHandle>>
+) {
+  if (route.kind === 'branch' && route.branchRoute === 'true') {
+    return '条件成立'
+  }
+  if (route.kind === 'branch' && route.branchRoute === 'false') {
+    return '条件不成立'
+  }
+  if (route.key === SWITCH_DEFAULT_HANDLE) return '其他'
+  if (route.kind === 'loop' && route.key === LOOP_ITEM_HANDLE) return '逐项处理'
+  if (route.kind === 'loop' && route.key === LOOP_DONE_HANDLE) return '循环完成'
+  const index = Number.parseInt(
+    route.key.slice(SWITCH_HANDLE_PREFIX.length),
+    10
+  )
+  return Number.isFinite(index) ? `分支 ${index + 1}` : '分支'
 }
 
 function buildPaletteTemplateGroups(
@@ -8319,6 +9111,38 @@ function filterGraphByNodeIds(
       (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)
     ),
   }
+}
+
+function isAgentConnectionValid(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[],
+  connection: Pick<Connection, 'source' | 'target'>
+) {
+  const source = connection.source
+  const target = connection.target
+  if (!source || !target || source === target) return false
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  if (!nodeIds.has(source) || !nodeIds.has(target)) return false
+
+  const outgoing = new Map<string, string[]>()
+  for (const edge of edges) {
+    outgoing.set(edge.source, [
+      ...(outgoing.get(edge.source) ?? []),
+      edge.target,
+    ])
+  }
+  outgoing.set(source, [...(outgoing.get(source) ?? []), target])
+
+  const visited = new Set<string>()
+  const queue = [target]
+  while (queue.length > 0) {
+    const id = queue.shift()
+    if (!id || visited.has(id)) continue
+    if (id === source) return false
+    visited.add(id)
+    queue.push(...(outgoing.get(id) ?? []))
+  }
+  return true
 }
 
 function orderNodes(nodes: AgentFlowNode[], edges: AgentFlowEdge[]) {

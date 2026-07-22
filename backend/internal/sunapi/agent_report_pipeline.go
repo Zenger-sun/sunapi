@@ -55,6 +55,7 @@ func buildAgentReportPlan(node agentBlueprintGraphNode, upstream map[string]inte
 		"output_format":          node.Data.Settings["输出格式"],
 		"output_directory":       firstNonEmpty(node.Data.Settings["输出目录"], "data/output/reports"),
 		"source_url":             findAgentStringRecursive(upstream, "final_url", "url"),
+		"browser_session":        findAgentStringRecursive(upstream, "browser_session"),
 		"browser_target_id":      findAgentStringRecursive(upstream, "browser_target_id"),
 		"required_fields":        requiredFields,
 		"requires_products":      requiresProducts,
@@ -106,8 +107,9 @@ func executeAgentReportDataGraphNode(
 	maxPages := parseAgentPositiveSetting(node.Data.Settings["最大页数"], agentReportDataDefaultPages, agentReportDataMaxPages)
 	period := firstNonEmpty(node.Data.Settings["采集周期"], stringFromInterface(plan["period"]), "近1天")
 	requiredFields := agentStringSlice(plan["required_fields"])
+	browserSession := stringFromInterface(plan["browser_session"])
 	browserTargetID := stringFromInterface(plan["browser_target_id"])
-	dataset, err := collectAgentReportBrowserData(ctx, store.DataDir(), sourceURL, period, waitSeconds, maxPages, requiredFields, browserTargetID)
+	dataset, err := collectAgentReportBrowserData(ctx, store.DataDir(), sourceURL, period, waitSeconds, maxPages, requiredFields, browserSession, browserTargetID)
 	if err != nil {
 		result.Status = "failed"
 		result.Message = "处理数据节点重新采集浏览器数据失败。"
@@ -242,9 +244,10 @@ func collectAgentReportBrowserData(
 	waitSeconds int,
 	maxPages int,
 	requiredFields []string,
+	browserSession string,
 	browserTargetID string,
 ) (map[string]interface{}, error) {
-	endpoint, err := ensureAgentBrowserDevtools(ctx, dataDir)
+	endpoint, err := ensureAgentBrowserDevtoolsForSession(ctx, resolveAgentBrowserSessionPaths(dataDir, browserSession))
 	if err != nil {
 		return nil, err
 	}
@@ -264,13 +267,14 @@ func collectAgentReportBrowserData(
 	}
 	createdTarget := false
 	if !found {
-		target, err = openAgentBrowserTarget(ctx, endpoint, sourceURL)
+		var reusedTarget bool
+		target, reusedTarget, err = openAgentBrowserTarget(ctx, endpoint, sourceURL)
 		if err != nil {
 			return nil, err
 		}
-		createdTarget = true
+		createdTarget = !reusedTarget
 	}
-	if found || createdTarget {
+	if createdTarget {
 		defer func() {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

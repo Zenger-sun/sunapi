@@ -24,13 +24,17 @@ type componentConfigPayload struct {
 var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.start", "开始", "手动启动一次蓝图任务。", "start", "trigger", "system.runner", "skill.mcp-workflow", []string{}, []string{"执行信号"}, map[string]string{"触发方式": "手动", "运行模式": "单次执行"}, []string{"trigger"}),
 	builtinComponent("component.schedule", "定时", "按固定时间自动触发任务。", "schedule", "trigger", "system.scheduler", "skill.mcp-workflow", []string{}, []string{"定时信号"}, map[string]string{"执行频率": "每天", "执行时间": "08:30", "时区": "Asia/Shanghai"}, []string{"trigger", "schedule"}),
-	builtinComponent("component.stop", "停止", "用于中断流程、循环控制或标记流程结束。", "stop", "trigger", "system.runner", "skill.mcp-workflow", []string{"执行结果"}, []string{"结束状态"}, map[string]string{"结束方式": "本轮完成后停止"}, []string{"control"}),
-	builtinComponent("component.browser", "打开浏览器", "打开独立浏览器窗口并等待用户完成登录，为后续只读数据采集提供复用会话。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "登录要求"}, []string{"浏览器会话", "登录状态"}, map[string]string{"网址": "https://www.goofish.com/", "登录态": "使用当前设备浏览器", "登录等待": "120s", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "session", "data"}),
+	builtinComponent("component.stop", "停止", "用于中断流程、循环控制或标记流程结束。", "stop", "control", "system.runner", "skill.mcp-workflow", []string{"执行结果"}, []string{"结束状态"}, map[string]string{"结束方式": "本轮完成后停止"}, []string{"control"}),
+	builtinComponent("component.browser", "打开浏览器", "使用持久化浏览器会话访问登录态页面；首次登录后，定时任务会复用 Cookie，无需每天重新登录。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "登录要求"}, []string{"浏览器会话", "登录状态"}, map[string]string{"网址": "https://www.goofish.com/", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "默认", "登录等待": "120s", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "session", "data"}),
 	builtinComponent("component.request", "网页请求", "发起 HTTP 请求，获取接口或页面的结构化原始数据。", "request", "collect", "gpt-4.1-mini", "skill.api-function", []string{"任务描述"}, []string{"JSON 数据", "请求日志"}, map[string]string{"网址": "https://example.com/api", "方法": "GET", "超时": "30s", "重试": "1 次"}, []string{"http", "api"}),
 	builtinComponent("component.webhook", "Webhook 触发", "接收外部系统回调并把请求体作为蓝图输入。", "custom", "trigger", "system.runner", "skill.api-function", []string{"Webhook 请求"}, []string{"请求体", "请求头"}, map[string]string{"路径": "/api/agent-webhooks/{blueprint_id}", "方法": "POST", "鉴权": "可选密钥", "密钥": ""}, []string{"webhook", "trigger"}),
-	builtinComponent("component.branch", "条件分支", "根据上游数据和条件表达式输出是/否分支结果。", "custom", "process", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "条件"}, []string{"分支结果", "命中数据"}, map[string]string{"条件": "status=ok", "真分支": "通过", "假分支": "未通过"}, []string{"branch", "condition", "control"}),
-	builtinComponent("component.wait", "等待延迟", "按配置等待一段时间后继续传递上游数据。", "custom", "process", "system.runner", "skill.mcp-workflow", []string{"上游数据"}, []string{"等待结果", "上游数据"}, map[string]string{"等待时间": "5s", "最大等待": "60s"}, []string{"wait", "delay", "control"}),
-	builtinComponent("component.loop", "列表循环", "把上游数组、表格或对象展开为可迭代条目。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"列表数据"}, []string{"迭代条目", "条目数量"}, map[string]string{"最大条目": "100", "输出字段": "items"}, []string{"loop", "iteration", "data"}),
+	builtinComponent("component.branch", "条件分支", "根据上游数据和条件表达式输出是/否分支结果。", "custom", "control", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "条件"}, []string{"分支结果", "命中数据"}, map[string]string{"条件": "status=ok", "真分支": "通过", "假分支": "未通过"}, []string{"branch", "condition", "control"}),
+	builtinComponent("component.switch", "多路判断", "按字段值选择多个命名分支，并在没有匹配时走默认分支。", "custom", "control", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "判断字段"}, []string{"选中分支", "判断值"}, map[string]string{"判断字段": "status", "分支配置": "ok=正常\nerror=异常", "默认分支": "其他"}, []string{"switch", "condition", "control"}),
+	builtinComponent("component.set_variable", "设置变量", "把固定值或上游结果写入蓝图变量，供后续节点和条件使用。", "custom", "control", "system.runner", "skill.mcp-workflow", []string{"上游数据", "变量名", "变量值"}, []string{"变量结果", "变量快照"}, map[string]string{"变量名": "result", "变量值": "", "为空时": "使用上游数据"}, []string{"variable", "state", "control"}),
+	builtinComponent("component.subflow", "调用子蓝图", "调用另一个蓝图作为可复用子流程，并把执行结果传递给当前蓝图。", "custom", "control", "system.runner", "skill.mcp-workflow", []string{"上游数据", "输入变量"}, []string{"子蓝图结果", "子蓝图状态"}, map[string]string{"蓝图ID": "", "输入映射": "", "递归限制": "8 层"}, []string{"subflow", "workflow", "control"}),
+	builtinComponent("component.wait", "等待延迟", "按配置等待一段时间后继续传递上游数据。", "custom", "control", "system.runner", "skill.mcp-workflow", []string{"上游数据"}, []string{"等待结果", "上游数据"}, map[string]string{"等待时间": "5s", "最大等待": "60s"}, []string{"wait", "delay", "control"}),
+	builtinComponent("component.loop", "列表循环", "把上游数组、表格或对象展开为可迭代条目。", "custom", "control", "gpt-4.1-mini", "skill.code-interpreter", []string{"列表数据"}, []string{"迭代条目", "条目数量"}, map[string]string{"最大条目": "100", "输出字段": "items"}, []string{"loop", "iteration", "data"}),
+	builtinComponent("component.loop_collect", "汇总循环", "收集逐项处理结果并结束循环上下文，继续执行后续节点。", "custom", "control", "system.runner", "skill.mcp-workflow", []string{"逐项结果"}, []string{"汇总数据", "处理数量"}, map[string]string{"结果字段": "items", "汇总失败项": "保留并标记"}, []string{"loop", "collect", "control"}),
 	builtinComponent("component.filter", "条件过滤", "按字段、表达式或状态筛选上游数据。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"上游数据", "过滤条件"}, []string{"命中数据", "过滤日志"}, map[string]string{"条件": "字段存在", "未命中处理": "跳过"}, []string{"filter", "data"}),
 	builtinComponent("component.merge", "合并数据", "把多个上游分支按索引、字段或追加方式合并。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"数据 A", "数据 B"}, []string{"合并数据", "冲突记录"}, map[string]string{"合并方式": "按字段", "冲突处理": "保留最新"}, []string{"merge", "data"}),
 	builtinComponent("component.dedupe_sort", "去重排序", "按字段对上游行数据去重、排序和限制数量。", "custom", "process", "gpt-4.1-mini", "skill.code-interpreter", []string{"行数据"}, []string{"处理后数据", "处理日志"}, map[string]string{"去重字段": "id", "排序字段": "updated_at", "排序方向": "降序", "限制": "100"}, []string{"dedupe", "sort", "data"}),
@@ -38,8 +42,9 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.database", "数据库查询", "对 SQLite 数据库执行只读 SQL 查询并输出结构化结果。", "custom", "collect", "gpt-4.1-mini", "skill.database-sql", []string{"SQL"}, []string{"查询结果", "查询日志"}, map[string]string{"数据库": "当前 SunAPI 数据库", "SQL": "select name from sqlite_master where type='table' order by name", "限制": "100"}, []string{"database", "sql", "data"}),
 	builtinComponent("component.file", "读写文件", "读取或生成 Excel、CSV、Markdown、HTML、TXT 等文件。", "custom", "process", "gpt-4.1-mini", "skill.file-document", []string{"文件路径", "文件内容"}, []string{"文件内容", "保存路径"}, map[string]string{"模式": "读取", "格式": "自动识别"}, []string{"file", "document"}),
 	builtinComponent("component.image", "生成图片", "根据数据和提示词生成封面图、趋势图或运营图片。", "image", "process", "gpt-image-1", "skill.code-interpreter", []string{"提示词", "参考图"}, []string{"图片 URL"}, map[string]string{"尺寸": "16:9", "风格": "清爽数据看板", "数量": "1"}, []string{"image"}),
-	builtinComponent("component.report", "生成日报", "按上游数据、当前描述和模板生成日报文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 日报", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 日报、CSV 表格"}, []string{"report", "document"}),
-	builtinComponent("component.report-data", "处理数据", "读取生成日报节点的模板计划，复用已登录浏览器重新采集必要数据、计算排行并输出日报文件。", "report_data", "process", "gpt-4.1", "skill.browser-automation", []string{"日报模板计划", "浏览器会话"}, []string{"商品明细", "商品排行", "日报文件"}, map[string]string{"采集周期": "近1天", "页面等待": "4s", "最大页数": "10"}, []string{"browser", "data", "report"}),
+	builtinComponent("component.report", "生成报告", "按上游数据、当前描述和模板生成结构化报告文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 日报", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 日报、CSV 表格"}, []string{"report", "document"}),
+	builtinComponent("component.report-data", "日报数据管线", "读取日报模板计划，复用已登录浏览器重新采集商品数据、计算排行并输出日报文件。", "report_data", "template", "gpt-4.1", "skill.browser-automation", []string{"日报模板计划", "浏览器会话"}, []string{"商品明细", "商品排行", "日报文件"}, map[string]string{"采集周期": "近1天", "页面等待": "4s", "最大页数": "10"}, []string{"browser", "data", "report"}),
+	builtinComponent("component.ticket_grab", "智能抢票", "复用已登录浏览器智能轮询票源；命中后可进入确认页，但提交订单和支付必须人工完成。", "custom", "template", "system.runner", "skill.browser-automation", []string{"浏览器会话", "抢票条件"}, []string{"抢票结果", "确认状态"}, map[string]string{"抢票页面": "", "会话名称": "默认", "场次/票档关键词": "", "有票关键词": "立即购买,立即预订,马上抢,选座购买,有票", "无票关键词": "售罄,无票,缺票,暂时无票,已结束", "购票按钮": "立即购买,立即预订,马上抢,选座购买,去购票", "轮询间隔": "5s", "最大轮询": "96", "最长运行": "8m", "找到后动作": "进入确认页后停止", "订单提交": "必须人工确认"}, []string{"ticket", "browser", "automation", "template"}),
 	builtinComponent("component.webpage", "输出网页", "将报告数据渲染成可交互网页，支持自定义模板。", "webpage", "output", "gpt-4.1", "skill.file-document", []string{"Markdown 日报", "CSV 表格"}, []string{"网页 URL", "数据文件"}, map[string]string{"输出目录": "data/output/web-reports", "输出模式": "输出网页 + 数据"}, []string{"html", "report"}),
 	builtinComponent("component.notify", "发送通知", "将任务结果发送到邮件、飞书、企业微信、Slack 或 Webhook。", "notify", "output", "gpt-4.1-mini", "skill.api-function", []string{"消息内容", "通知目标"}, []string{"发送结果"}, map[string]string{"渠道": "Webhook", "通知目标": "", "Webhook": "", "确认": "发送前确认", "超时": "30s"}, []string{"notification", "webhook"}),
 }
@@ -139,6 +144,10 @@ func normalizeComponentGroup(value string) string {
 		return "collect"
 	case "处理", "智能处理", "process", "processor", "transform":
 		return "process"
+	case "控制", "控制流", "control", "flow", "workflow":
+		return "control"
+	case "模板", "业务模板", "template", "recipe":
+		return "template"
 	case "输出", "output", "sink":
 		return "output"
 	default:
@@ -156,6 +165,7 @@ func inferComponentTags(description string) []string {
 		"csv": "spreadsheet", "图片": "image", "报告": "report", "日报": "report",
 		"通知": "notification", "数据库": "database", "sql": "database",
 		"流程": "workflow", "分支": "workflow", "循环": "workflow", "等待": "workflow",
+		"变量": "state", "多路": "workflow",
 		"去重": "dedupe", "排序": "sort",
 	}
 	for keyword, tag := range keywords {
@@ -184,7 +194,7 @@ func inferComponentCapabilities(description string) []string {
 	if strings.Contains(lower, "通知") || strings.Contains(lower, "webhook") {
 		caps = append(caps, "结果投递")
 	}
-	if strings.Contains(lower, "流程") || strings.Contains(lower, "分支") || strings.Contains(lower, "循环") || strings.Contains(lower, "等待") {
+	if strings.Contains(lower, "流程") || strings.Contains(lower, "分支") || strings.Contains(lower, "循环") || strings.Contains(lower, "等待") || strings.Contains(lower, "变量") {
 		caps = append(caps, "流程控制")
 	}
 	if strings.Contains(lower, "去重") || strings.Contains(lower, "排序") {

@@ -300,6 +300,17 @@ func nextAgentScheduleTime(config agentScheduleConfig, after, anchor time.Time) 
 	switch config.Frequency {
 	case "hourly":
 		return after.Truncate(time.Hour).Add(time.Hour), nil
+	case "weekdays":
+		for dayOffset := 0; dayOffset <= 7; dayOffset++ {
+			day := after.AddDate(0, 0, dayOffset)
+			if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
+				continue
+			}
+			candidate := time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, location)
+			if candidate.After(after) {
+				return candidate, nil
+			}
+		}
 	case "daily", "once":
 		candidate := time.Date(after.Year(), after.Month(), after.Day(), hour, minute, 0, 0, location)
 		if !candidate.After(after) {
