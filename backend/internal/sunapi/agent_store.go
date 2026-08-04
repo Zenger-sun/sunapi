@@ -332,6 +332,7 @@ func (s *Store) UpdateBlueprint(ctx context.Context, id string, userID int64, f 
 	if b == nil {
 		return nil, errors.New("blueprint not found")
 	}
+	wasScheduled := isAgentScheduledBlueprint(b)
 	now := time.Now().UnixMilli()
 	if strings.TrimSpace(f.Name) != "" {
 		b.Name = strings.TrimSpace(f.Name)
@@ -376,17 +377,21 @@ func (s *Store) UpdateBlueprint(ctx context.Context, id string, userID int64, f 
 		}
 	} else {
 		b.NextExecutionTime = 0
+		if wasScheduled && (b.Status == "running" || b.Status == "paused") {
+			b.Status = "pending"
+			b.FailureReason = ""
+		}
 	}
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE agent_blueprints
 		SET name=?, description=?, trigger_config=?, model_group=?, model_name=?,
 		    skills=?, input_variables=?, archive_config=?, nodes=?, edges=?, status=?,
-		    next_execution_time=?, updated_time=?
+		    failure_reason=?, next_execution_time=?, updated_time=?
 		WHERE id=? AND user_id=?`,
 		b.Name, b.Description, b.TriggerConfig, b.ModelGroup, b.ModelName,
 		b.Skills, b.InputVariables, b.ArchiveConfig, b.Nodes, b.Edges, b.Status,
-		b.NextExecutionTime, b.UpdatedTime, id, userID)
+		b.FailureReason, b.NextExecutionTime, b.UpdatedTime, id, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -474,6 +479,42 @@ func (s *Store) UpdateRecurringBlueprintAfterRun(ctx context.Context, id, failur
 		WHERE id=?`,
 		failureReason, time.Now().UnixMilli(), id)
 	return err
+}
+
+func (s *Store) UpdateBlueprintAfterRun(ctx context.Context, id, executionStatus, failureReason string) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		bp, err := s.GetBlueprintByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if bp == nil {
+			return errors.New("blueprint not found")
+		}
+
+		status := executionStatus
+		if isRecurringAgentScheduledBlueprint(bp) {
+			status = "running"
+			if bp.Status == "paused" {
+				status = "paused"
+			}
+		}
+		result, err := s.db.ExecContext(ctx, `
+			UPDATE agent_blueprints
+			SET status=?, failure_reason=?, updated_time=?
+			WHERE id=? AND trigger_config=? AND status=?`,
+			status, failureReason, time.Now().UnixMilli(), id, bp.TriggerConfig, bp.Status)
+		if err != nil {
+			return err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if updated == 1 {
+			return nil
+		}
+	}
+	return errors.New("blueprint changed while updating execution status")
 }
 
 func (s *Store) DeleteBlueprint(ctx context.Context, id string, userID int64) error {

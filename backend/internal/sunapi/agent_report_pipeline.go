@@ -513,7 +513,12 @@ func clickAgentBrowserNextPage(ctx context.Context, conn *websocket.Conn, id int
 	expression := `(function(){
 		const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
 		const disabled = el => el.disabled || el.getAttribute('aria-disabled') === 'true' || /disabled/.test(el.className || '') || /disabled/.test((el.parentElement && el.parentElement.className) || '');
-		const selectors = ['button[aria-label*="下一"]','button[title*="下一"]','.ant-pagination-next button','.ant-pagination-next','[class*="pagination-next"] button','[class*="pagination-next"]'];
+		const selectors = [
+			'button[aria-label*="下一"]','button[title*="下一"]','button[aria-label*="Next"]','button[title*="Next"]',
+			'.ant-pagination-next button','.ant-pagination-next','.semi-page-next','.semi-pagination-next',
+			'[class*="pagination-next"] button','[class*="pagination-next"]','[class*="page-next"]',
+			'[data-testid*="next"]','[data-testid*="Next"]'
+		];
 		for (const selector of selectors) {
 			const el = document.querySelector(selector);
 			if (el && visible(el) && !disabled(el)) { el.click(); return JSON.stringify({clicked:true}); }

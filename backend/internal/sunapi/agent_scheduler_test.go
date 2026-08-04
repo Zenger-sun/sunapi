@@ -127,6 +127,128 @@ func TestScheduledBlueprintPersistsActiveScheduleState(t *testing.T) {
 	}
 }
 
+func TestRemovingScheduleResetsBlueprintToPending(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createAgentTestChannel(t, store, "default", "gpt-test")
+
+	ctx := context.Background()
+	bp := createScheduledBlueprintForTest(t, store, ctx, "schedule removal")
+	if err := store.UpdateBlueprintStatus(ctx, bp.ID, "running", "stale schedule failure"); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := store.UpdateBlueprint(ctx, bp.ID, 1, BlueprintFormData{
+		Name:          bp.Name,
+		ModelName:     bp.ModelName,
+		TriggerConfig: json.RawMessage(`{"type":"manual","timezone":"Asia/Shanghai"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "pending" {
+		t.Fatalf("status = %q, want pending", updated.Status)
+	}
+	if updated.NextExecutionTime != 0 {
+		t.Fatalf("next execution time = %d, want 0", updated.NextExecutionTime)
+	}
+	if updated.FailureReason != "" {
+		t.Fatalf("failure reason = %q, want empty", updated.FailureReason)
+	}
+
+	persisted, err := store.GetBlueprint(ctx, bp.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted == nil || persisted.Status != "pending" || persisted.NextExecutionTime != 0 {
+		t.Fatalf("persisted blueprint = %#v, want pending with no next execution", persisted)
+	}
+	if persisted.FailureReason != "" {
+		t.Fatalf("persisted failure reason = %q, want empty", persisted.FailureReason)
+	}
+}
+
+func TestScheduledRunCompletionUsesLatestTriggerConfig(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createAgentTestChannel(t, store, "default", "gpt-test")
+
+	ctx := context.Background()
+	bp := createScheduledBlueprintForTest(t, store, ctx, "active schedule removal")
+	if !store.beginAgentScheduledRun(bp.ID) {
+		t.Fatal("failed to mark scheduled run active")
+	}
+	defer store.endAgentScheduledRun(bp.ID)
+
+	updated, err := store.UpdateBlueprint(ctx, bp.ID, 1, BlueprintFormData{
+		Name:          bp.Name,
+		ModelName:     bp.ModelName,
+		TriggerConfig: json.RawMessage(`{"type":"manual","timezone":"Asia/Shanghai"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "pending" {
+		t.Fatalf("status after schedule removal = %q, want pending", updated.Status)
+	}
+	if !store.isAgentScheduledRunActive(bp.ID) {
+		t.Fatal("scheduled run claim was lost while updating the blueprint")
+	}
+
+	if err := store.UpdateBlueprintAfterRun(ctx, bp.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.GetBlueprint(ctx, bp.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted == nil || persisted.Status != "completed" || persisted.NextExecutionTime != 0 {
+		t.Fatalf("persisted blueprint = %#v, want completed with no next execution", persisted)
+	}
+}
+
+func TestReconcileResetsStaleManualBlueprintState(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createAgentTestChannel(t, store, "default", "gpt-test")
+
+	ctx := context.Background()
+	agent, err := store.CreateAgent(ctx, 1, AgentFormData{Name: "stale manual agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, err := store.CreateBlueprint(ctx, agent.ID, 1, BlueprintFormData{
+		Name:      "stale manual",
+		ModelName: "gpt-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateBlueprintStatus(ctx, bp.ID, "running", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.reconcileAgentSchedules(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.GetBlueprint(ctx, bp.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted == nil || persisted.Status != "pending" || persisted.NextExecutionTime != 0 {
+		t.Fatalf("reconciled blueprint = %#v, want pending with no next execution", persisted)
+	}
+}
+
 func TestDispatchDueAgentBlueprintRunsSchedulePath(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
 	if err != nil {
@@ -192,6 +314,32 @@ func TestDispatchDueAgentBlueprintRunsSchedulePath(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("scheduled blueprint did not complete before the deadline")
+}
+
+func createScheduledBlueprintForTest(t *testing.T, store *Store, ctx context.Context, name string) *AgentBlueprint {
+	t.Helper()
+	agent, err := store.CreateAgent(ctx, 1, AgentFormData{Name: name + " agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger, err := json.Marshal(agentScheduleConfig{
+		Type:      "scheduled",
+		Frequency: "daily",
+		Time:      "08:30",
+		Timezone:  "Asia/Shanghai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp, err := store.CreateBlueprint(ctx, agent.ID, 1, BlueprintFormData{
+		Name:          name,
+		ModelName:     "gpt-test",
+		TriggerConfig: trigger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bp
 }
 
 func newAgentSchedulerTestNode(id, kind string) agentBlueprintGraphNode {

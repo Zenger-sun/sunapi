@@ -85,6 +85,12 @@ func (s *Store) reconcileAgentSchedules(ctx context.Context, now time.Time) erro
 	for i := range blueprints {
 		bp := &blueprints[i]
 		if _, ok := parseAgentScheduleConfig(bp); !ok {
+			if bp.Status == "running" && !s.isAgentScheduledRunActive(bp.ID) {
+				if err := s.UpdateBlueprintScheduleState(ctx, bp.ID, "pending", "", 0); err != nil {
+					return err
+				}
+				continue
+			}
 			if bp.NextExecutionTime != 0 {
 				if err := s.updateAgentNextExecutionTime(ctx, bp.ID, 0); err != nil {
 					return err
@@ -218,6 +224,13 @@ func (s *Store) endAgentScheduledRun(blueprintID string) {
 	s.agentScheduledRunsMu.Lock()
 	delete(s.agentScheduledRuns, blueprintID)
 	s.agentScheduledRunsMu.Unlock()
+}
+
+func (s *Store) isAgentScheduledRunActive(blueprintID string) bool {
+	s.agentScheduledRunsMu.Lock()
+	defer s.agentScheduledRunsMu.Unlock()
+	_, exists := s.agentScheduledRuns[blueprintID]
+	return exists
 }
 
 func (s *Store) refreshAgentNextExecutionTime(ctx context.Context, bp *AgentBlueprint, after time.Time) error {

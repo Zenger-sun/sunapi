@@ -265,7 +265,7 @@ func handleRunBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
-		if bp.Status == "running" {
+		if bp.Status == "running" || store.isAgentScheduledRunActive(bp.ID) {
 			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
 			return
 		}

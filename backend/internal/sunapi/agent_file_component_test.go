@@ -82,3 +82,52 @@ func TestExecuteAgentFileGraphNodeWritesExcelFile(t *testing.T) {
 		t.Fatalf("expected written file: %v", err)
 	}
 }
+
+func TestComponentInputFilesUseDedicatedDirectory(t *testing.T) {
+	directory, outputDirectory := agentUploadDirectories("component-input")
+	if directory != agentDataInputDir || outputDirectory != "" {
+		t.Fatalf("component input directories = (%q, %q)", directory, outputDirectory)
+	}
+
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, agentDataInputDir, "source.csv")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("name\nSunAPI\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := agentUploadedTemplateAbsPath(dataDir, "data/inputs/source.csv")
+	if err != nil {
+		t.Fatalf("component input path rejected: %v", err)
+	}
+	if resolved != path {
+		t.Fatalf("resolved=%q want %q", resolved, path)
+	}
+}
+
+func TestResolveAgentNodeImportedFilesReadsConfiguredFile(t *testing.T) {
+	store := &Store{dataDir: t.TempDir()}
+	path := filepath.Join(store.DataDir(), agentDataInputDir, "source.csv")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("name,amount\nSunAPI,1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	node := agentBlueprintGraphNode{ID: "custom-file"}
+	node.Data.Inputs = []string{"导入文件"}
+	node.Data.Settings = map[string]string{"导入文件": "data/inputs/source.csv"}
+	files, err := resolveAgentNodeImportedFiles(store, node)
+	if err != nil {
+		t.Fatalf("resolveAgentNodeImportedFiles returned error: %v", err)
+	}
+	file, ok := files["导入文件"]
+	if !ok {
+		t.Fatalf("files=%#v", files)
+	}
+	if file.Format != "CSV 表格" || len(file.Rows) != 1 {
+		t.Fatalf("file=%#v", file)
+	}
+}

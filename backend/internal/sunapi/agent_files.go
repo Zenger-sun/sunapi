@@ -29,6 +29,7 @@ import (
 const (
 	agentDataTemplateDirReports  = "templates/reports"
 	agentDataTemplateDirWeb      = "templates/web"
+	agentDataInputDir            = "inputs"
 	agentDataOutputDirReports    = "output/reports"
 	agentDataOutputDirWeb        = "output/web-reports"
 	agentTemplateIndexFilename   = ".agent-template-index.json"
@@ -52,9 +53,13 @@ var allowedAgentFileExtensions = map[string]bool{
 	".htm":  true,
 	".html": true,
 	".json": true,
+	".jpeg": true,
+	".jpg":  true,
 	".md":   true,
 	".pdf":  true,
+	".png":  true,
 	".txt":  true,
+	".webp": true,
 	".xls":  true,
 	".xlsx": true,
 }
@@ -100,6 +105,14 @@ type AgentReportOutputFile struct {
 	TemplatePath         string                 `json:"template_path,omitempty"`
 	TemplateOriginalName string                 `json:"template_original_name,omitempty"`
 	TemplateData         map[string]interface{} `json:"template_data,omitempty"`
+	Worksheets           []AgentReportWorksheet `json:"worksheets,omitempty"`
+}
+
+// AgentReportWorksheet is used by deterministic report pipelines that can
+// produce a useful workbook even when the user has not uploaded a template.
+type AgentReportWorksheet struct {
+	Name string     `json:"name"`
+	Rows [][]string `json:"rows"`
 }
 
 type AgentReportWrittenFile struct {
@@ -445,6 +458,9 @@ func encodeAgentReportOutputFile(dataDir, ext, title, label, content string, fil
 
 	switch ext {
 	case ".xlsx":
+		if len(file.Worksheets) > 0 {
+			return buildAgentReportXLSXWorkbook(title, label, file.Worksheets)
+		}
 		return buildAgentReportXLSX(title, label, content)
 	case ".docx":
 		return buildAgentReportDOCX(title, label, content)
@@ -592,6 +608,105 @@ func buildAgentReportXLSX(title, label, content string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func buildAgentReportXLSXWorkbook(title, label string, worksheets []AgentReportWorksheet) ([]byte, error) {
+	if len(worksheets) == 0 {
+		return buildAgentReportXLSX(title, label, "")
+	}
+
+	names := make([]string, len(worksheets))
+	usedNames := map[string]int{}
+	for index, worksheet := range worksheets {
+		name := normalizeAgentReportWorksheetName(worksheet.Name, index+1)
+		base := name
+		if count := usedNames[base]; count > 0 {
+			count++
+			name = truncateRunes(fmt.Sprintf("%s-%d", base, count), 31)
+			for usedNames[name] > 0 {
+				count++
+				name = truncateRunes(fmt.Sprintf("%s-%d", base, count), 31)
+			}
+			usedNames[base] = count
+		}
+		usedNames[name]++
+		names[index] = name
+	}
+
+	var contentTypes strings.Builder
+	contentTypes.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	contentTypes.WriteString(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`)
+	contentTypes.WriteString(`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>`)
+	contentTypes.WriteString(`<Default Extension="xml" ContentType="application/xml"/>`)
+	contentTypes.WriteString(`<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>`)
+	for index := range worksheets {
+		contentTypes.WriteString(fmt.Sprintf(`<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`, index+1))
+	}
+	contentTypes.WriteString(`</Types>`)
+
+	var workbook strings.Builder
+	workbook.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	workbook.WriteString(`<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>`)
+	for index, name := range names {
+		workbook.WriteString(fmt.Sprintf(`<sheet name="%s" sheetId="%d" r:id="rId%d"/>`, xmlEscape(name), index+1, index+1))
+	}
+	workbook.WriteString(`</sheets></workbook>`)
+
+	var relationships strings.Builder
+	relationships.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	relationships.WriteString(`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`)
+	for index := range worksheets {
+		relationships.WriteString(fmt.Sprintf(`<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>`, index+1, index+1))
+	}
+	relationships.WriteString(`</Relationships>`)
+
+	files := map[string]string{
+		"[Content_Types].xml":        contentTypes.String(),
+		"_rels/.rels":                `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+		"xl/_rels/workbook.xml.rels": relationships.String(),
+		"xl/workbook.xml":            workbook.String(),
+	}
+	for index, worksheet := range worksheets {
+		files[fmt.Sprintf("xl/worksheets/sheet%d.xml", index+1)] = buildAgentReportWorksheetXMLFromRows(worksheet.Rows)
+	}
+
+	var buf bytes.Buffer
+	writer := zip.NewWriter(&buf)
+	for name, body := range files {
+		entry, err := writer.Create(name)
+		if err != nil {
+			_ = writer.Close()
+			return nil, err
+		}
+		if _, err := io.WriteString(entry, body); err != nil {
+			_ = writer.Close()
+			return nil, err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func normalizeAgentReportWorksheetName(value string, index int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = fmt.Sprintf("Sheet%d", index)
+	}
+	value = strings.NewReplacer("/", "-", "\\", "-", "?", "-", "*", "-", "[", "(", "]", ")", ":", "-").Replace(value)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = fmt.Sprintf("Sheet%d", index)
+	}
+	return truncateRunes(value, 31)
+}
+
+func buildAgentReportWorksheetXMLFromRows(rows [][]string) string {
+	if len(rows) == 0 {
+		rows = [][]string{{"暂无数据"}}
+	}
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` + buildAgentReportSheetDataXML(rows) + `</worksheet>`
 }
 
 func buildAgentReportWorksheetXML(title, label, content string) string {
@@ -762,6 +877,7 @@ type agentReportTemplateContext struct {
 	sourceURL string
 	products  []map[string]string
 	rankings  []map[string]string
+	orders    []map[string]string
 }
 
 type agentReportWorksheetCell struct {
@@ -874,6 +990,7 @@ func buildAgentReportTemplateContext(templateData map[string]interface{}) agentR
 		fields:   map[string]string{},
 		products: extractAgentReportTemplateRows(templateData, "products", "商品明细"),
 		rankings: extractAgentReportTemplateRows(templateData, "rankings", "商品排行"),
+		orders:   extractAgentReportTemplateRows(templateData, "orders", "订单明细"),
 	}
 	texts := []string{}
 	var walk func(string, interface{})
@@ -884,7 +1001,8 @@ func buildAgentReportTemplateContext(templateData map[string]interface{}) agentR
 			for childKey, child := range typed {
 				childNormalized := normalizeAgentReportFieldName(childKey)
 				if childNormalized == "products" || childNormalized == normalizeAgentReportFieldName("商品明细") ||
-					childNormalized == "rankings" || childNormalized == normalizeAgentReportFieldName("商品排行") {
+					childNormalized == "rankings" || childNormalized == normalizeAgentReportFieldName("商品排行") ||
+					childNormalized == "orders" || childNormalized == normalizeAgentReportFieldName("订单明细") {
 					continue
 				}
 				walk(childKey, child)
@@ -1091,6 +1209,13 @@ func buildAgentReportWorksheetFieldUpdates(
 	if rankingHeaderRow > 0 {
 		return buildAgentReportRepeatedRowUpdates(cells, rankingHeaderRow, context.rankings)
 	}
+	orderHeaderRow := agentReportHeaderRowWithAliases(headersByRow,
+		[]string{"订单编号", "订单号"},
+		[]string{"下单时间", "下单日期", "订单日期"},
+	)
+	if orderHeaderRow > 0 {
+		return buildAgentReportRepeatedRowUpdates(cells, orderHeaderRow, context.orders)
+	}
 
 	if metricHeaderRow > 0 {
 		endRow := adviceRow
@@ -1186,6 +1311,35 @@ func agentReportHeaderRow(headersByRow map[int]map[string]bool, required ...stri
 	return 0
 }
 
+func agentReportHeaderRowWithAliases(headersByRow map[int]map[string]bool, required ...[]string) int {
+	rows := make([]int, 0, len(headersByRow))
+	for row := range headersByRow {
+		rows = append(rows, row)
+	}
+	sort.Ints(rows)
+	for _, row := range rows {
+		headers := headersByRow[row]
+		matched := true
+		for _, aliases := range required {
+			aliasMatched := false
+			for _, alias := range aliases {
+				if headers[normalizeAgentReportFieldName(alias)] {
+					aliasMatched = true
+					break
+				}
+			}
+			if !aliasMatched {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return row
+		}
+	}
+	return 0
+}
+
 func buildAgentReportRepeatedRowUpdates(
 	cells []agentReportWorksheetCell,
 	headerRow int,
@@ -1227,10 +1381,31 @@ func lookupAgentReportRowValue(row map[string]string, label string) string {
 		normalizeAgentReportFieldName("支付订单数"):   {"支付订单数", "支付笔数", "订单数"},
 		normalizeAgentReportFieldName("支付金额"):    {"支付金额", "支付金额(元)", "成交金额"},
 		normalizeAgentReportFieldName("浏览支付转化率"): {"浏览支付转化率", "支付转化率"},
+		normalizeAgentReportFieldName("订单编号"):    {"订单编号", "订单号"},
+		normalizeAgentReportFieldName("下单时间"):    {"下单时间", "下单日期", "订单日期"},
+		normalizeAgentReportFieldName("订单状态"):    {"订单状态", "状态"},
+		normalizeAgentReportFieldName("退款状态"):    {"退款状态", "退款"},
+		normalizeAgentReportFieldName("商品名称"):    {"商品名称", "商品"},
+		normalizeAgentReportFieldName("规格"):      {"规格", "规格名称"},
+		normalizeAgentReportFieldName("单价"):      {"单价", "商品单价", "价格"},
+		normalizeAgentReportFieldName("数量"):      {"数量", "购买数量"},
+		normalizeAgentReportFieldName("成交价"):     {"成交价", "成交金额", "成交金额(元)"},
+		normalizeAgentReportFieldName("买家昵称"):    {"买家昵称", "买家", "买家名称"},
 	}
 	candidates := []string{label}
-	if values := aliases[normalized]; len(values) > 0 {
-		candidates = append(candidates, values...)
+	for canonical, values := range aliases {
+		matchesAlias := canonical == normalized
+		if !matchesAlias {
+			for _, alias := range values {
+				if normalizeAgentReportFieldName(alias) == normalized {
+					matchesAlias = true
+					break
+				}
+			}
+		}
+		if matchesAlias {
+			candidates = append(candidates, values...)
+		}
 	}
 	for _, candidate := range candidates {
 		candidateNormalized := normalizeAgentReportFieldName(candidate)
@@ -1800,6 +1975,8 @@ func agentUploadDirectories(purpose string) (string, string) {
 	switch strings.ToLower(strings.TrimSpace(purpose)) {
 	case "web-template", "webpage-template", "web":
 		return agentDataTemplateDirWeb, agentDataOutputDirWeb
+	case "component-input", "input", "import-file":
+		return agentDataInputDir, ""
 	default:
 		return agentDataTemplateDirReports, agentDataOutputDirReports
 	}
@@ -1868,8 +2045,8 @@ func agentUploadedTemplateAbsPath(dataDir, displayPath string) (string, error) {
 	if dataDir == "" || displayPath == "" {
 		return "", errors.New("template path is required")
 	}
-	if !strings.HasPrefix(displayPath, "data/templates/") {
-		return "", errors.New("template path must be under data/templates")
+	if !strings.HasPrefix(displayPath, "data/templates/") && !strings.HasPrefix(displayPath, "data/inputs/") {
+		return "", errors.New("managed file path must be under data/templates or data/inputs")
 	}
 
 	rel := strings.TrimPrefix(displayPath, "data/")
@@ -1880,7 +2057,11 @@ func agentUploadedTemplateAbsPath(dataDir, displayPath string) (string, error) {
 		return "", errors.New("invalid template path")
 	}
 
-	root := filepath.Clean(filepath.Join(dataDir, "templates"))
+	rootDir := "templates"
+	if strings.HasPrefix(displayPath, "data/inputs/") {
+		rootDir = "inputs"
+	}
+	root := filepath.Clean(filepath.Join(dataDir, rootDir))
 	full := filepath.Clean(filepath.Join(dataDir, cleanRel))
 	if full != root && !strings.HasPrefix(full, root+string(filepath.Separator)) {
 		return "", errors.New("invalid template path")

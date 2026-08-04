@@ -156,7 +156,10 @@ export interface PlaygroundAttachment {
   created_time: number
 }
 
-export type AgentFileUploadPurpose = 'report-template' | 'web-template'
+export type AgentFileUploadPurpose =
+  | 'report-template'
+  | 'web-template'
+  | 'component-input'
 
 export interface AgentFileUpload {
   filename: string

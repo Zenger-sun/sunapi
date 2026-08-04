@@ -90,6 +90,7 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -164,6 +165,7 @@ type AgentNodeKind =
   | 'image'
   | 'report'
   | 'report_data'
+  | 'order_report_data'
   | 'webpage'
   | 'notify'
   | 'stop'
@@ -278,6 +280,48 @@ type SkillChoice = {
 type SkillSource = 'built-in' | 'github' | 'marketplace' | 'custom'
 
 type SkillDraftSource = Exclude<SkillSource, 'built-in'>
+
+type ComponentPortOption = {
+  value: string
+  label: string
+  setting?: string
+}
+
+const CUSTOM_COMPONENT_INPUT_OPTIONS: ComponentPortOption[] = [
+  { value: 'upstream-data', label: '上游数据' },
+  { value: 'import-file', label: '导入文件', setting: '导入文件' },
+  { value: 'text-input', label: '文本输入', setting: '文本输入' },
+  { value: 'url-input', label: '网址', setting: '网址' },
+  { value: 'json-input', label: 'JSON 数据', setting: 'JSON 数据' },
+  { value: 'browser-session', label: '浏览器会话', setting: '会话名称' },
+  { value: 'blueprint-variable', label: '蓝图变量', setting: '变量名' },
+]
+
+const CUSTOM_COMPONENT_OUTPUT_OPTIONS: ComponentPortOption[] = [
+  { value: 'execution-result', label: '执行结果' },
+  { value: 'processed-data', label: '处理数据' },
+  { value: 'json-output', label: 'JSON 数据' },
+  { value: 'text-output', label: '文本结果' },
+  { value: 'generated-file', label: '生成文件' },
+  { value: 'file-path', label: '文件路径' },
+  { value: 'image-url', label: '图片 URL' },
+]
+
+function componentPortLabels(values: string[], options: ComponentPortOption[]) {
+  return values
+    .map((value) => options.find((option) => option.value === value)?.label)
+    .filter((label): label is string => Boolean(label))
+}
+
+function componentInputSettings(values: string[]) {
+  return values.reduce<Record<string, string>>((settings, value) => {
+    const option = CUSTOM_COMPONENT_INPUT_OPTIONS.find(
+      (candidate) => candidate.value === value
+    )
+    if (option?.setting) settings[option.setting] = ''
+    return settings
+  }, {})
+}
 
 type SkillStore = {
   id: string
@@ -431,7 +475,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser', 'report_data', 'custom'],
+    appliesTo: ['browser', 'report_data', 'order_report_data', 'custom'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -577,6 +621,7 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   image: 'skill.code-interpreter',
   report: 'skill.file-document',
   report_data: 'skill.browser-automation',
+  order_report_data: 'skill.browser-automation',
   webpage: 'skill.file-document',
   notify: 'skill.api-function',
   stop: 'skill.mcp-workflow',
@@ -592,6 +637,19 @@ const TIMEZONE_OPTIONS = [
   'America/New_York',
   'Europe/London',
   'Europe/Berlin',
+]
+const ORDER_STATUS_OPTIONS = [
+  '待付款',
+  '待发货',
+  '发货即将超时',
+  '发货已超时',
+  '已发货',
+  '售后中',
+  '交易成功',
+  '交易关闭',
+  '已取消',
+  '退款中',
+  '退款成功',
 ]
 const REPORT_OUTPUT_FORMAT_SETTING = '输出格式'
 const REPORT_OUTPUT_PATH_LABEL = '归档路径'
@@ -669,6 +727,7 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   采集周期: ['近1天', '近7天', '近30天'],
   页面等待: ['2s', '4s', '6s', '10s'],
   最大页数: ['5', '10', '20', '50'],
+  去重字段: ['订单编号'],
   轮询间隔: ['3s', '5s', '10s', '15s', '30s'],
   最大轮询: ['24', '48', '96', '180', '360'],
   最长运行: ['2m', '5m', '8m', '15m', '30m'],
@@ -837,6 +896,25 @@ const NODE_META: Record<
       最大页数: '10',
     },
   },
+  order_report_data: {
+    label: '订单数据管线',
+    group: '业务模板',
+    role: 'reasoning',
+    icon: FileSpreadsheetIcon,
+    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
+    description:
+      '读取报告模板计划，复用已登录浏览器分页采集订单，按日期和状态筛选、去重汇总并输出报告。',
+    inputs: ['订单报告模板计划', '浏览器会话'],
+    outputs: ['订单明细', '状态与金额汇总', '订单报告文件'],
+    settings: {
+      开始日期: '',
+      结束日期: '',
+      订单状态: '全部',
+      页面等待: '4s',
+      最大页数: '20',
+      去重字段: '订单编号',
+    },
+  },
   notify: {
     label: '发送通知',
     group: '输出',
@@ -993,6 +1071,12 @@ const COMPONENT_VISUAL_META: Record<
     icon: FileSpreadsheetIcon,
     accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
   },
+  'component.order-report-data': {
+    label: '订单数据管线',
+    group: '业务模板',
+    icon: FileSpreadsheetIcon,
+    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
+  },
 }
 
 function getAgentNodeVisualMeta(kind: AgentNodeKind, componentId?: string) {
@@ -1010,7 +1094,7 @@ const PALETTE_GROUPS: Array<{
   { title: '采集', kinds: ['browser', 'request'] },
   { title: '智能处理', kinds: ['transform', 'image'] },
   { title: '输出', kinds: ['report', 'webpage', 'notify'] },
-  { title: '业务模板', kinds: ['report_data'] },
+  { title: '业务模板', kinds: ['report_data', 'order_report_data'] },
 ]
 
 type PaletteTemplateGroup = {
@@ -1025,14 +1109,7 @@ type ComponentPaletteSection = {
 }
 
 const INITIAL_EDGES: AgentFlowEdge[] = [
-  { id: 'e-schedule-browser', source: 'schedule', target: 'browser' },
-  { id: 'e-start-browser', source: 'start', target: 'browser' },
-  { id: 'e-browser-transform', source: 'browser', target: 'transform' },
-  { id: 'e-transform-image', source: 'transform', target: 'image' },
-  { id: 'e-transform-report', source: 'transform', target: 'report' },
-  { id: 'e-image-report', source: 'image', target: 'report' },
-  { id: 'e-report-report-data', source: 'report', target: 'report_data' },
-  { id: 'e-report-data-stop', source: 'report_data', target: 'stop' },
+  { id: 'e-start-stop', source: 'start', target: 'stop' },
 ]
 
 export function AgentWorkspace({
@@ -1476,7 +1553,7 @@ export function AgentWorkspace({
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
     setExecutionLog({})
-    setSelectedNodeId('browser')
+    setSelectedNodeId('start')
   }, [bumpHistoryVersion, cancelPreviewRun, templates])
 
   const handleSaveBlueprint = useCallback(async () => {
@@ -1732,7 +1809,7 @@ export function AgentWorkspace({
       setNodes(createInitialNodes(templates))
       setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
       setExecutionLog({})
-      setSelectedNodeId('browser')
+      setSelectedNodeId('start')
     },
     [
       blueprints,
@@ -2872,8 +2949,8 @@ function ComponentManagerPanel({
     groupChoices[0]?.value ?? 'default'
   )
   const [modelName, setModelName] = useState(modelChoices[0]?.value ?? '')
-  const [inputs, setInputs] = useState('上游数据')
-  const [outputs, setOutputs] = useState('执行结果')
+  const [inputPorts, setInputPorts] = useState<string[]>([])
+  const [outputPorts, setOutputPorts] = useState<string[]>([])
   const [tags, setTags] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
 
@@ -2894,8 +2971,8 @@ function ComponentManagerPanel({
     setGroup('process')
     setModelGroup(groupChoices[0]?.value ?? 'default')
     setModelName(modelChoices[0]?.value ?? '')
-    setInputs('上游数据')
-    setOutputs('执行结果')
+    setInputPorts([])
+    setOutputPorts([])
     setTags('')
   }
 
@@ -2908,6 +2985,10 @@ function ComponentManagerPanel({
       toast.error('请输入组件描述')
       return
     }
+    if (outputPorts.length === 0) {
+      toast.error('请至少选择一个输出字段')
+      return
+    }
     setIsSubmitting(true)
     try {
       await onCreateComponent({
@@ -2916,8 +2997,12 @@ function ComponentManagerPanel({
         group,
         model_group: modelGroup,
         model_name: modelName,
-        inputs: splitListInput(inputs),
-        outputs: splitListInput(outputs),
+        inputs: componentPortLabels(inputPorts, CUSTOM_COMPONENT_INPUT_OPTIONS),
+        outputs: componentPortLabels(
+          outputPorts,
+          CUSTOM_COMPONENT_OUTPUT_OPTIONS
+        ),
+        settings: componentInputSettings(inputPorts),
         tags: splitListInput(tags),
       })
       reset()
@@ -3027,29 +3112,21 @@ function ComponentManagerPanel({
             </NativeSelect>
           </div>
 
-          <div className='grid gap-1'>
-            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
-              输入字段
-            </span>
-            <Input
-              value={inputs}
-              onChange={(event) => setInputs(event.target.value)}
-              placeholder='页面数据, 商品明细'
-              className='h-7 rounded-[6px] text-xs'
-            />
-          </div>
+          <ComponentPortPicker
+            label='输入字段'
+            emptyLabel='选择输入字段'
+            options={CUSTOM_COMPONENT_INPUT_OPTIONS}
+            values={inputPorts}
+            onChange={setInputPorts}
+          />
 
-          <div className='grid gap-1'>
-            <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
-              输出字段
-            </span>
-            <Input
-              value={outputs}
-              onChange={(event) => setOutputs(event.target.value)}
-              placeholder='关键指标, 运营建议'
-              className='h-7 rounded-[6px] text-xs'
-            />
-          </div>
+          <ComponentPortPicker
+            label='输出字段'
+            emptyLabel='选择输出字段'
+            options={CUSTOM_COMPONENT_OUTPUT_OPTIONS}
+            values={outputPorts}
+            onChange={setOutputPorts}
+          />
 
           <div className='grid gap-1'>
             <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
@@ -3072,6 +3149,88 @@ function ComponentManagerPanel({
           >
             创建组件
           </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ComponentPortPicker({
+  label,
+  emptyLabel,
+  options,
+  values,
+  onChange,
+}: {
+  label: string
+  emptyLabel: string
+  options: ComponentPortOption[]
+  values: string[]
+  onChange: (values: string[]) => void
+}) {
+  const [pendingValue, setPendingValue] = useState('')
+  const availableOptions = options.filter(
+    (option) => !values.includes(option.value)
+  )
+  const addPort = () => {
+    if (!pendingValue || values.includes(pendingValue)) return
+    onChange([...values, pendingValue])
+    setPendingValue('')
+  }
+
+  return (
+    <div className='grid gap-1'>
+      <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
+        {label}
+      </span>
+      <div className='grid grid-cols-[minmax(0,1fr)_28px] gap-1'>
+        <NativeSelect
+          value={pendingValue}
+          onChange={(event) => setPendingValue(event.target.value)}
+          className='h-7 rounded-[6px] text-xs'
+        >
+          <NativeSelectOption value=''>{emptyLabel}</NativeSelectOption>
+          {availableOptions.map((option) => (
+            <NativeSelectOption key={option.value} value={option.value}>
+              {option.label}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
+        <Button
+          type='button'
+          size='icon-sm'
+          variant='outline'
+          className='size-7 rounded-[6px]'
+          disabled={!pendingValue}
+          onClick={addPort}
+          title={`添加${label}`}
+        >
+          <PlusIcon className='size-3.5' />
+          <span className='sr-only'>{`添加${label}`}</span>
+        </Button>
+      </div>
+      {values.length > 0 && (
+        <div className='flex flex-wrap gap-1'>
+          {values.map((value) => {
+            const option = options.find(
+              (candidate) => candidate.value === value
+            )
+            if (!option) return null
+            return (
+              <button
+                key={value}
+                type='button'
+                className='border-border/70 bg-muted/45 hover:bg-muted inline-flex h-6 items-center gap-1 rounded-[5px] border px-1.5 text-[10px]'
+                onClick={() =>
+                  onChange(values.filter((item) => item !== value))
+                }
+                title={`移除${option.label}`}
+              >
+                <span>{option.label}</span>
+                <XIcon className='size-3' />
+              </button>
+            )
+          })}
         </div>
       )}
     </div>
@@ -4368,6 +4527,7 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     image: 2600,
     report: 1600,
     report_data: 5200,
+    order_report_data: 6800,
     webpage: 1400,
     notify: 720,
     stop: 240,
@@ -4473,7 +4633,8 @@ function buildNodeOutputSummary(
   if (
     (node.data.kind === 'transform' ||
       node.data.kind === 'report' ||
-      node.data.kind === 'report_data') &&
+      node.data.kind === 'report_data' ||
+      node.data.kind === 'order_report_data') &&
     hasMissingBrowserData(upstreamLogs) &&
     status === 'completed'
   ) {
@@ -4484,10 +4645,19 @@ function buildNodeOutputSummary(
     return buildReportOutputSummary(node, status)
   }
 
+  if (node.data.kind === 'order_report_data' && status === 'completed') {
+    return [
+      '订单明细: 已按订单编号去重并按日期范围筛选',
+      '状态与金额汇总: 已按订单状态聚合',
+      '订单报告文件: 已按上游模板生成',
+    ]
+  }
+
   const suffix: Record<AgentNodeLogStatus, string> = {
     pending: '等待生成',
     running: '生成中',
     completed: '已根据真实输入生成',
+    failed: '执行失败',
     stopped: '已停止，保留部分输入',
   }
 
@@ -4605,6 +4775,16 @@ function buildNodeModelOutput(
         `最大页数: ${node.data.settings['最大页数'] || '10'}`,
         '输出: 商品明细、曝光/支付/转化排行及最终日报文件。',
         '限制: 仅执行只读页面采集，不发布商品、不修改数据、不执行交易操作。',
+      ].join('\n')
+    case 'order_report_data':
+      return [
+        `模型: ${node.data.model}${skillLine}`,
+        '处理方式: 读取上游报告模板计划并复用浏览器登录会话。',
+        `日期范围: ${node.data.settings['开始日期'] || '未限制'} 至 ${node.data.settings['结束日期'] || '未限制'}`,
+        `订单状态: ${node.data.settings['订单状态'] || '全部'}`,
+        `最大页数: ${node.data.settings['最大页数'] || '20'}`,
+        '输出: 去重后的订单明细、状态与金额汇总及最终订单报告文件。',
+        '限制: 仅执行只读页面采集，不联系买家、不修改订单、不执行退款或交易操作。',
       ].join('\n')
     case 'webpage': {
       const templateBindings = parseTemplateBindings(
@@ -5023,6 +5203,12 @@ function buildNodeLogSteps(
     steps.push('计算商品排行并将结构化数据写回日报模板。')
   }
 
+  if (node.data.kind === 'order_report_data') {
+    steps.push('读取上游报告模板中的工作表、表头和订单字段。')
+    steps.push('复用浏览器登录会话，进入订单管理页并在日期范围内按页采集。')
+    steps.push('按订单编号去重，汇总状态与金额并将结构化数据写回报告模板。')
+  }
+
   if (node.data.kind === 'webpage') {
     const templateBindings = parseTemplateBindings(
       node.data.settings['网页模板'] || '',
@@ -5063,6 +5249,9 @@ function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
     }
     if (node.data.kind === 'report_data') {
       return `${node.data.title} 已重新采集数据并输出最终日报。`
+    }
+    if (node.data.kind === 'order_report_data') {
+      return `${node.data.title} 已采集并汇总订单数据，输出最终订单报告。`
     }
     if (node.data.kind === 'stop') {
       return `${node.data.title} 已完成流程结束动作，输出目录以上游节点配置为准。`
@@ -5612,6 +5801,9 @@ const LEGACY_OUTPUT_DIR_REPORT = '/output/reports'
 const LEGACY_OUTPUT_DIR_WEB = '/output/web-reports'
 const TEMPLATE_FILE_ACCEPT =
   '.xlsx,.xls,.doc,.docx,.pdf,.html,.htm,.md,.txt,.csv,.json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/pdf,text/html,text/markdown,text/plain,text/csv,application/json'
+const COMPONENT_INPUT_FILE_ACCEPT =
+  TEMPLATE_FILE_ACCEPT +
+  ',.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp'
 const TRANSIENT_BROWSER_SETTING_LABELS = new Set([
   BROWSER_PAGE_DATA_SETTING,
   BROWSER_CAPTURE_TEXT_SETTING,
@@ -5953,6 +6145,13 @@ function SettingControl({
   const [isLoadingTemplateLibrary, setIsLoadingTemplateLibrary] =
     useState(false)
   const [templateLibrary, setTemplateLibrary] = useState<AgentFileUpload[]>([])
+  const [isUploadingImportedFile, setIsUploadingImportedFile] = useState(false)
+  const [isImportFileLibraryOpen, setIsImportFileLibraryOpen] = useState(false)
+  const [isLoadingImportFileLibrary, setIsLoadingImportFileLibrary] =
+    useState(false)
+  const [importFileLibrary, setImportFileLibrary] = useState<AgentFileUpload[]>(
+    []
+  )
 
   if (label === '条件') {
     return <ConditionSettingControl value={value} onChange={onChange} />
@@ -6137,6 +6336,148 @@ function SettingControl({
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
           生成的文件默认写入 exe 同级 data
           目录；标题、格式、语气、归档规则等要求请写在任务描述中。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (label === '导入文件') {
+    const selectedPath = value.trim()
+    const selectedName = selectedPath
+      ? selectedPath.split('/').filter(Boolean).at(-1) || selectedPath
+      : ''
+    const refreshImportFileLibrary = async () => {
+      setIsLoadingImportFileLibrary(true)
+      try {
+        setImportFileLibrary(await listAgentFiles('component-input'))
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : '文件列表加载失败')
+      } finally {
+        setIsLoadingImportFileLibrary(false)
+      }
+    }
+    const handleImportFileUpload = async (
+      event: ChangeEvent<HTMLInputElement>
+    ) => {
+      const input = event.currentTarget
+      const file = input.files?.[0]
+      if (!file) return
+      setIsUploadingImportedFile(true)
+      try {
+        const uploaded = await uploadAgentFile(file, 'component-input')
+        onChange(uploaded.path)
+        toast.success('文件已设为节点输入', {
+          description: uploaded.original_name || uploaded.path,
+        })
+        if (isImportFileLibraryOpen) void refreshImportFileLibrary()
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : '文件上传失败')
+      } finally {
+        input.value = ''
+        setIsUploadingImportedFile(false)
+      }
+    }
+
+    return (
+      <LabeledField label='导入文件'>
+        <div className='space-y-2'>
+          <div className='border-border/70 bg-muted/20 flex min-w-0 items-center gap-2 rounded-[8px] border px-2 py-2'>
+            <FileTextIcon className='text-muted-foreground size-4 shrink-0' />
+            <div className='min-w-0 flex-1'>
+              <div className='truncate text-xs font-medium'>
+                {selectedName || '未选择文件'}
+              </div>
+              <div className='text-muted-foreground truncate text-[11px]'>
+                {selectedPath || '上传文件或从已上传文件中选择'}
+              </div>
+            </div>
+            {selectedPath && (
+              <Button
+                type='button'
+                size='icon-sm'
+                variant='ghost'
+                className='size-7 shrink-0 rounded-[6px]'
+                onClick={() => onChange('')}
+                title='清除导入文件'
+              >
+                <XIcon className='size-3.5' />
+                <span className='sr-only'>清除导入文件</span>
+              </Button>
+            )}
+          </div>
+
+          <div className='grid grid-cols-2 gap-2'>
+            <label
+              aria-disabled={isUploadingImportedFile}
+              className='bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-[6px] px-2.5 text-xs font-medium aria-disabled:pointer-events-none aria-disabled:opacity-50'
+            >
+              <UploadIcon className='size-3.5 shrink-0' />
+              <span>{isUploadingImportedFile ? '上传中' : '上传文件'}</span>
+              <input
+                type='file'
+                accept={COMPONENT_INPUT_FILE_ACCEPT}
+                className='sr-only'
+                disabled={isUploadingImportedFile}
+                onChange={handleImportFileUpload}
+              />
+            </label>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              className='h-8 rounded-[6px] px-2.5 text-xs'
+              onClick={() => {
+                const nextOpen = !isImportFileLibraryOpen
+                setIsImportFileLibraryOpen(nextOpen)
+                if (nextOpen) void refreshImportFileLibrary()
+              }}
+            >
+              选择已上传文件
+            </Button>
+          </div>
+
+          {isImportFileLibraryOpen && (
+            <div className='border-border/70 bg-muted/20 max-h-40 overflow-y-auto rounded-[8px] border p-1.5'>
+              {isLoadingImportFileLibrary ? (
+                <div className='text-muted-foreground py-2 text-center text-xs'>
+                  正在加载文件
+                </div>
+              ) : importFileLibrary.length === 0 ? (
+                <div className='text-muted-foreground py-2 text-center text-xs'>
+                  暂无可选择的文件
+                </div>
+              ) : (
+                <div className='space-y-1'>
+                  {importFileLibrary.map((file) => {
+                    const selected = file.path === selectedPath
+                    return (
+                      <button
+                        key={file.path}
+                        type='button'
+                        className={cn(
+                          'border-border/60 hover:bg-accent/50 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-[6px] border px-2 py-1.5 text-left',
+                          selected && 'border-primary/50 bg-primary/5'
+                        )}
+                        onClick={() => onChange(file.path)}
+                      >
+                        <span className='min-w-0'>
+                          <span className='block truncate text-xs font-medium'>
+                            {file.original_name || file.filename}
+                          </span>
+                          <span className='text-muted-foreground block truncate text-[10px]'>
+                            {file.path}
+                          </span>
+                        </span>
+                        <span className='text-muted-foreground text-[10px]'>
+                          {selected ? '已选择' : '选择'}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </LabeledField>
     )
@@ -6559,6 +6900,32 @@ function SettingControl({
     )
   }
 
+  if (
+    nodeKind === 'order_report_data' &&
+    (label === '开始日期' || label === '结束日期')
+  ) {
+    return (
+      <LabeledField label={label}>
+        <Input
+          type='date'
+          value={value}
+          min={
+            label === '结束日期' ? settings['开始日期'] || undefined : undefined
+          }
+          max={
+            label === '开始日期' ? settings['结束日期'] || undefined : undefined
+          }
+          onChange={(event) => onChange(event.target.value)}
+          className='h-8 rounded-[8px] text-sm'
+        />
+      </LabeledField>
+    )
+  }
+
+  if (nodeKind === 'order_report_data' && label === '订单状态') {
+    return <OrderStatusSettingControl value={value} onChange={onChange} />
+  }
+
   if (label === '时区') {
     return (
       <LabeledField label={label}>
@@ -6606,6 +6973,58 @@ function SettingControl({
         onChange={(event) => onChange(event.target.value)}
         className='h-8 rounded-[8px] text-sm'
       />
+    </LabeledField>
+  )
+}
+
+function OrderStatusSettingControl({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
+  const selected = new Set(
+    value === '全部'
+      ? []
+      : value
+          .split(/[、,，;；\n\r]+/)
+          .map((item) => item.trim())
+          .filter(Boolean)
+  )
+  const updateStatus = (status: string, checked: boolean) => {
+    const next = new Set(selected)
+    if (checked) next.add(status)
+    else next.delete(status)
+    const ordered = ORDER_STATUS_OPTIONS.filter((item) => next.has(item))
+    onChange(ordered.length > 0 ? ordered.join('、') : '全部')
+  }
+
+  return (
+    <LabeledField label='订单状态'>
+      <div className='border-border/70 grid grid-cols-2 gap-x-3 gap-y-2 rounded-[8px] border px-2.5 py-2'>
+        <label className='flex min-w-0 cursor-pointer items-center gap-2 text-xs'>
+          <Checkbox
+            checked={selected.size === 0}
+            onCheckedChange={() => onChange('全部')}
+            aria-label='全部订单状态'
+          />
+          <span>全部</span>
+        </label>
+        {ORDER_STATUS_OPTIONS.map((status) => (
+          <label
+            key={status}
+            className='flex min-w-0 cursor-pointer items-center gap-2 text-xs'
+          >
+            <Checkbox
+              checked={selected.has(status)}
+              onCheckedChange={(checked) => updateStatus(status, !!checked)}
+              aria-label={status}
+            />
+            <span className='min-w-0'>{status}</span>
+          </label>
+        ))}
+      </div>
     </LabeledField>
   )
 }
@@ -7491,6 +7910,7 @@ function readSkillNodeKinds(
     'image',
     'report',
     'report_data',
+    'order_report_data',
     'webpage',
     'notify',
     'stop',
@@ -7870,7 +8290,13 @@ function upgradeSavedReportDataPipeline(
   nodes: AgentFlowNode[],
   edges: AgentFlowEdge[]
 ) {
-  if (nodes.some((node) => node.data.kind === 'report_data')) {
+  if (
+    nodes.some(
+      (node) =>
+        node.data.kind === 'report_data' ||
+        node.data.kind === 'order_report_data'
+    )
+  ) {
     return { nodes, edges }
   }
   const report = nodes.find(
@@ -7880,20 +8306,26 @@ function upgradeSavedReportDataPipeline(
   )
   if (!report) return { nodes, edges }
 
-  const meta = NODE_META.report_data
-  const processorId = `report-data-${report.id}`
+  const processorKind = isOrderReportTemplate(report)
+    ? 'order_report_data'
+    : 'report_data'
+  const meta = NODE_META[processorKind]
+  const processorId = `${processorKind.replace(/_/g, '-')}-${report.id}`
   const processor: AgentFlowNode = {
     id: processorId,
     type: 'agentNode',
     position: { x: report.position.x + 350, y: report.position.y },
     data: {
-      kind: 'report_data',
-      componentId: 'component.report-data',
+      kind: processorKind,
+      componentId:
+        processorKind === 'order_report_data'
+          ? 'component.order-report-data'
+          : 'component.report-data',
       title: meta.label,
       description: meta.description,
       group: report.data.group,
       model: report.data.model,
-      skill: DEFAULT_SKILL_BY_NODE_KIND.report_data ?? NO_SKILL_VALUE,
+      skill: DEFAULT_SKILL_BY_NODE_KIND[processorKind] ?? NO_SKILL_VALUE,
       inputs: [...meta.inputs],
       outputs: [...meta.outputs],
       settings: { ...meta.settings },
@@ -7918,6 +8350,22 @@ function upgradeSavedReportDataPipeline(
     ),
   ]
   return { nodes: [...nodes, processor], edges: nextEdges }
+}
+
+function isOrderReportTemplate(report: AgentFlowNode) {
+  const settings = report.data.settings
+  const haystack = [
+    settings['模板预览'],
+    settings['模板原文件名'],
+    settings['模板文件'],
+    report.data.title,
+    report.data.description,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return /订单编号|订单号|下单时间|下单日期|订单日期|退款状态|成交价|成交金额/.test(
+    haystack
+  )
 }
 
 function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
@@ -8293,7 +8741,7 @@ function normalizeNode(node: AgentFlowNode): AgentFlowNode {
     position: node.position ?? { x: 0, y: 0 },
     data: {
       kind,
-      componentId: data.componentId ?? `component.${kind.replace('_', '-')}`,
+      componentId: data.componentId ?? `component.${kind.replace(/_/g, '-')}`,
       title: data.title ?? meta.label,
       description: data.description ?? meta.description,
       group: data.group,
@@ -8459,7 +8907,7 @@ function buildTemplates(
     baseTemplates.flatMap((template) => [
       template.componentId ?? template.kind,
       `component.${template.kind}`,
-      `component.${template.kind.replace('_', '-')}`,
+      `component.${template.kind.replace(/_/g, '-')}`,
     ])
   )
   const dynamicTemplates = components
@@ -8702,89 +9150,21 @@ function createInitialNodes(templates: NodeTemplate[]) {
     patch: Partial<NodeTemplate>
   }> = [
     {
-      kind: 'schedule',
-      id: 'schedule',
-      position: { x: -360, y: -120 },
-      patch: {
-        title: '每天早上执行',
-        description: '每天 08:30 自动启动当前自动化任务。',
-        status: 'waiting',
-      },
-    },
-    {
       kind: 'start',
       id: 'start',
-      position: { x: -360, y: 90 },
+      position: { x: -260, y: 0 },
       patch: {
-        title: '立即执行一次',
-        description: '手动触发当前蓝图，适合临时执行一次任务。',
-      },
-    },
-    {
-      kind: 'browser',
-      id: 'browser',
-      position: { x: 0, y: -20 },
-      patch: {
-        title: '打开目标页面',
-        description:
-          '使用持久化登录会话打开目标页面；首次登录后会在后续定时任务中复用。',
-        settings: {
-          网址: 'https://www.baidu.com/',
-          登录态: '持久化登录会话（首次登录后复用）',
-          会话名称: '默认',
-          登录等待: '120s',
-          权限: '只读采集',
-          采集等待: '6s',
-        },
-      },
-    },
-    {
-      kind: 'transform',
-      id: 'transform',
-      position: { x: 350, y: -20 },
-      patch: {
-        title: '整理数据',
-        description:
-          '根据上一节点输出清洗、归并和排序数据，按当前节点描述生成结构化结果。',
-      },
-    },
-    {
-      kind: 'image',
-      id: 'image',
-      position: { x: 700, y: -145 },
-      patch: {
-        title: '生成图片',
-        description: '根据上一节点输出和当前节点描述生成配图或封面图。',
-      },
-    },
-    {
-      kind: 'report',
-      id: 'report',
-      position: { x: 700, y: 95 },
-      patch: {
-        title: '生成日报',
-        description:
-          '上传并解析日报模板，生成字段映射和浏览器采集计划，交给后续处理数据节点。',
-      },
-    },
-    {
-      kind: 'report_data',
-      id: 'report_data',
-      position: { x: 1050, y: 95 },
-      patch: {
-        title: '处理数据',
-        description:
-          '根据日报模板计划复用已登录浏览器，重新采集商品明细、计算排行并输出最终日报。',
+        title: '手动开始',
+        description: '手动触发当前蓝图。',
       },
     },
     {
       kind: 'stop',
       id: 'stop',
-      position: { x: 1400, y: 95 },
+      position: { x: 220, y: 0 },
       patch: {
         title: '结束',
-        description:
-          '确认上游产物已生成后结束当前流程；产物目录以上游输出节点配置为准。',
+        description: '结束当前蓝图流程。',
       },
     },
   ]

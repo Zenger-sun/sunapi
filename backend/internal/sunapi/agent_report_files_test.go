@@ -193,6 +193,28 @@ func TestBuildAgentReportWorksheetFieldUpdatesFillsRankingRows(t *testing.T) {
 	}
 }
 
+func TestBuildAgentReportWorksheetFieldUpdatesFillsOrderAliases(t *testing.T) {
+	cells := []agentReportWorksheetCell{
+		{Reference: "A1", Value: "订单号"},
+		{Reference: "B1", Value: "订单日期"},
+		{Reference: "C1", Value: "商品"},
+		{Reference: "D1", Value: "成交金额"},
+		{Reference: "A2", Value: "old"},
+		{Reference: "B2", Value: "old"},
+		{Reference: "C2", Value: "old"},
+		{Reference: "D2", Value: "old"},
+	}
+	updates := buildAgentReportWorksheetFieldUpdates(cells, agentReportTemplateContext{
+		fields: map[string]string{},
+		orders: []map[string]string{
+			{"订单编号": "order-1", "下单时间": "2026-07-20 10:00:00", "商品名称": "新商品", "成交价": "12.06"},
+		},
+	})
+	if updates["A2"] != "order-1" || updates["B2"] != "2026-07-20 10:00:00" || updates["C2"] != "新商品" || updates["D2"] != "12.06" {
+		t.Fatalf("order row=%#v", updates)
+	}
+}
+
 func TestReplaceAgentReportWorksheetCellValueSupportsSelfClosingCell(t *testing.T) {
 	worksheet := []byte(`<worksheet><sheetData><row r="2"><c r="A2" s="1"/></row></sheetData></worksheet>`)
 	updated := string(replaceAgentReportWorksheetCellValue(worksheet, "A2", "商品-1"))

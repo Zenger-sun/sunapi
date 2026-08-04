@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	agentArchiveDirName      = "agent-archives"
-	agentBlueprintRunTimeout = 10 * time.Minute
+	agentArchiveDirName          = "agent-archives"
+	agentBlueprintRunTimeout     = 10 * time.Minute
+	agentBlueprintCleanupTimeout = 5 * time.Second
 )
 
 type agentSubflowStackContextKey struct{}
@@ -61,6 +62,12 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 	if err != nil {
 		log.WithError(err).WithField("blueprint_id", bp.ID).
 			Warn("agent: failed to create execution log")
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), agentBlueprintCleanupTimeout)
+		defer cleanupCancel()
+		if statusErr := store.UpdateBlueprintAfterRun(cleanupCtx, bp.ID, "failed", err.Error()); statusErr != nil {
+			log.WithError(statusErr).WithField("blueprint_id", bp.ID).
+				Warn("agent: failed to release blueprint after execution log error")
+		}
 		return
 	}
 
@@ -90,19 +97,16 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 		log.WithError(execErr).WithField("blueprint_id", bp.ID).
 			Warn("agent: blueprint execution failed")
 	}
-	blueprintStatus := executionStatus
-	if isRecurringAgentScheduledBlueprint(bp) {
-		blueprintStatus = "running"
-	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), agentBlueprintCleanupTimeout)
+	defer cleanupCancel()
 
 	// 更新蓝图执行次数和时间
 	now := time.Now().UnixMilli()
-	if isRecurringAgentScheduledBlueprint(bp) {
-		_ = store.UpdateRecurringBlueprintAfterRun(ctx, bp.ID, failureReason)
-	} else {
-		_ = store.UpdateBlueprintStatus(ctx, bp.ID, blueprintStatus, failureReason)
+	if err := store.UpdateBlueprintAfterRun(cleanupCtx, bp.ID, executionStatus, failureReason); err != nil {
+		log.WithError(err).WithField("blueprint_id", bp.ID).
+			Warn("agent: failed to update blueprint execution status")
 	}
-	_, _ = store.db.ExecContext(ctx, `
+	_, _ = store.db.ExecContext(cleanupCtx, `
 		UPDATE agent_blueprints
 		SET execution_count = execution_count + 1,
 		    last_executed_time = ?,
@@ -112,12 +116,12 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 		now, durationMs, now, bp.ID)
 
 	// 更新智能体的最后执行时间
-	_, _ = store.db.ExecContext(ctx, `
+	_, _ = store.db.ExecContext(cleanupCtx, `
 		UPDATE agents SET last_executed_time = ?, updated_time = ?
 		WHERE id = ?`, now, now, bp.AgentID)
 
 	// 完成执行日志
-	_ = store.FinishExecutionLog(ctx, execLog.ID, executionStatus, failureReason, archivePath, output)
+	_ = store.FinishExecutionLog(cleanupCtx, execLog.ID, executionStatus, failureReason, archivePath, output)
 
 	log.WithFields(log.Fields{
 		"blueprint_id": bp.ID,
@@ -902,6 +906,8 @@ func executeAgentBlueprintNode(
 		result = executeAgentReportGraphNode(store, node, upstream, result, reportPlanOnly)
 	case "report_data":
 		result = executeAgentReportDataGraphNode(ctx, store, node, upstream, result)
+	case "order_report_data":
+		result = executeAgentOrderReportDataGraphNode(ctx, store, node, upstream, result)
 	case "webpage":
 		result = executeAgentWebpageGraphNode(store, node, upstream, result)
 	case "notify":
@@ -1899,7 +1905,8 @@ func agentNodeHasDownstreamReportData(
 			if edge.Source != current || seen[edge.Target] {
 				continue
 			}
-			if kindByID[edge.Target] == "report_data" || componentByID[edge.Target] == "component.report-data" {
+			if kindByID[edge.Target] == "report_data" || kindByID[edge.Target] == "order_report_data" ||
+				componentByID[edge.Target] == "component.report-data" || componentByID[edge.Target] == "component.order-report-data" {
 				return true
 			}
 			seen[edge.Target] = true
@@ -2160,6 +2167,8 @@ func executeAgentBuiltinCustomComponent(
 		return true, executeAgentDatabaseGraphNode(ctx, store, node, result)
 	case "component.file":
 		return true, executeAgentFileGraphNode(store, node, upstream, result)
+	case "component.order-report-data":
+		return true, executeAgentOrderReportDataGraphNode(ctx, store, node, upstream, result)
 	default:
 		_ = ctx
 		_ = bp
@@ -3396,6 +3405,8 @@ func parseAgentDataFileContent(absPath, ext string, data []byte) (string, []map[
 			return "", nil, "", err
 		}
 		return truncateRunes(preview, 12000), nil, strings.ToUpper(strings.TrimPrefix(ext, ".")) + " 文件", nil
+	case ".png", ".jpg", ".jpeg", ".webp":
+		return "Binary image input. The file path and metadata are available to this node; use an image-capable component for pixel-level editing.", nil, "Image", nil
 	default:
 		return "", nil, "", fmt.Errorf("unsupported file extension %q", ext)
 	}
@@ -4130,11 +4141,15 @@ func callLLMForAgentNode(
 	if model == "" {
 		return "", errors.New("model name is required")
 	}
+	configuredFiles, err := resolveAgentNodeImportedFiles(store, node)
+	if err != nil {
+		return "", err
+	}
 	reqBody := map[string]interface{}{
 		"model": model,
 		"messages": []chatMsg{
 			{Role: "system", Content: buildAgentNodeSystemPrompt(ctx, store, bp, node)},
-			{Role: "user", Content: buildAgentNodeUserPrompt(node, upstream, inputVars)},
+			{Role: "user", Content: buildAgentNodeUserPrompt(node, upstream, inputVars, configuredFiles)},
 		},
 		"stream": false,
 	}
@@ -4270,12 +4285,37 @@ func buildAgentNodeSystemPrompt(ctx context.Context, store *Store, bp *AgentBlue
 	return sb.String()
 }
 
-func buildAgentNodeUserPrompt(node agentBlueprintGraphNode, upstream map[string]interface{}, inputVars map[string]interface{}) string {
+func resolveAgentNodeImportedFiles(store *Store, node agentBlueprintGraphNode) (map[string]AgentFileReadResult, error) {
+	files := map[string]AgentFileReadResult{}
+	for _, input := range node.Data.Inputs {
+		if strings.TrimSpace(input) != "导入文件" {
+			continue
+		}
+		path := strings.TrimSpace(node.Data.Settings[input])
+		if path == "" {
+			continue
+		}
+		file, err := readAgentDataFile(store, path)
+		if err != nil {
+			return nil, fmt.Errorf("read imported file %q: %w", path, err)
+		}
+		files[input] = file
+	}
+	return files, nil
+}
+
+func buildAgentNodeUserPrompt(
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	inputVars map[string]interface{},
+	importedFiles map[string]AgentFileReadResult,
+) string {
 	payload := map[string]interface{}{
 		"node_description": node.Data.Description,
 		"node_settings":    node.Data.Settings,
 		"upstream":         upstream,
 		"input_vars":       inputVars,
+		"imported_files":   importedFiles,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -4305,7 +4345,7 @@ var builtinAgentSkillOrder = []string{
 var builtinAgentSkillAppliesTo = map[string][]string{
 	"skill.web-research":       {"browser", "request", "webpage", "report", "custom"},
 	"skill.file-document":      {"transform", "report", "webpage", "custom"},
-	"skill.browser-automation": {"browser", "report_data", "custom"},
+	"skill.browser-automation": {"browser", "report_data", "order_report_data", "custom"},
 	"skill.code-interpreter":   {"transform", "image", "report", "custom"},
 	"skill.api-function":       {"request", "notify", "custom"},
 	"skill.rag-file-search":    {"browser", "request", "transform", "report", "custom"},
