@@ -403,7 +403,7 @@ func normalizeAgentReportOutputFiles(req AgentReportWriteRequest) []AgentReportO
 	var out []AgentReportOutputFile
 	if strings.TrimSpace(req.Markdown) != "" {
 		out = append(out, AgentReportOutputFile{
-			Label:     "Markdown 日报",
+			Label:     "Markdown 文档",
 			Extension: "md",
 			Content:   req.Markdown,
 		})

@@ -11,7 +11,7 @@ import (
 func TestAgentGraphReportFilesUsesMultipleTemplateBindings(t *testing.T) {
 	node := agentBlueprintGraphNode{ID: "report-1"}
 	node.Data.Kind = "report"
-	node.Data.Title = "生成日报"
+	node.Data.Title = "生成报告"
 	node.Data.Settings = map[string]string{
 		"模板文件": `[{"path":"data/templates/reports/a.xlsx","originalName":"a.xlsx"},"data/templates/reports/b.md"]`,
 	}
@@ -23,7 +23,7 @@ func TestAgentGraphReportFilesUsesMultipleTemplateBindings(t *testing.T) {
 	if files[0].Label != "Excel 表格" || files[0].TemplateOriginalName != "a.xlsx" {
 		t.Fatalf("first file=%+v", files[0])
 	}
-	if files[1].Label != "Markdown 日报" || files[1].TemplateOriginalName != "b.md" {
+	if files[1].Label != "Markdown 文档" || files[1].TemplateOriginalName != "b.md" {
 		t.Fatalf("second file=%+v", files[1])
 	}
 }
@@ -53,7 +53,7 @@ func TestBuildAgentReportXLSXFromTemplateReplacesPlaceholders(t *testing.T) {
 		t.Fatalf("build template xlsx: %v", err)
 	}
 
-	output, err := buildAgentReportXLSXFromTemplate(templateBytes, "日报", "Excel 表格", "生成内容")
+	output, err := buildAgentReportXLSXFromTemplate(templateBytes, "报告", "Excel 表格", "生成内容")
 	if err != nil {
 		t.Fatalf("build xlsx from template: %v", err)
 	}

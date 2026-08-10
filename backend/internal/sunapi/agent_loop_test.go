@@ -48,7 +48,6 @@ func TestAgentLoopItemsPropagateAndCollect(t *testing.T) {
 		outputs,
 		items,
 		map[string]interface{}{},
-		false,
 	)
 	if sortResult.Status != "completed" {
 		t.Fatalf("per-item status = %q, error = %s", sortResult.Status, sortResult.Error)
@@ -93,7 +92,7 @@ func TestAgentLoopBranchRoutesMatchingItems(t *testing.T) {
 	branch.Data.Settings = map[string]string{"条件": "status=ok"}
 	branchResult := executeAgentBlueprintNodeForEach(
 		context.Background(), nil, nil, branch, edges, outputs, items,
-		map[string]interface{}{}, false,
+		map[string]interface{}{},
 	)
 	if branchResult.Status != "completed" {
 		t.Fatalf("branch status = %q, error = %s", branchResult.Status, branchResult.Error)

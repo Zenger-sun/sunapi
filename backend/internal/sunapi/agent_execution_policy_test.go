@@ -21,7 +21,6 @@ func TestExecuteAgentBlueprintNodeWithPolicyRetriesAndContinues(t *testing.T) {
 		node,
 		nil,
 		map[string]interface{}{},
-		false,
 	)
 	if result.Status != "completed" {
 		t.Fatalf("status = %q, want completed", result.Status)
@@ -51,7 +50,6 @@ func TestExecuteAgentBlueprintNodeWithPolicyTimesOut(t *testing.T) {
 		node,
 		map[string]interface{}{"source": map[string]interface{}{"value": true}},
 		map[string]interface{}{},
-		false,
 	)
 	if result.Status != "failed" {
 		t.Fatalf("status = %q, want failed", result.Status)

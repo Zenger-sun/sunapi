@@ -63,6 +63,46 @@ func TestPrepareAndCreateCustomComponentPersistsModelSkillTags(t *testing.T) {
 	}
 }
 
+func TestBuiltinAgentComponentsDoesNotExposeBusinessTemplates(t *testing.T) {
+	hidden := map[string]bool{
+		"component.report-data":       true,
+		"component.order-report-data": true,
+		"component.ticket_grab":       true,
+	}
+	for _, component := range builtinAgentComponents {
+		if hidden[component.ID] {
+			t.Fatalf("business template must not be exposed in the generic catalog: %#v", component)
+		}
+	}
+}
+
+func TestNormalizeComponentGroupRejectsTemplateGroups(t *testing.T) {
+	for _, group := range []string{"模板", "业务模板", "template", "recipe"} {
+		if got := normalizeComponentGroup(group); got != "" {
+			t.Fatalf("normalizeComponentGroup(%q)=%q want empty", group, got)
+		}
+	}
+}
+
+func TestBuiltinCollectorComponentsDoNotPresetBusinessURLs(t *testing.T) {
+	collectorIDs := map[string]bool{
+		"component.browser": true,
+		"component.request": true,
+	}
+	for _, component := range builtinAgentComponents {
+		if !collectorIDs[component.ID] {
+			continue
+		}
+		var cfg componentConfigPayload
+		if err := json.Unmarshal(component.Config, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Settings["网址"] != "" {
+			t.Fatalf("collector %q must not preset a URL: %#v", component.ID, cfg.Settings)
+		}
+	}
+}
+
 func stringSliceContains(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {

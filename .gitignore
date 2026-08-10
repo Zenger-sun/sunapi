@@ -3,6 +3,7 @@ front/dist/
 front/.tanstack/
 .cache/
 .gocache/
+.gomodcache/
 backend/.cache/
 backend/.tmp/
 backend/static/

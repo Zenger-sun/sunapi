@@ -52,7 +52,7 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 }
 
 func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *AgentBlueprint) {
-	ctx, cancel := context.WithTimeout(parent, agentBlueprintExecutionTimeout(bp))
+	ctx, cancel := context.WithTimeout(parent, agentBlueprintRunTimeout)
 	defer cancel()
 
 	startedAt := time.Now()
@@ -128,32 +128,6 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 		"status":       executionStatus,
 		"duration_ms":  durationMs,
 	}).Info("agent: blueprint execution finished")
-}
-
-func agentBlueprintExecutionTimeout(bp *AgentBlueprint) time.Duration {
-	timeout := agentBlueprintRunTimeout
-	if bp == nil {
-		return timeout
-	}
-	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
-	if err != nil {
-		return timeout
-	}
-	for _, node := range nodes {
-		if node.Data.ComponentID != "component.ticket_grab" {
-			continue
-		}
-		ticketDuration := parseAgentTicketDuration(
-			node.Data.Settings["最长运行"],
-			agentTicketDefaultDuration,
-			10*time.Second,
-			agentTicketMaxDuration,
-		)
-		if candidate := ticketDuration + 2*time.Minute; candidate > timeout {
-			timeout = candidate
-		}
-	}
-	return timeout
 }
 
 func blueprintHasScheduleNode(bp *AgentBlueprint) bool {
@@ -332,13 +306,12 @@ func executeBlueprintNodeGraph(
 			continue
 		}
 		upstream := upstreamAgentNodeOutputs(node.ID, edges, outputsByNodeID)
-		reportPlanOnly := node.Data.Kind == "report" && agentNodeHasDownstreamReportData(node.ID, nodes, edges)
 		loopItems, hasLoopItems := agentLoopItemsForNode(node.ID, edges, outputsByNodeID)
 		var result agentBlueprintNodeResult
 		if hasLoopItems && node.Data.ComponentID != "component.loop_collect" {
-			result = executeAgentBlueprintNodeForEach(ctx, store, bp, node, edges, outputsByNodeID, loopItems, inputVars, reportPlanOnly)
+			result = executeAgentBlueprintNodeForEach(ctx, store, bp, node, edges, outputsByNodeID, loopItems, inputVars)
 		} else {
-			result = executeAgentBlueprintNodeWithPolicy(ctx, store, bp, node, upstream, inputVars, reportPlanOnly)
+			result = executeAgentBlueprintNodeWithPolicy(ctx, store, bp, node, upstream, inputVars)
 		}
 		results = append(results, result)
 		if result.Status == "failed" {
@@ -619,7 +592,6 @@ func executeAgentBlueprintNodeForEach(
 	outputsByNodeID map[string]map[string]interface{},
 	items []interface{},
 	inputVars map[string]interface{},
-	reportPlanOnly bool,
 ) agentBlueprintNodeResult {
 	started := time.Now()
 	result := agentBlueprintNodeResult{
@@ -634,7 +606,7 @@ func executeAgentBlueprintNodeForEach(
 	loopResults := make([]interface{}, 0, len(items))
 	for index, item := range items {
 		itemUpstream := agentLoopItemUpstream(node.ID, edges, outputsByNodeID, item, index)
-		itemResult := executeAgentBlueprintNodeWithPolicy(ctx, store, bp, node, itemUpstream, inputVars, reportPlanOnly)
+		itemResult := executeAgentBlueprintNodeWithPolicy(ctx, store, bp, node, itemUpstream, inputVars)
 		loopResults = append(loopResults, map[string]interface{}{
 			"index":  index,
 			"item":   item,
@@ -857,7 +829,6 @@ func executeAgentBlueprintNode(
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	inputVars map[string]interface{},
-	reportPlanOnly bool,
 ) agentBlueprintNodeResult {
 	started := time.Now()
 	result := agentBlueprintNodeResult{
@@ -903,11 +874,7 @@ func executeAgentBlueprintNode(
 	case "image":
 		result = executeAgentImageGraphNode(ctx, store, bp, node, upstream, result)
 	case "report":
-		result = executeAgentReportGraphNode(store, node, upstream, result, reportPlanOnly)
-	case "report_data":
-		result = executeAgentReportDataGraphNode(ctx, store, node, upstream, result)
-	case "order_report_data":
-		result = executeAgentOrderReportDataGraphNode(ctx, store, node, upstream, result)
+		result = executeAgentReportGraphNode(store, node, upstream, result)
 	case "webpage":
 		result = executeAgentWebpageGraphNode(store, node, upstream, result)
 	case "notify":
@@ -931,7 +898,6 @@ func executeAgentBlueprintNodeWithPolicy(
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	inputVars map[string]interface{},
-	reportPlanOnly bool,
 ) agentBlueprintNodeResult {
 	retries := parseAgentNodeRetryCount(node.Data.Settings["失败重试"])
 	retryInterval := parseAgentNodeRetryInterval(node.Data.Settings["重试间隔"])
@@ -944,7 +910,7 @@ func executeAgentBlueprintNodeWithPolicy(
 		if timeout > 0 {
 			attemptCtx, cancel = context.WithTimeout(ctx, timeout)
 		}
-		last = executeAgentBlueprintNode(attemptCtx, store, bp, node, upstream, inputVars, reportPlanOnly)
+		last = executeAgentBlueprintNode(attemptCtx, store, bp, node, upstream, inputVars)
 		timedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if timedOut {
@@ -1847,35 +1813,29 @@ func executeAgentReportGraphNode(
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
 	result agentBlueprintNodeResult,
-	planOnly ...bool,
 ) agentBlueprintNodeResult {
 	if len(upstream) == 0 {
 		result.Status = "failed"
-		result.Message = "生成日报节点没有收到上游真实输出。"
+		result.Message = "生成文件节点没有收到上游输出。"
 		result.Error = "upstream data is required"
 		result.Output = map[string]interface{}{"error": result.Error}
-		return result
-	}
-	if len(planOnly) > 0 && planOnly[0] {
-		result.Message = "日报模板已解析，数据采集计划已传递给处理数据节点。"
-		result.Output = buildAgentReportPlan(node, upstream)
 		return result
 	}
 	content := buildAgentGraphReportContent(node, upstream)
 	files := agentGraphReportFiles(node, content, upstream)
 	writeResult, err := writeAgentReportFiles(store.DataDir(), AgentReportWriteRequest{
-		Title:           firstNonEmpty(node.Data.Title, "生成日报"),
+		Title:           firstNonEmpty(node.Data.Title, "生成文件"),
 		OutputDirectory: firstNonEmpty(node.Data.Settings["输出目录"], "data/output/reports"),
 		Files:           files,
 	})
 	if err != nil {
 		result.Status = "failed"
-		result.Message = "日报文件写入失败。"
+		result.Message = "结果文件写入失败。"
 		result.Error = err.Error()
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	result.Message = "日报文件已按生成日报节点配置写入。"
+	result.Message = "结果文件已按节点配置写入。"
 	result.ArchivePath = writeResult.OutputDirectory
 	result.Output = map[string]interface{}{
 		"content":          content,
@@ -1884,38 +1844,6 @@ func executeAgentReportGraphNode(
 	}
 	return result
 }
-
-func agentNodeHasDownstreamReportData(
-	nodeID string,
-	nodes []agentBlueprintGraphNode,
-	edges []agentBlueprintGraphEdge,
-) bool {
-	kindByID := make(map[string]string, len(nodes))
-	componentByID := make(map[string]string, len(nodes))
-	for _, node := range nodes {
-		kindByID[node.ID] = node.Data.Kind
-		componentByID[node.ID] = node.Data.ComponentID
-	}
-	queue := []string{nodeID}
-	seen := map[string]bool{nodeID: true}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		for _, edge := range edges {
-			if edge.Source != current || seen[edge.Target] {
-				continue
-			}
-			if kindByID[edge.Target] == "report_data" || kindByID[edge.Target] == "order_report_data" ||
-				componentByID[edge.Target] == "component.report-data" || componentByID[edge.Target] == "component.order-report-data" {
-				return true
-			}
-			seen[edge.Target] = true
-			queue = append(queue, edge.Target)
-		}
-	}
-	return false
-}
-
 func executeAgentWebpageGraphNode(
 	store *Store,
 	node agentBlueprintGraphNode,
@@ -2155,8 +2083,6 @@ func executeAgentBuiltinCustomComponent(
 		return true, executeAgentLoopGraphNode(node, upstream, result)
 	case "component.loop_collect":
 		return true, executeAgentLoopCollectGraphNode(node, upstream, result)
-	case "component.ticket_grab":
-		return true, executeAgentTicketGrabGraphNode(ctx, store, node, upstream, result)
 	case "component.filter":
 		return true, executeAgentFilterGraphNode(node, upstream, result)
 	case "component.merge":
@@ -2167,8 +2093,6 @@ func executeAgentBuiltinCustomComponent(
 		return true, executeAgentDatabaseGraphNode(ctx, store, node, result)
 	case "component.file":
 		return true, executeAgentFileGraphNode(store, node, upstream, result)
-	case "component.order-report-data":
-		return true, executeAgentOrderReportDataGraphNode(ctx, store, node, upstream, result)
 	default:
 		_ = ctx
 		_ = bp
@@ -3870,7 +3794,7 @@ func escapeAgentHTML(value string) string {
 
 func buildAgentGraphReportContent(node agentBlueprintGraphNode, upstream map[string]interface{}) string {
 	return strings.Join([]string{
-		"# " + firstNonEmpty(node.Data.Title, "日报"),
+		"# " + firstNonEmpty(node.Data.Title, "处理结果"),
 		"",
 		"## 节点描述",
 		firstNonEmpty(node.Data.Description, "未填写描述。"),
@@ -3903,7 +3827,7 @@ func agentGraphReportFiles(
 		for _, binding := range templateBindings {
 			label := agentReportLabelForTemplatePath(binding.Path)
 			if label == "" {
-				label = firstNonEmpty(node.Data.Settings["输出格式"], "Markdown 日报")
+				label = firstNonEmpty(node.Data.Settings["输出格式"], "Markdown 文档")
 			}
 			files = append(files, AgentReportOutputFile{
 				Label:                label,
@@ -3919,7 +3843,7 @@ func agentGraphReportFiles(
 
 	formats := splitAgentOutputFormats(node.Data.Settings["输出格式"])
 	if len(formats) == 0 {
-		formats = []string{"Markdown 日报"}
+		formats = []string{"Markdown 文档"}
 	}
 	files := make([]AgentReportOutputFile, 0, len(formats))
 	for _, format := range formats {
@@ -3986,7 +3910,7 @@ func agentReportLabelForTemplatePath(pathValue string) string {
 	case ".csv":
 		return "CSV 表格"
 	case ".md", ".markdown":
-		return "Markdown 日报"
+		return "Markdown 文档"
 	case ".doc", ".docx":
 		return "Word 文档"
 	case ".pdf":
@@ -4345,7 +4269,7 @@ var builtinAgentSkillOrder = []string{
 var builtinAgentSkillAppliesTo = map[string][]string{
 	"skill.web-research":       {"browser", "request", "webpage", "report", "custom"},
 	"skill.file-document":      {"transform", "report", "webpage", "custom"},
-	"skill.browser-automation": {"browser", "report_data", "order_report_data", "custom"},
+	"skill.browser-automation": {"browser", "custom"},
 	"skill.code-interpreter":   {"transform", "image", "report", "custom"},
 	"skill.api-function":       {"request", "notify", "custom"},
 	"skill.rag-file-search":    {"browser", "request", "transform", "report", "custom"},

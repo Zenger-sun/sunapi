@@ -25,8 +25,8 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.start", "开始", "手动启动一次蓝图任务。", "start", "trigger", "system.runner", "skill.mcp-workflow", []string{}, []string{"执行信号"}, map[string]string{"触发方式": "手动", "运行模式": "单次执行"}, []string{"trigger"}),
 	builtinComponent("component.schedule", "定时", "按固定时间自动触发任务。", "schedule", "trigger", "system.scheduler", "skill.mcp-workflow", []string{}, []string{"定时信号"}, map[string]string{"执行频率": "每天", "执行时间": "08:30", "时区": "Asia/Shanghai"}, []string{"trigger", "schedule"}),
 	builtinComponent("component.stop", "停止", "用于中断流程、循环控制或标记流程结束。", "stop", "control", "system.runner", "skill.mcp-workflow", []string{"执行结果"}, []string{"结束状态"}, map[string]string{"结束方式": "本轮完成后停止"}, []string{"control"}),
-	builtinComponent("component.browser", "打开浏览器", "使用持久化浏览器会话访问登录态页面；首次登录后，定时任务会复用 Cookie，无需每天重新登录。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "登录要求"}, []string{"浏览器会话", "登录状态"}, map[string]string{"网址": "https://www.goofish.com/", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "默认", "登录等待": "120s", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "session", "data"}),
-	builtinComponent("component.request", "网页请求", "发起 HTTP 请求，获取接口或页面的结构化原始数据。", "request", "collect", "gpt-4.1-mini", "skill.api-function", []string{"任务描述"}, []string{"JSON 数据", "请求日志"}, map[string]string{"网址": "https://example.com/api", "方法": "GET", "超时": "30s", "重试": "1 次"}, []string{"http", "api"}),
+	builtinComponent("component.browser", "打开浏览器", "打开指定网页并采集页面内容；需要登录时可复用已保存的浏览器会话。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "登录要求"}, []string{"浏览器会话", "登录状态"}, map[string]string{"网址": "", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "默认", "登录等待": "120s", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "session", "data"}),
+	builtinComponent("component.request", "API / 网页请求", "发起 HTTP 请求，获取接口或页面的结构化原始数据。", "request", "collect", "gpt-4.1-mini", "skill.api-function", []string{"任务描述"}, []string{"JSON 数据", "请求日志"}, map[string]string{"网址": "", "方法": "GET", "超时": "30s", "重试": "1 次"}, []string{"http", "api"}),
 	builtinComponent("component.webhook", "Webhook 触发", "接收外部系统回调并把请求体作为蓝图输入。", "custom", "trigger", "system.runner", "skill.api-function", []string{"Webhook 请求"}, []string{"请求体", "请求头"}, map[string]string{"路径": "/api/agent-webhooks/{blueprint_id}", "方法": "POST", "鉴权": "可选密钥", "密钥": ""}, []string{"webhook", "trigger"}),
 	builtinComponent("component.branch", "条件分支", "根据上游数据和条件表达式输出是/否分支结果。", "custom", "control", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "条件"}, []string{"分支结果", "命中数据"}, map[string]string{"条件": "status=ok", "真分支": "通过", "假分支": "未通过"}, []string{"branch", "condition", "control"}),
 	builtinComponent("component.switch", "多路判断", "按字段值选择多个命名分支，并在没有匹配时走默认分支。", "custom", "control", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "判断字段"}, []string{"选中分支", "判断值"}, map[string]string{"判断字段": "status", "分支配置": "ok=正常\nerror=异常", "默认分支": "其他"}, []string{"switch", "condition", "control"}),
@@ -42,11 +42,8 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.database", "数据库查询", "对 SQLite 数据库执行只读 SQL 查询并输出结构化结果。", "custom", "collect", "gpt-4.1-mini", "skill.database-sql", []string{"SQL"}, []string{"查询结果", "查询日志"}, map[string]string{"数据库": "当前 SunAPI 数据库", "SQL": "select name from sqlite_master where type='table' order by name", "限制": "100"}, []string{"database", "sql", "data"}),
 	builtinComponent("component.file", "读写文件", "读取或生成 Excel、CSV、Markdown、HTML、TXT 等文件。", "custom", "process", "gpt-4.1-mini", "skill.file-document", []string{"文件路径", "文件内容"}, []string{"文件内容", "保存路径"}, map[string]string{"模式": "读取", "格式": "自动识别"}, []string{"file", "document"}),
 	builtinComponent("component.image", "生成图片", "根据数据和提示词生成封面图、趋势图或运营图片。", "image", "process", "gpt-image-1", "skill.code-interpreter", []string{"提示词", "参考图"}, []string{"图片 URL"}, map[string]string{"尺寸": "16:9", "风格": "清爽数据看板", "数量": "1"}, []string{"image"}),
-	builtinComponent("component.report", "生成报告", "按上游数据、当前描述和模板生成结构化报告文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 日报", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 日报、CSV 表格"}, []string{"report", "document"}),
-	builtinComponent("component.report-data", "日报数据管线", "读取日报模板计划，复用已登录浏览器重新采集商品数据、计算排行并输出日报文件。", "report_data", "template", "gpt-4.1", "skill.browser-automation", []string{"日报模板计划", "浏览器会话"}, []string{"商品明细", "商品排行", "日报文件"}, map[string]string{"采集周期": "近1天", "页面等待": "4s", "最大页数": "10"}, []string{"browser", "data", "report"}),
-	builtinComponent("component.order-report-data", "订单数据管线", "读取订单报告模板计划，复用已登录浏览器分页采集订单、按日期和状态筛选去重，并输出订单报告文件。", "order_report_data", "template", "gpt-4.1", "skill.browser-automation", []string{"订单报告模板计划", "浏览器会话"}, []string{"订单明细", "状态与金额汇总", "订单报告文件"}, map[string]string{"开始日期": "", "结束日期": "", "订单状态": "全部", "页面等待": "4s", "最大页数": "20", "去重字段": "订单编号"}, []string{"browser", "order", "data", "report"}),
-	builtinComponent("component.ticket_grab", "智能抢票", "复用已登录浏览器智能轮询票源；命中后可进入确认页，但提交订单和支付必须人工完成。", "custom", "template", "system.runner", "skill.browser-automation", []string{"浏览器会话", "抢票条件"}, []string{"抢票结果", "确认状态"}, map[string]string{"抢票页面": "", "会话名称": "默认", "场次/票档关键词": "", "有票关键词": "立即购买,立即预订,马上抢,选座购买,有票", "无票关键词": "售罄,无票,缺票,暂时无票,已结束", "购票按钮": "立即购买,立即预订,马上抢,选座购买,去购票", "轮询间隔": "5s", "最大轮询": "96", "最长运行": "8m", "找到后动作": "进入确认页后停止", "订单提交": "必须人工确认"}, []string{"ticket", "browser", "automation", "template"}),
-	builtinComponent("component.webpage", "输出网页", "将报告数据渲染成可交互网页，支持自定义模板。", "webpage", "output", "gpt-4.1", "skill.file-document", []string{"Markdown 日报", "CSV 表格"}, []string{"网页 URL", "数据文件"}, map[string]string{"输出目录": "data/output/web-reports", "输出模式": "输出网页 + 数据"}, []string{"html", "report"}),
+	builtinComponent("component.report", "生成报告", "按上游数据、当前描述和模板生成结构化报告文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 文档", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 文档、CSV 表格"}, []string{"report", "document"}),
+	builtinComponent("component.webpage", "输出网页", "将结果数据渲染成可访问网页，支持自定义模板。", "webpage", "output", "gpt-4.1", "skill.file-document", []string{"Markdown 文档", "CSV 表格"}, []string{"网页 URL", "数据文件"}, map[string]string{"输出目录": "data/output/web-reports", "输出模式": "输出网页 + 数据"}, []string{"html", "report"}),
 	builtinComponent("component.notify", "发送通知", "将任务结果发送到邮件、飞书、企业微信、Slack 或 Webhook。", "notify", "output", "gpt-4.1-mini", "skill.api-function", []string{"消息内容", "通知目标"}, []string{"发送结果"}, map[string]string{"渠道": "Webhook", "通知目标": "", "Webhook": "", "确认": "发送前确认", "超时": "30s"}, []string{"notification", "webhook"}),
 }
 
@@ -143,16 +140,14 @@ func normalizeComponentGroup(value string) string {
 		return "trigger"
 	case "采集", "collect", "collection", "source":
 		return "collect"
-	case "处理", "智能处理", "process", "processor", "transform":
+	case "处理", "智能处理", "process", "processor", "transform", "default":
 		return "process"
 	case "控制", "控制流", "control", "flow", "workflow":
 		return "control"
-	case "模板", "业务模板", "template", "recipe":
-		return "template"
 	case "输出", "output", "sink":
 		return "output"
 	default:
-		return strings.ToLower(strings.TrimSpace(value))
+		return ""
 	}
 }
 
@@ -163,7 +158,7 @@ func inferComponentTags(description string) []string {
 		"定时": "schedule", "webhook": "webhook", "浏览器": "browser", "网页": "web",
 		"http": "api", "api": "api", "接口": "api", "过滤": "filter", "条件": "filter",
 		"合并": "merge", "代码": "code", "脚本": "code", "文件": "file", "excel": "spreadsheet",
-		"csv": "spreadsheet", "图片": "image", "报告": "report", "日报": "report",
+		"csv": "spreadsheet", "图片": "image", "报告": "report",
 		"通知": "notification", "数据库": "database", "sql": "database",
 		"流程": "workflow", "分支": "workflow", "循环": "workflow", "等待": "workflow",
 		"变量": "state", "多路": "workflow",

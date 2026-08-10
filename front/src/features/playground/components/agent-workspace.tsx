@@ -76,7 +76,6 @@ import {
   SparklesIcon,
   StopCircleIcon,
   Table2Icon,
-  TicketCheckIcon,
   Trash2Icon,
   Undo2Icon,
   UploadIcon,
@@ -90,7 +89,11 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Dialog,
   DialogContent,
@@ -124,7 +127,14 @@ import {
   runBlueprint,
   updateBlueprint,
 } from '@/features/agents/api'
-import type { AgentExecutionLog, Blueprint } from '@/features/agents/types'
+import {
+  ArchiveType,
+  FrequencyType,
+  TriggerType,
+  type AgentExecutionLog,
+  type Blueprint,
+  type TriggerConfig,
+} from '@/features/agents/types'
 import {
   createAgentComponent,
   createAgentSkill,
@@ -164,8 +174,6 @@ type AgentNodeKind =
   | 'transform'
   | 'image'
   | 'report'
-  | 'report_data'
-  | 'order_report_data'
   | 'webpage'
   | 'notify'
   | 'stop'
@@ -345,13 +353,24 @@ type TemplateBinding = {
   hash?: string
 }
 
-type AgentPaletteGroup =
-  | '触发'
-  | '控制流'
-  | '采集'
-  | '智能处理'
-  | '输出'
-  | '业务模板'
+type AgentPaletteGroup = '触发' | '采集' | '处理' | '落档' | '结束'
+
+type WorkflowValidationIssue = {
+  message: string
+  nodeId?: string
+}
+
+type WorkflowStageState = {
+  label: AgentPaletteGroup
+  present: boolean
+  complete: boolean
+}
+
+type WorkflowReadiness = {
+  ready: boolean
+  issues: WorkflowValidationIssue[]
+  stages: WorkflowStageState[]
+}
 
 type NodeTemplate = {
   kind: AgentNodeKind
@@ -475,7 +494,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser', 'report_data', 'order_report_data', 'custom'],
+    appliesTo: ['browser', 'custom'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -620,8 +639,6 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   transform: 'skill.code-interpreter',
   image: 'skill.code-interpreter',
   report: 'skill.file-document',
-  report_data: 'skill.browser-automation',
-  order_report_data: 'skill.browser-automation',
   webpage: 'skill.file-document',
   notify: 'skill.api-function',
   stop: 'skill.mcp-workflow',
@@ -638,19 +655,6 @@ const TIMEZONE_OPTIONS = [
   'Europe/London',
   'Europe/Berlin',
 ]
-const ORDER_STATUS_OPTIONS = [
-  '待付款',
-  '待发货',
-  '发货即将超时',
-  '发货已超时',
-  '已发货',
-  '售后中',
-  '交易成功',
-  '交易关闭',
-  '已取消',
-  '退款中',
-  '退款成功',
-]
 const REPORT_OUTPUT_FORMAT_SETTING = '输出格式'
 const REPORT_OUTPUT_PATH_LABEL = '归档路径'
 const BROWSER_PAGE_DATA_SETTING = '页面数据'
@@ -666,9 +670,9 @@ const IMAGE_TASK_STATUS_SETTING = '图片任务状态'
 const IMAGE_TASK_URLS_SETTING = '图片 URL'
 const IMAGE_TASK_ERROR_SETTING = '图片错误'
 const IMAGE_TASK_PROMPT_SETTING = '图片任务提示词'
-const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 日报', 'CSV 表格']
+const DEFAULT_REPORT_OUTPUT_FORMATS = ['Markdown 文档', 'CSV 表格']
 const REPORT_OUTPUT_FORMAT_PRESETS = [
-  'Markdown 日报',
+  'Markdown 文档',
   'CSV 表格',
   'Excel 表格',
   'Word 文档',
@@ -688,13 +692,9 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   重试: ['0 次', '1 次', '2 次', '3 次'],
   数据类型: [
     '自动识别',
-    '商品运营数据',
-    '交易/订单数据',
-    '用户行为数据',
-    '日志/事件数据',
-    '财务/对账数据',
     '通用表格/CSV',
     'JSON 对象/数组',
+    '日志/事件数据',
     '纯文本',
   ],
   输出格式: [
@@ -715,25 +715,15 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   去重规则: ['按 ID', '按链接', '按标题 + 日期', '不去重'],
   缺失处理: ['保留空值并标注', '填充 0', '跳过该行', '请求人工确认'],
   尺寸: ['16:9', '1:1', '4:3', '9:16'],
-  风格: ['清爽数据看板', '运营日报封面', '极简图表', '品牌营销图'],
+  风格: ['清爽数据看板', '极简图表', '文档配图', '写实图片'],
   数量: ['1', '2', '3', '4'],
   格式: ['Markdown + CSV', 'Markdown', 'PDF', 'Markdown + 图片'],
-  语气: ['运营复盘', '简洁客观', '专业分析', '行动建议'],
+  语气: ['简洁客观', '专业分析', '自然说明', '行动建议'],
   渠道: ['邮件', '企业微信', '钉钉', '飞书', 'Slack', 'Webhook'],
   确认: ['发送前确认', '自动发送', '失败时确认'],
   结束方式: ['本轮完成后停止', '达到次数后停止', '手动停止', '出错停止'],
-  日报模板: ['默认模板', '简洁版', '详细分析版', '自定义模板'],
   输出模式: ['输出网页 + 数据', '仅输出数据'],
-  采集周期: ['近1天', '近7天', '近30天'],
-  页面等待: ['2s', '4s', '6s', '10s'],
-  最大页数: ['5', '10', '20', '50'],
-  去重字段: ['订单编号'],
-  轮询间隔: ['3s', '5s', '10s', '15s', '30s'],
-  最大轮询: ['24', '48', '96', '180', '360'],
-  最长运行: ['2m', '5m', '8m', '15m', '30m'],
-  找到后动作: ['进入确认页后停止', '仅提醒并停止'],
-  订单提交: ['必须人工确认'],
-  组件来源: ['系统内置', '自定义'],
+  步骤来源: ['系统内置', '自定义'],
   执行策略: ['按描述执行', '结构化处理', '只读采集', '写入前确认'],
   模式: ['读取', '写入', '追加', '转换'],
   鉴权: ['无', '签名校验', 'Token', 'Basic Auth'],
@@ -793,12 +783,11 @@ const NODE_META: Record<
     role: 'browser',
     icon: GlobeIcon,
     accent: 'bg-blue-500/12 text-blue-700 dark:text-blue-300',
-    description:
-      '使用持久化浏览器会话访问登录态页面。首次登录后，定时任务会复用 Cookie。',
+    description: '打开网页并采集页面内容；需要登录时可复用已保存的浏览器会话。',
     inputs: ['网址', '登录要求'],
     outputs: ['浏览器会话', '登录状态'],
     settings: {
-      网址: 'https://www.goofish.com/',
+      网址: '',
       登录态: '持久化登录会话（首次登录后复用）',
       会话名称: '默认',
       登录等待: '120s',
@@ -807,7 +796,7 @@ const NODE_META: Record<
     },
   },
   request: {
-    label: '网页请求',
+    label: 'API / 网页请求',
     group: '采集',
     role: 'fast',
     icon: NetworkIcon,
@@ -817,7 +806,7 @@ const NODE_META: Record<
     inputs: ['任务描述'],
     outputs: ['JSON 数据', '请求日志'],
     settings: {
-      网址: 'https://api.example.com/data',
+      网址: '',
       请求参数: '',
       方法: 'GET',
       超时: '30s',
@@ -826,7 +815,7 @@ const NODE_META: Record<
   },
   transform: {
     label: '整理数据',
-    group: '智能处理',
+    group: '处理',
     role: 'reasoning',
     icon: Table2Icon,
     accent: 'bg-violet-500/12 text-violet-700 dark:text-violet-300',
@@ -848,7 +837,7 @@ const NODE_META: Record<
   },
   image: {
     label: '生成图片',
-    group: '智能处理',
+    group: '处理',
     role: 'image',
     icon: ImageIcon,
     accent: 'bg-fuchsia-500/12 text-fuchsia-700 dark:text-fuchsia-300',
@@ -864,12 +853,11 @@ const NODE_META: Record<
   },
   report: {
     label: '生成报告',
-    group: '输出',
+    group: '落档',
     role: 'reasoning',
     icon: FileTextIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
-    description:
-      '把表格、结论和图片整理成报告文档；格式、语气、标题等要求写在任务描述里。',
+    description: '把处理结果保存为文档或结构化文件，供后续查看和复用。',
     inputs: ['标准表格', '关键结论', '图片 URL'],
     outputs: [...DEFAULT_REPORT_OUTPUT_FORMATS, REPORT_OUTPUT_PATH_LABEL],
     settings: {
@@ -880,49 +868,14 @@ const NODE_META: Record<
       输出目录: 'data/output/reports',
     },
   },
-  report_data: {
-    label: '日报数据管线',
-    group: '业务模板',
-    role: 'reasoning',
-    icon: Table2Icon,
-    accent: 'bg-indigo-500/12 text-indigo-700 dark:text-indigo-300',
-    description:
-      '读取日报模板计划，复用已登录浏览器重新采集商品数据、计算排行并输出日报。',
-    inputs: ['日报模板计划', '浏览器会话'],
-    outputs: ['商品明细', '商品排行', '日报文件'],
-    settings: {
-      采集周期: '近1天',
-      页面等待: '4s',
-      最大页数: '10',
-    },
-  },
-  order_report_data: {
-    label: '订单数据管线',
-    group: '业务模板',
-    role: 'reasoning',
-    icon: FileSpreadsheetIcon,
-    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
-    description:
-      '读取报告模板计划，复用已登录浏览器分页采集订单，按日期和状态筛选、去重汇总并输出报告。',
-    inputs: ['订单报告模板计划', '浏览器会话'],
-    outputs: ['订单明细', '状态与金额汇总', '订单报告文件'],
-    settings: {
-      开始日期: '',
-      结束日期: '',
-      订单状态: '全部',
-      页面等待: '4s',
-      最大页数: '20',
-      去重字段: '订单编号',
-    },
-  },
   notify: {
     label: '发送通知',
-    group: '输出',
+    group: '落档',
     role: 'fast',
     icon: BellIcon,
     accent: 'bg-rose-500/12 text-rose-700 dark:text-rose-300',
-    description: '将日报发送到指定渠道，或提醒人工确认。',
-    inputs: ['日报文档', '通知目标'],
+    description: '将结果发送到指定渠道，或提醒相关人员进行确认。',
+    inputs: ['处理结果', '通知目标'],
     outputs: ['发送结果'],
     settings: {
       渠道: 'Webhook',
@@ -932,28 +885,27 @@ const NODE_META: Record<
     },
   },
   custom: {
-    label: '自定义组件',
-    group: '智能处理',
+    label: '自定义步骤',
+    group: '处理',
     role: 'fast',
     icon: WrenchIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
-    description: '根据自定义组件模板执行独立功能模块。',
+    description: '用任务描述、输入和输出定义一个可复用的通用步骤。',
     inputs: ['上游数据'],
     outputs: ['执行结果'],
     settings: {
-      组件来源: '自定义',
+      步骤来源: '自定义',
       执行策略: '按描述执行',
     },
   },
   webpage: {
     label: '输出网页',
-    group: '输出',
+    group: '落档',
     role: 'reasoning',
     icon: MonitorIcon,
     accent: 'bg-teal-500/12 text-teal-700 dark:text-teal-300',
-    description:
-      '将日报数据渲染成可交互的网页，支持自定义模板，后续只更新数据无需重新生成网页。',
-    inputs: ['Markdown 日报', 'CSV 表格'],
+    description: '将处理结果渲染为可访问的网页，可绑定已有网页模板。',
+    inputs: ['Markdown 文档', 'CSV 表格'],
     outputs: ['网页 URL', '数据文件'],
     settings: {
       输出目录: 'data/output/web-reports',
@@ -964,12 +916,12 @@ const NODE_META: Record<
     },
   },
   stop: {
-    label: '停止',
-    group: '控制流',
+    label: '结束',
+    group: '结束',
     role: 'system',
     icon: StopCircleIcon,
     accent: 'bg-slate-500/12 text-slate-700 dark:text-slate-300',
-    description: '可选控制节点，用于循环任务、中断流程或标记流程结束。',
+    description: '记录本轮任务的完成状态并结束流程。',
     inputs: ['执行结果'],
     outputs: ['结束状态'],
     settings: {
@@ -995,67 +947,61 @@ const COMPONENT_VISUAL_META: Record<
   },
   'component.branch': {
     label: '条件分支',
-    group: '控制流',
+    group: '处理',
     icon: ChartNetworkIcon,
     accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
   },
   'component.switch': {
     label: '多路判断',
-    group: '控制流',
+    group: '处理',
     icon: MergeIcon,
     accent: 'bg-sky-500/12 text-sky-700 dark:text-sky-300',
   },
   'component.set_variable': {
     label: '设置变量',
-    group: '控制流',
+    group: '处理',
     icon: CpuIcon,
     accent: 'bg-violet-500/12 text-violet-700 dark:text-violet-300',
   },
   'component.subflow': {
     label: '调用子蓝图',
-    group: '控制流',
+    group: '处理',
     icon: ChartNetworkIcon,
     accent: 'bg-pink-500/12 text-pink-700 dark:text-pink-300',
   },
   'component.wait': {
     label: '等待延迟',
-    group: '控制流',
+    group: '处理',
     icon: ClockIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
   },
   'component.loop': {
     label: '列表循环',
-    group: '控制流',
+    group: '处理',
     icon: RotateCcwIcon,
     accent: 'bg-indigo-500/12 text-indigo-700 dark:text-indigo-300',
   },
   'component.loop_collect': {
     label: '汇总循环',
-    group: '控制流',
+    group: '处理',
     icon: RotateCcwIcon,
     accent: 'bg-purple-500/12 text-purple-700 dark:text-purple-300',
   },
-  'component.ticket_grab': {
-    label: '智能抢票',
-    group: '业务模板',
-    icon: TicketCheckIcon,
-    accent: 'bg-red-500/12 text-red-700 dark:text-red-300',
-  },
   'component.filter': {
     label: '条件过滤',
-    group: '智能处理',
+    group: '处理',
     icon: FilterIcon,
     accent: 'bg-lime-500/12 text-lime-700 dark:text-lime-300',
   },
   'component.merge': {
     label: '合并数据',
-    group: '智能处理',
+    group: '处理',
     icon: MergeIcon,
     accent: 'bg-blue-500/12 text-blue-700 dark:text-blue-300',
   },
   'component.dedupe_sort': {
     label: '去重排序',
-    group: '智能处理',
+    group: '处理',
     icon: Table2Icon,
     accent: 'bg-teal-500/12 text-teal-700 dark:text-teal-300',
   },
@@ -1067,15 +1013,9 @@ const COMPONENT_VISUAL_META: Record<
   },
   'component.file': {
     label: '读写文件',
-    group: '智能处理',
+    group: '处理',
     icon: FileSpreadsheetIcon,
     accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
-  },
-  'component.order-report-data': {
-    label: '订单数据管线',
-    group: '业务模板',
-    icon: FileSpreadsheetIcon,
-    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
   },
 }
 
@@ -1090,12 +1030,149 @@ const PALETTE_GROUPS: Array<{
   kinds: AgentNodeKind[]
 }> = [
   { title: '触发', kinds: ['start', 'schedule'] },
-  { title: '控制流', kinds: ['stop'] },
   { title: '采集', kinds: ['browser', 'request'] },
-  { title: '智能处理', kinds: ['transform', 'image'] },
-  { title: '输出', kinds: ['report', 'webpage', 'notify'] },
-  { title: '业务模板', kinds: ['report_data', 'order_report_data'] },
+  { title: '处理', kinds: ['transform', 'image'] },
+  { title: '落档', kinds: ['report', 'webpage', 'notify'] },
+  { title: '结束', kinds: ['stop'] },
 ]
+
+const WORKFLOW_STAGE_ORDER: AgentPaletteGroup[] = [
+  '触发',
+  '采集',
+  '处理',
+  '落档',
+  '结束',
+]
+
+function validateWorkflowStructure(
+  nodes: AgentFlowNode[],
+  edges: AgentFlowEdge[]
+): WorkflowReadiness {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const stageByNodeId = new Map(
+    nodes.map((node) => [
+      node.id,
+      getAgentNodeVisualMeta(node.data.kind, node.data.componentId).group,
+    ])
+  )
+  const validEdges = edges.filter(
+    (edge) => nodeById.has(edge.source) && nodeById.has(edge.target)
+  )
+  const outgoing = new Map<string, string[]>()
+  const incoming = new Map<string, string[]>()
+
+  for (const edge of validEdges) {
+    outgoing.set(edge.source, [
+      ...(outgoing.get(edge.source) ?? []),
+      edge.target,
+    ])
+    incoming.set(edge.target, [
+      ...(incoming.get(edge.target) ?? []),
+      edge.source,
+    ])
+  }
+
+  const walk = (starts: string[], graph: Map<string, string[]>) => {
+    const visited = new Set<string>()
+    const queue = [...starts]
+    while (queue.length > 0) {
+      const nodeId = queue.shift()
+      if (!nodeId || visited.has(nodeId)) continue
+      visited.add(nodeId)
+      queue.push(...(graph.get(nodeId) ?? []))
+    }
+    return visited
+  }
+
+  const triggerIds = nodes
+    .filter((node) => stageByNodeId.get(node.id) === '触发')
+    .map((node) => node.id)
+  const endIds = nodes
+    .filter((node) => stageByNodeId.get(node.id) === '结束')
+    .map((node) => node.id)
+  const reachableFromTrigger = walk(triggerIds, outgoing)
+  const canReachEnd = walk(endIds, incoming)
+  const issues: WorkflowValidationIssue[] = []
+
+  for (const stage of WORKFLOW_STAGE_ORDER) {
+    if (!nodes.some((node) => stageByNodeId.get(node.id) === stage)) {
+      issues.push({ message: `请添加“${stage}”阶段的步骤。` })
+    }
+  }
+
+  if (validEdges.length !== edges.length) {
+    issues.push({ message: '存在指向已删除步骤的连线，请重新连接流程。' })
+  }
+
+  if (triggerIds.length > 0) {
+    for (const node of nodes) {
+      if (!reachableFromTrigger.has(node.id)) {
+        issues.push({
+          nodeId: node.id,
+          message: `“${node.data.title}”没有接入触发路径。`,
+        })
+      }
+    }
+  }
+
+  if (endIds.length > 0) {
+    for (const node of nodes) {
+      if (!canReachEnd.has(node.id)) {
+        issues.push({
+          nodeId: node.id,
+          message: `“${node.data.title}”还没有连接到结束步骤。`,
+        })
+      }
+    }
+  }
+
+  for (const node of nodes) {
+    if (
+      (node.data.kind === 'browser' || node.data.kind === 'request') &&
+      !node.data.settings['网址']?.trim()
+    ) {
+      issues.push({
+        nodeId: node.id,
+        message: `请为“${node.data.title}”填写网址。`,
+      })
+    }
+    if (
+      node.data.kind === 'notify' &&
+      !node.data.settings['通知目标']?.trim() &&
+      !node.data.settings['Webhook']?.trim()
+    ) {
+      issues.push({
+        nodeId: node.id,
+        message: `请为“${node.data.title}”填写通知目标。`,
+      })
+    }
+  }
+
+  const nodeIdsWithIssues = new Set(
+    issues.flatMap((issue) => (issue.nodeId ? [issue.nodeId] : []))
+  )
+  const stages = WORKFLOW_STAGE_ORDER.map((label) => {
+    const stageNodes = nodes.filter(
+      (node) => stageByNodeId.get(node.id) === label
+    )
+    return {
+      label,
+      present: stageNodes.length > 0,
+      complete: stageNodes.some(
+        (node) =>
+          reachableFromTrigger.has(node.id) &&
+          canReachEnd.has(node.id) &&
+          !nodeIdsWithIssues.has(node.id)
+      ),
+    }
+  })
+
+  return {
+    ready: issues.length === 0,
+    issues,
+    stages,
+  }
+}
 
 type PaletteTemplateGroup = {
   title: AgentPaletteGroup
@@ -1109,7 +1186,10 @@ type ComponentPaletteSection = {
 }
 
 const INITIAL_EDGES: AgentFlowEdge[] = [
-  { id: 'e-start-stop', source: 'start', target: 'stop' },
+  { id: 'e-start-collect', source: 'start', target: 'collect' },
+  { id: 'e-collect-process', source: 'collect', target: 'process' },
+  { id: 'e-process-archive', source: 'process', target: 'archive' },
+  { id: 'e-archive-stop', source: 'archive', target: 'stop' },
 ]
 
 export function AgentWorkspace({
@@ -1184,7 +1264,7 @@ export function AgentWorkspace({
     AgentExecutionLog[]
   >([])
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
-    initialBlueprint?.nodes[0]?.id ?? 'browser'
+    initialBlueprint?.nodes[0]?.id ?? 'collect'
   )
   const [search, setSearch] = useState('')
   const addCounterRef = useRef(0)
@@ -1275,9 +1355,15 @@ export function AgentWorkspace({
     bumpHistoryVersion()
   }, [bumpHistoryVersion, createHistorySnapshot])
   const refreshBackendExecutionLogs = useCallback(
-    async (agentId: string, blueprintId: string) => {
+    async (
+      agentId: string,
+      blueprintId: string,
+      shouldApply: () => boolean = () => true
+    ) => {
       const logs = await listBlueprintExecutionLogs(agentId, blueprintId, 5)
-      setBackendExecutionLogs(logs)
+      if (shouldApply()) {
+        setBackendExecutionLogs(logs)
+      }
       return logs
     },
     []
@@ -1288,7 +1374,7 @@ export function AgentWorkspace({
       let logs: AgentExecutionLog[] = []
 
       while (isActive() && Date.now() < deadline) {
-        logs = await refreshBackendExecutionLogs(agentId, blueprintId)
+        logs = await refreshBackendExecutionLogs(agentId, blueprintId, isActive)
         const latest = logs[0]
         if (
           latest &&
@@ -1374,7 +1460,36 @@ export function AgentWorkspace({
         activeNodes,
         activeEdges
       )
-      if (!preview) return
+      if (!preview) {
+        const activeNodeIds = new Set(activeNodes.map((node) => node.id))
+        const fallbackExecutionLog: AgentExecutionLogMap = {}
+        setExecutionLog(fallbackExecutionLog)
+        setNodes((current) => {
+          const nextNodes = current.map((node) =>
+            activeNodeIds.has(node.id) && node.data.status === 'running'
+              ? {
+                  ...node,
+                  data: {
+                    ...node.data,
+                    status: 'waiting' as AgentNodeStatus,
+                  },
+                }
+              : node
+          )
+          persistCurrentBlueprintSnapshot(
+            stripTransientNodeSettings(nextNodes),
+            fallbackExecutionLog,
+            statusOverride ??
+              backendBlueprintStatus(
+                log.status,
+                new Map<string, AgentNodeStatus>()
+              ),
+            snapshotEdges
+          )
+          return nextNodes
+        })
+        return
+      }
 
       setExecutionLog(preview.executionLog)
       setNodes((current) => {
@@ -1454,7 +1569,7 @@ export function AgentWorkspace({
   const onConnect = useCallback(
     (connection: Connection) => {
       if (!isAgentConnectionValid(nodes, edges, connection)) {
-        toast.error('不能形成循环连线，请使用列表循环组件。')
+        toast.error('不能形成循环连线，请使用列表循环步骤。')
         return
       }
       recordHistorySnapshot()
@@ -1539,6 +1654,7 @@ export function AgentWorkspace({
     setNodes([])
     setEdges([])
     setExecutionLog({})
+    setBackendExecutionLogs([])
     setSelectedNodeId('')
   }, [cancelPreviewRun, recordHistorySnapshot])
 
@@ -1553,10 +1669,21 @@ export function AgentWorkspace({
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
     setExecutionLog({})
-    setSelectedNodeId('start')
+    setBackendExecutionLogs([])
+    setSelectedNodeId('collect')
   }, [bumpHistoryVersion, cancelPreviewRun, templates])
 
   const handleSaveBlueprint = useCallback(async () => {
+    const readiness = validateWorkflowStructure(nodes, edges)
+    if (!readiness.ready) {
+      const issue = readiness.issues[0]
+      if (issue?.nodeId) setSelectedNodeId(issue.nodeId)
+      toast.error('流程尚未闭环', {
+        description: issue?.message ?? '请补全五个阶段后再保存。',
+      })
+      return
+    }
+
     try {
       await validateAgentNodeModels(nodes)
     } catch (error) {
@@ -1652,9 +1779,11 @@ export function AgentWorkspace({
       setExecutionLog(blueprint.executionLog ?? {})
       setBackendExecutionLogs([])
       if (blueprint.backendAgentId && blueprint.backendBlueprintId) {
+        const requestId = previewRunIdRef.current
         void refreshBackendExecutionLogs(
           blueprint.backendAgentId,
-          blueprint.backendBlueprintId
+          blueprint.backendBlueprintId,
+          () => previewRunIdRef.current === requestId
         ).catch(() => undefined)
       }
       setSelectedNodeId(normalizedNodes[0]?.id ?? '')
@@ -1809,7 +1938,7 @@ export function AgentWorkspace({
       setNodes(createInitialNodes(templates))
       setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
       setExecutionLog({})
-      setSelectedNodeId('start')
+      setSelectedNodeId('collect')
     },
     [
       blueprints,
@@ -1823,6 +1952,15 @@ export function AgentWorkspace({
   const handleRunPreview = useCallback(
     (mode: AgentPreviewRunMode = 'default') => {
       const isManualPreview = mode === 'manual'
+      const readiness = validateWorkflowStructure(nodes, edges)
+      if (!readiness.ready) {
+        const issue = readiness.issues[0]
+        if (issue?.nodeId) setSelectedNodeId(issue.nodeId)
+        toast.error('流程还不能运行', {
+          description: issue?.message ?? '请补全五个阶段后再运行。',
+        })
+        return
+      }
       if (
         (isManualPreview || !hasScheduledBlueprint) &&
         !hasManualTriggerNode(nodes)
@@ -1846,7 +1984,12 @@ export function AgentWorkspace({
               setBlueprints((current) => {
                 const next = current.map((item) =>
                   item.id === currentBlueprint.id
-                    ? { ...item, status: backendBlueprint.status ?? 'running' }
+                    ? {
+                        ...item,
+                        status: localBlueprintStatusFromBackend(
+                          backendBlueprint.status
+                        ),
+                      }
                     : item
                 )
                 writeSavedBlueprints(next)
@@ -1878,6 +2021,7 @@ export function AgentWorkspace({
       if (runExecutionNodes.length === 0) return
 
       cancelPreviewRun()
+      setBackendExecutionLogs([])
       const runId = previewRunIdRef.current
       const statusAfterManualPreview: AgentBlueprintStatus | undefined =
         isManualPreview && hasScheduledBlueprint
@@ -2201,7 +2345,7 @@ export function AgentWorkspace({
         ...current.filter((item) => item.id !== component.id),
         component,
       ])
-      toast.success('自定义组件已创建')
+      toast.success('自定义步骤已创建')
     },
     []
   )
@@ -2211,7 +2355,7 @@ export function AgentWorkspace({
     setComponentCatalog((current) =>
       current.filter((component) => component.id !== componentId)
     )
-    toast.success('自定义组件已删除')
+    toast.success('自定义步骤已删除')
   }, [])
 
   const handleAddNode = useCallback(
@@ -2297,12 +2441,12 @@ export function AgentWorkspace({
     setExecutionLog({})
     setNodes(() =>
       createInitialNodes(templates).map((node) =>
-        node.id === 'start'
+        node.id === 'process'
           ? {
               ...node,
               data: {
                 ...node.data,
-                title: '从对话开启任务',
+                title: '处理任务',
                 description: seedPrompt,
               },
             }
@@ -2310,7 +2454,7 @@ export function AgentWorkspace({
       )
     )
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
-    setSelectedNodeId('start')
+    setSelectedNodeId('process')
   }, [seedPrompt, templates])
 
   useEffect(() => {
@@ -2524,6 +2668,10 @@ function BlueprintWorkspace({
   onUndo,
 }: BlueprintWorkspaceProps) {
   const reactFlow = useReactFlow<AgentFlowNode, AgentFlowEdge>()
+  const workflowReadiness = useMemo(
+    () => validateWorkflowStructure(nodes, edges),
+    [edges, nodes]
+  )
   const isValidConnection = useCallback(
     (connection: Connection | AgentFlowEdge) =>
       isAgentConnectionValid(nodes, edges, connection),
@@ -2605,7 +2753,7 @@ function BlueprintWorkspace({
           onDrop={handleDrop}
         >
           <div className='pointer-events-none absolute top-3 right-3 left-3 z-10 flex flex-wrap items-start justify-between gap-2'>
-            <div className='bg-background/88 border-border/70 pointer-events-auto flex min-w-0 items-center gap-2 rounded-[8px] border px-2 py-1.5 shadow-sm backdrop-blur'>
+            <div className='bg-background/88 border-border/70 pointer-events-auto flex max-w-full min-w-0 items-start gap-2 rounded-[8px] border px-2 py-1.5 shadow-sm backdrop-blur'>
               <div className='bg-primary text-primary-foreground flex size-7 shrink-0 items-center justify-center rounded-[6px]'>
                 <ChartNetworkIcon className='size-4' />
               </div>
@@ -2615,14 +2763,31 @@ function BlueprintWorkspace({
                   onChange={(event) => onTitleChange(event.target.value)}
                   className='h-7 min-w-45 rounded-[6px] border-0 bg-transparent px-0 text-sm font-semibold shadow-none focus-visible:ring-0'
                 />
-                <div className='text-muted-foreground truncate text-[11px]'>
-                  {nodes.length} 个组件 · {edges.length} 条连线
-                  {' · '}
-                  {getAgentBlueprintStatusLabel(currentBlueprintStatus)}
-                  {lastSavedAt
-                    ? ` · ${formatBlueprintTime(lastSavedAt)} 已保存`
-                    : ''}
+                <div className='text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11px]'>
+                  <span className='truncate'>
+                    {nodes.length} 个步骤 · {edges.length} 条连线 ·{' '}
+                    {getAgentBlueprintStatusLabel(currentBlueprintStatus)}
+                    {lastSavedAt
+                      ? ` · ${formatBlueprintTime(lastSavedAt)} 已保存`
+                      : ''}
+                  </span>
+                  <span
+                    className={cn(
+                      'shrink-0 font-medium',
+                      workflowReadiness.ready
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-amber-600 dark:text-amber-400'
+                    )}
+                    title={workflowReadiness.issues
+                      .map((issue) => issue.message)
+                      .join('\n')}
+                  >
+                    {workflowReadiness.ready
+                      ? '流程已闭环'
+                      : `待完善 ${workflowReadiness.issues.length} 项`}
+                  </span>
                 </div>
+                <WorkflowStageStrip readiness={workflowReadiness} />
               </div>
             </div>
 
@@ -2792,6 +2957,35 @@ function BlueprintWorkspace({
   )
 }
 
+function WorkflowStageStrip({ readiness }: { readiness: WorkflowReadiness }) {
+  return (
+    <div className='mt-1.5 flex min-w-0 items-center gap-1 overflow-x-auto pb-0.5 whitespace-nowrap'>
+      {readiness.stages.map((stage, index) => (
+        <div key={stage.label} className='flex shrink-0 items-center gap-1'>
+          {index > 0 && (
+            <span className='text-muted-foreground/60 text-[10px]' aria-hidden>
+              →
+            </span>
+          )}
+          <span
+            className={cn(
+              'inline-flex items-center gap-1 rounded-[6px] border px-1.5 py-0.5 text-[10px] font-medium',
+              stage.complete
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                : stage.present
+                  ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                  : 'border-border/70 bg-muted/40 text-muted-foreground'
+            )}
+          >
+            {stage.complete && <CheckCircle2Icon className='size-3' />}
+            {stage.label}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function Palette({
   groupChoices,
   groups,
@@ -2836,7 +3030,7 @@ function Palette({
             <div className='bg-primary text-primary-foreground flex size-7 shrink-0 items-center justify-center rounded-[7px]'>
               <BotIcon className='size-3.5' />
             </div>
-            <span className='text-sm font-semibold'>工具库</span>
+            <span className='text-sm font-semibold'>流程步骤</span>
           </div>
 
           <TabsList className='h-7 w-full gap-0 rounded-none border-0 bg-transparent p-0'>
@@ -2844,13 +3038,13 @@ function Palette({
               value='components'
               className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
             >
-              组件
+              步骤
             </TabsTrigger>
             <TabsTrigger
               value='skills'
               className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
             >
-              Skill
+              高级能力
               <span className='bg-muted text-muted-foreground ml-1 rounded-full px-1.5 py-0 text-[10px] leading-[14px]'>
                 {skillChoices.length}
               </span>
@@ -2870,7 +3064,7 @@ function Palette({
               <Input
                 value={search}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder='搜索组件…'
+                placeholder='搜索步骤…'
                 className='h-7 rounded-[7px] pl-7 text-xs'
               />
             </div>
@@ -2978,11 +3172,11 @@ function ComponentManagerPanel({
 
   const handleSubmit = async () => {
     if (!name.trim()) {
-      toast.error('请输入组件名称')
+      toast.error('请输入步骤名称')
       return
     }
     if (!description.trim()) {
-      toast.error('请输入组件描述')
+      toast.error('请输入步骤要求')
       return
     }
     if (outputPorts.length === 0) {
@@ -3008,7 +3202,7 @@ function ComponentManagerPanel({
       reset()
       setOpen(false)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : '创建组件失败')
+      toast.error(error instanceof Error ? error.message : '创建步骤失败')
     } finally {
       setIsSubmitting(false)
     }
@@ -3023,7 +3217,7 @@ function ComponentManagerPanel({
       >
         <span className='flex min-w-0 items-center gap-2'>
           <WrenchIcon className='text-muted-foreground size-3.5 shrink-0' />
-          <span className='truncate text-[11px] font-medium'>自定义组件</span>
+          <span className='truncate text-[11px] font-medium'>自定义步骤</span>
           {isLoading && (
             <span className='text-muted-foreground text-[10px]'>同步中</span>
           )}
@@ -3037,24 +3231,24 @@ function ComponentManagerPanel({
       {open && (
         <div className='mt-2 flex flex-col gap-2'>
           <div className='bg-muted/30 rounded-[8px] px-2 py-1.5'>
-            <div className='text-[11px] font-semibold'>创建自定义组件</div>
+            <div className='text-[11px] font-semibold'>创建自定义步骤</div>
           </div>
 
           <div className='grid gap-1'>
             <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
-              组件名称
+              步骤名称
             </span>
             <Input
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder='例如：商品指标分析'
+              placeholder='例如：检查异常数据'
               className='h-7 rounded-[6px] text-xs'
             />
           </div>
 
           <div className='grid gap-1'>
             <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
-              组件描述
+              步骤要求
             </span>
             <Textarea
               value={description}
@@ -3096,7 +3290,7 @@ function ComponentManagerPanel({
 
           <div className='grid gap-1'>
             <span className='text-muted-foreground px-0.5 text-[10px] font-medium'>
-              组件分类
+              所属阶段
             </span>
             <NativeSelect
               value={group}
@@ -3104,11 +3298,9 @@ function ComponentManagerPanel({
               className='h-7 rounded-[6px] text-xs'
             >
               <NativeSelectOption value='trigger'>触发</NativeSelectOption>
-              <NativeSelectOption value='control'>控制流</NativeSelectOption>
               <NativeSelectOption value='collect'>采集</NativeSelectOption>
-              <NativeSelectOption value='process'>智能处理</NativeSelectOption>
-              <NativeSelectOption value='output'>输出</NativeSelectOption>
-              <NativeSelectOption value='template'>业务模板</NativeSelectOption>
+              <NativeSelectOption value='process'>处理</NativeSelectOption>
+              <NativeSelectOption value='output'>落档</NativeSelectOption>
             </NativeSelect>
           </div>
 
@@ -3147,7 +3339,7 @@ function ComponentManagerPanel({
             disabled={isSubmitting}
             onClick={handleSubmit}
           >
-            创建组件
+            创建步骤
           </Button>
         </div>
       )}
@@ -3346,7 +3538,7 @@ function PaletteItem({
               void onDeleteComponent(template.componentId)
             }
           }}
-          title='删除自定义组件'
+          title='删除自定义步骤'
         >
           <Trash2Icon className='size-3' />
         </span>
@@ -3895,7 +4087,7 @@ function Inspector({
           </div>
         ) : (
           <div className='text-muted-foreground p-6 text-center text-sm'>
-            选中画布上的组件后配置执行模型。
+            选中画布上的步骤后查看和配置。
           </div>
         )}
       </div>
@@ -4117,10 +4309,191 @@ function formatDuration(durationMs?: number) {
   return `${(durationMs / 1000).toFixed(1)}s`
 }
 
-function parseBrowserCaptureWaitSeconds(value: string | undefined) {
-  const parsed = Number.parseInt(value || '', 10)
-  if (!Number.isFinite(parsed)) return 6
-  return Math.min(30, Math.max(1, parsed))
+type ExecutionPreviewSummaryStatus =
+  | 'idle'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'paused'
+
+type ExecutionPreviewSummary = {
+  status: ExecutionPreviewSummaryStatus
+  hasExecution: boolean
+  hasNodeProgress: boolean
+  isProgressIndeterminate: boolean
+  totalNodes: number
+  completedNodes: number
+  progressPercent: number
+  currentNodeId?: string
+  elapsedMs?: number
+}
+
+function formatElapsedTime(durationMs?: number) {
+  if (
+    durationMs === undefined ||
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return '-'
+  }
+
+  const totalSeconds = Math.floor(durationMs / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours.toString().padStart(2, '0')}:${minutes
+      .toString()
+      .padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+  }
+  return `${minutes.toString().padStart(2, '0')}:${seconds
+    .toString()
+    .padStart(2, '0')}`
+}
+
+function formatExecutionPreviewStatus(status: ExecutionPreviewSummaryStatus) {
+  const labels: Record<ExecutionPreviewSummaryStatus, string> = {
+    idle: '未执行',
+    running: '执行中',
+    completed: '已完成',
+    failed: '执行失败',
+    paused: '已暂停',
+  }
+  return labels[status]
+}
+
+function buildExecutionPreviewSummary(
+  executionNodes: AgentFlowNode[],
+  executionLog: AgentExecutionLogMap,
+  latestBackendLog: AgentExecutionLog | undefined,
+  now: number
+): ExecutionPreviewSummary {
+  const loggedNodeIds = new Set(Object.keys(executionLog))
+  const loggedNodes = executionNodes.filter((node) =>
+    loggedNodeIds.has(node.id)
+  )
+  const progressNodes = loggedNodes.length > 0 ? loggedNodes : executionNodes
+  const nodeStatuses = progressNodes.map(
+    (node) =>
+      executionLog[node.id]?.status ?? statusToLogStatus(node.data.status)
+  )
+  const localRunningNode = progressNodes.find(
+    (node) =>
+      executionLog[node.id]?.status === 'running' ||
+      node.data.status === 'running'
+  )
+  const hasLocalRunningNode = nodeStatuses.includes('running')
+  const hasLocalStoppedNode = nodeStatuses.includes('stopped')
+  const hasLocalFailedNode = nodeStatuses.includes('failed')
+  const backendStatus = latestBackendLog?.status
+  const hasBackendRunningLog =
+    backendStatus === 'running' || backendStatus === 'pending'
+
+  let status: ExecutionPreviewSummaryStatus = 'idle'
+  if (backendStatus === 'failed') {
+    status = 'failed'
+  } else if (backendStatus === 'paused') {
+    status = 'paused'
+  } else if (backendStatus === 'completed') {
+    status = 'completed'
+  } else if (hasLocalStoppedNode) {
+    status = 'paused'
+  } else if (hasLocalFailedNode) {
+    status = 'failed'
+  } else if (hasLocalRunningNode || hasBackendRunningLog) {
+    status = 'running'
+  } else if (nodeStatuses.includes('completed')) {
+    status = 'completed'
+  }
+
+  const hasNodeProgress =
+    loggedNodes.length > 0 ||
+    nodeStatuses.some((nodeStatus) => nodeStatus !== 'pending')
+  const hasExecution = Boolean(latestBackendLog) || hasNodeProgress
+  const totalNodes = progressNodes.length
+  const completedNodeCount = nodeStatuses.filter(
+    (nodeStatus) => nodeStatus === 'completed'
+  ).length
+  const completedNodes =
+    hasNodeProgress && status === 'completed' && backendStatus === 'completed'
+      ? totalNodes
+      : completedNodeCount
+  const progressPercent =
+    totalNodes > 0
+      ? Math.min(
+          100,
+          Math.max(0, Math.round((completedNodes / totalNodes) * 100))
+        )
+      : 0
+
+  const localStartTimes = Object.values(executionLog)
+    .map((log) => log.startedAt)
+    .filter(
+      (timestamp): timestamp is number =>
+        typeof timestamp === 'number' &&
+        Number.isFinite(timestamp) &&
+        timestamp > 0
+    )
+  const localEndTimes = Object.values(executionLog)
+    .map((log) => log.endedAt)
+    .filter(
+      (timestamp): timestamp is number =>
+        typeof timestamp === 'number' &&
+        Number.isFinite(timestamp) &&
+        timestamp > 0
+    )
+  const localDurations = Object.values(executionLog)
+    .map((log) => log.durationMs)
+    .filter(
+      (duration): duration is number =>
+        typeof duration === 'number' &&
+        Number.isFinite(duration) &&
+        duration > 0
+    )
+  const localStartedAt =
+    localStartTimes.length > 0 ? Math.min(...localStartTimes) : undefined
+  const localEndedAt =
+    localEndTimes.length > 0 ? Math.max(...localEndTimes) : undefined
+  const localDurationMs =
+    localDurations.length > 0 ? Math.max(...localDurations) : undefined
+  const localElapsedMs =
+    localStartedAt !== undefined && localEndedAt !== undefined
+      ? Math.max(0, localEndedAt - localStartedAt)
+      : localDurationMs
+  const backendDurationMs =
+    typeof latestBackendLog?.duration_ms === 'number' &&
+    Number.isFinite(latestBackendLog.duration_ms) &&
+    latestBackendLog.duration_ms > 0
+      ? latestBackendLog.duration_ms
+      : undefined
+
+  const startedAt =
+    status === 'running'
+      ? (localStartedAt ?? latestBackendLog?.start_time)
+      : hasLocalStoppedNode || hasLocalFailedNode
+        ? (localStartedAt ?? latestBackendLog?.start_time)
+        : (latestBackendLog?.start_time ?? localStartedAt)
+  const elapsedMs =
+    status === 'running'
+      ? startedAt !== undefined
+        ? Math.max(0, now - startedAt)
+        : localDurationMs
+      : hasLocalStoppedNode || hasLocalFailedNode
+        ? (localElapsedMs ?? backendDurationMs)
+        : (backendDurationMs ?? localElapsedMs)
+
+  return {
+    status,
+    hasExecution,
+    hasNodeProgress,
+    isProgressIndeterminate:
+      status === 'running' && hasNodeProgress && completedNodes === 0,
+    totalNodes,
+    completedNodes,
+    progressPercent,
+    currentNodeId: status === 'running' ? localRunningNode?.id : undefined,
+    elapsedMs,
+  }
 }
 
 function browserCapturedText(node: AgentFlowNode) {
@@ -4526,8 +4899,6 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     transform: 980,
     image: 2600,
     report: 1600,
-    report_data: 5200,
-    order_report_data: 6800,
     webpage: 1400,
     notify: 720,
     stop: 240,
@@ -4631,10 +5002,7 @@ function buildNodeOutputSummary(
   }
 
   if (
-    (node.data.kind === 'transform' ||
-      node.data.kind === 'report' ||
-      node.data.kind === 'report_data' ||
-      node.data.kind === 'order_report_data') &&
+    (node.data.kind === 'transform' || node.data.kind === 'report') &&
     hasMissingBrowserData(upstreamLogs) &&
     status === 'completed'
   ) {
@@ -4643,14 +5011,6 @@ function buildNodeOutputSummary(
 
   if (node.data.kind === 'report') {
     return buildReportOutputSummary(node, status)
-  }
-
-  if (node.data.kind === 'order_report_data' && status === 'completed') {
-    return [
-      '订单明细: 已按订单编号去重并按日期范围筛选',
-      '状态与金额汇总: 已按订单状态聚合',
-      '订单报告文件: 已按上游模板生成',
-    ]
   }
 
   const suffix: Record<AgentNodeLogStatus, string> = {
@@ -4750,7 +5110,7 @@ function buildNodeModelOutput(
       }
       return [
         `模型: ${node.data.model}${skillLine}`,
-        '# 日报预览',
+        '# 报告预览',
         '',
         '## 摘要',
         '- 根据上一节点提供的数据整理主要结论。',
@@ -4767,25 +5127,6 @@ function buildNodeModelOutput(
         ...previewPaths.map((path) => `预览文件: ${path}`),
       ].join('\n')
     }
-    case 'report_data':
-      return [
-        `模型: ${node.data.model}${skillLine}`,
-        '处理方式: 读取上游日报模板计划并复用浏览器登录会话。',
-        `采集周期: ${node.data.settings['采集周期'] || '近1天'}`,
-        `最大页数: ${node.data.settings['最大页数'] || '10'}`,
-        '输出: 商品明细、曝光/支付/转化排行及最终日报文件。',
-        '限制: 仅执行只读页面采集，不发布商品、不修改数据、不执行交易操作。',
-      ].join('\n')
-    case 'order_report_data':
-      return [
-        `模型: ${node.data.model}${skillLine}`,
-        '处理方式: 读取上游报告模板计划并复用浏览器登录会话。',
-        `日期范围: ${node.data.settings['开始日期'] || '未限制'} 至 ${node.data.settings['结束日期'] || '未限制'}`,
-        `订单状态: ${node.data.settings['订单状态'] || '全部'}`,
-        `最大页数: ${node.data.settings['最大页数'] || '20'}`,
-        '输出: 去重后的订单明细、状态与金额汇总及最终订单报告文件。',
-        '限制: 仅执行只读页面采集，不联系买家、不修改订单、不执行退款或交易操作。',
-      ].join('\n')
     case 'webpage': {
       const templateBindings = parseTemplateBindings(
         node.data.settings['网页模板'] || '',
@@ -4794,7 +5135,7 @@ function buildNodeModelOutput(
       return [
         `模型: ${node.data.model}${skillLine}`,
         '网页输出结果:',
-        '- 已生成交互式日报页面。',
+        '- 已生成交互式结果页面。',
         templateBindings.length > 0
           ? `- 按当前网页模板「${templateBindingNames(templateBindings)}」和节点描述渲染页面。`
           : '- 未绑定网页模板，按当前节点描述和上一节点输出渲染页面。',
@@ -5029,23 +5370,23 @@ function buildCustomNodeModelOutput(
   if (!upstreamSummary) {
     return [
       `模型: ${node.data.model}${skillLine}`,
-      `自定义组件: ${node.data.title}`,
-      '无法执行: 当前自定义组件没有收到已完成的上游真实输出。',
-      '处理: 请在组件描述中明确输入字段，或连接真实数据节点后重新执行。',
+      `自定义步骤: ${node.data.title}`,
+      '无法执行: 当前自定义步骤没有收到已完成的上游真实输出。',
+      '处理: 请在步骤要求中明确输入字段，或连接真实数据节点后重新执行。',
       '限制: 不使用内置样例或默认业务上下文补全输出。',
     ].join('\n')
   }
 
   return [
     `模型: ${node.data.model}${skillLine}`,
-    `自定义组件: ${node.data.title}`,
-    '执行依据: 仅使用当前组件描述、配置字段和上一节点真实输出。',
+    `自定义步骤: ${node.data.title}`,
+    '执行依据: 仅使用当前步骤要求、配置字段和上一节点真实输出。',
     '',
     '上游输入摘要:',
     formatGenericUpstreamSummaryMarkdown(upstreamLogs),
     '',
     '处理要求:',
-    node.data.description || '未填写组件描述。',
+    node.data.description || '未填写步骤要求。',
     '',
     '输出:',
     upstreamSummary,
@@ -5078,10 +5419,6 @@ function hasMissingBrowserData(logs: AgentNodeExecutionLog[]) {
       log.status === 'completed' &&
       log.modelOutput.includes(BROWSER_DATA_MISSING_MARKER)
   )
-}
-
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function buildReportOutputSummary(
@@ -5186,7 +5523,7 @@ function buildNodeLogSteps(
     steps.push(
       templateBindings.length > 0
         ? `读取当前模板文件: ${templateBindingNames(templateBindings)}`
-        : '未绑定模板文件，按当前节点描述生成日报。'
+        : '未绑定模板文件，按当前节点描述生成报告。'
     )
     if (hasMissingBrowserData(upstreamLogs)) {
       steps.push('上游真实页面数据缺失，本节点停止生成业务内容。')
@@ -5194,19 +5531,7 @@ function buildNodeLogSteps(
       steps.push(`使用 ${upstreamLogs.length} 个上游真实节点输出生成。`)
     }
     steps.push(`输出格式: ${outputFormats.join('、')}`)
-    steps.push(`生成日报预览；正式执行时写入输出目录: ${outputDir}`)
-  }
-
-  if (node.data.kind === 'report_data') {
-    steps.push('读取上游日报模板中的工作表、表头和采集字段。')
-    steps.push('复用浏览器登录会话，重新进入商品数据页并按页采集。')
-    steps.push('计算商品排行并将结构化数据写回日报模板。')
-  }
-
-  if (node.data.kind === 'order_report_data') {
-    steps.push('读取上游报告模板中的工作表、表头和订单字段。')
-    steps.push('复用浏览器登录会话，进入订单管理页并在日期范围内按页采集。')
-    steps.push('按订单编号去重，汇总状态与金额并将结构化数据写回报告模板。')
+    steps.push(`生成报告预览；正式执行时写入输出目录: ${outputDir}`)
   }
 
   if (node.data.kind === 'webpage') {
@@ -5245,13 +5570,7 @@ function buildNodeLogSteps(
 function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
   if (status === 'completed') {
     if (node.data.kind === 'report') {
-      return `${node.data.title} 已解析日报模板并生成数据采集计划。`
-    }
-    if (node.data.kind === 'report_data') {
-      return `${node.data.title} 已重新采集数据并输出最终日报。`
-    }
-    if (node.data.kind === 'order_report_data') {
-      return `${node.data.title} 已采集并汇总订单数据，输出最终订单报告。`
+      return `${node.data.title} 已根据上游结果生成报告。`
     }
     if (node.data.kind === 'stop') {
       return `${node.data.title} 已完成流程结束动作，输出目录以上游节点配置为准。`
@@ -5295,7 +5614,7 @@ function NodeConfigPanel({
   )
   return (
     <div className='space-y-3'>
-      <ConfigCard title='基础信息'>
+      <ConfigCard title='步骤信息'>
         <NodeCommonConfig
           currentGroup={currentGroup}
           groupChoices={groupChoices}
@@ -5304,10 +5623,11 @@ function NodeConfigPanel({
           skillChoices={skillChoices}
           onDeleteNode={onDeleteNode}
           onUpdateNode={onUpdateNode}
+          onUpdateSetting={onUpdateSetting}
         />
       </ConfigCard>
 
-      <ConfigCard title='描述信息'>
+      <ConfigCard title='任务要求'>
         <Textarea
           value={node.data.description}
           onChange={(event) =>
@@ -5317,7 +5637,7 @@ function NodeConfigPanel({
         />
       </ConfigCard>
 
-      <ConfigCard title='参数'>
+      <ConfigCard title='步骤设置'>
         {parameterEntries.length === 0 ? (
           <div className='text-muted-foreground text-xs'>无参数</div>
         ) : (
@@ -5339,18 +5659,11 @@ function NodeConfigPanel({
         )}
       </ConfigCard>
 
-      <ConfigCard title='执行策略'>
-        <ExecutionPolicyConfig
-          settings={node.data.settings}
-          onUpdateSetting={onUpdateSetting}
-        />
-      </ConfigCard>
-
       <div className='grid grid-cols-2 gap-2'>
-        <ConfigCard title='输入'>
+        <ConfigCard title='使用的数据'>
           <FieldList values={node.data.inputs} />
         </ConfigCard>
-        <ConfigCard title='输出'>
+        <ConfigCard title='产生的结果'>
           <FieldList values={node.data.outputs} />
         </ConfigCard>
       </div>
@@ -5429,6 +5742,7 @@ function NodeCommonConfig({
   currentGroup,
   onDeleteNode,
   onUpdateNode,
+  onUpdateSetting,
 }: {
   node: AgentFlowNode
   modelChoices: ModelChoice[]
@@ -5437,6 +5751,7 @@ function NodeCommonConfig({
   currentGroup?: string
   onDeleteNode: (nodeId: string) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
+  onUpdateSetting: (key: string, value: string) => void
 }) {
   const meta = getAgentNodeVisualMeta(node.data.kind, node.data.componentId)
   const Icon = meta.icon
@@ -5463,6 +5778,7 @@ function NodeCommonConfig({
     ? node.data.model
     : ''
   const selectedSkill = getSkillChoice(node.data.skill, skillChoices)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
 
   useEffect(() => {
     if (selectedGroupModels === undefined) return
@@ -5492,7 +5808,7 @@ function NodeCommonConfig({
         <div className='min-w-0 flex-1'>
           <div className='truncate text-sm font-semibold'>{meta.label}</div>
           <div className='text-muted-foreground truncate text-xs'>
-            {node.id}
+            {node.data.description || '按任务要求执行此步骤'}
           </div>
         </div>
         <Badge variant='outline' className='rounded-[6px]'>
@@ -5510,78 +5826,109 @@ function NodeCommonConfig({
         </Button>
       </div>
 
-      <div className='grid grid-cols-2 gap-2'>
-        <CompactField label='名称'>
-          <Input
-            value={node.data.title}
-            onChange={(event) => onUpdateNode({ title: event.target.value })}
-            className='h-7 rounded-[7px] px-2 text-xs'
+      <CompactField label='名称'>
+        <Input
+          value={node.data.title}
+          onChange={(event) => onUpdateNode({ title: event.target.value })}
+          className='h-7 rounded-[7px] px-2 text-xs'
+        />
+      </CompactField>
+
+      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+        <CollapsibleTrigger className='border-border/70 text-muted-foreground hover:text-foreground flex w-full items-center justify-between rounded-[7px] border px-2.5 py-2 text-xs font-medium transition-colors'>
+          <span>高级设置</span>
+          <ChevronDownIcon
+            className={cn(
+              'size-3.5 transition-transform',
+              advancedOpen && 'rotate-180'
+            )}
           />
-        </CompactField>
-
-        <CompactField label='模型组'>
-          <NativeSelect
-            size='sm'
-            value={selectedGroup}
-            onChange={(event) =>
-              onUpdateNode({ group: event.target.value, model: '' })
-            }
-            className='w-full'
-          >
-            {groupChoices.map((group) => (
-              <NativeSelectOption key={group.value} value={group.value}>
-                {group.label}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
-        </CompactField>
-
-        <CompactField label='模型'>
-          <NativeSelect
-            size='sm'
-            value={selectedModelValue}
-            onChange={(event) => onUpdateNode({ model: event.target.value })}
-            className='w-full'
-          >
-            {choices.length > 0 ? (
-              <NativeSelectOptGroup label={`渠道模型: ${selectedGroup}`}>
-                {choices.map((model) => (
-                  <NativeSelectOption key={model.value} value={model.value}>
-                    {model.label}
+        </CollapsibleTrigger>
+        <CollapsibleContent className='pt-2'>
+          <div className='grid grid-cols-2 gap-2'>
+            <CompactField label='模型分组'>
+              <NativeSelect
+                size='sm'
+                value={selectedGroup}
+                onChange={(event) =>
+                  onUpdateNode({ group: event.target.value, model: '' })
+                }
+                className='w-full'
+              >
+                {groupChoices.map((group) => (
+                  <NativeSelectOption key={group.value} value={group.value}>
+                    {group.label}
                   </NativeSelectOption>
                 ))}
-              </NativeSelectOptGroup>
-            ) : (
-              <NativeSelectOption value='' disabled>
-                {isFetchingGroupModels
-                  ? '正在加载模型...'
-                  : '该分组暂无可用模型'}
-              </NativeSelectOption>
-            )}
-          </NativeSelect>
-        </CompactField>
+              </NativeSelect>
+            </CompactField>
 
-        <CompactField label='Skill'>
-          <NativeSelect
-            size='sm'
-            value={normalizeBuiltinSkillValue(node.data.skill)}
-            title={selectedSkill.description}
-            onChange={(event) => onUpdateNode({ skill: event.target.value })}
-            className='w-full'
-          >
-            <NativeSelectOption value={NO_SKILL_CHOICE.value}>
-              {NO_SKILL_CHOICE.label}
-            </NativeSelectOption>
-            {skillChoicesForNodeKind(skillChoices, node.data.kind).map(
-              (skill) => (
-                <NativeSelectOption key={skill.value} value={skill.value}>
-                  {skill.label}
+            <CompactField label='模型'>
+              <NativeSelect
+                size='sm'
+                value={selectedModelValue}
+                onChange={(event) =>
+                  onUpdateNode({ model: event.target.value })
+                }
+                className='w-full'
+              >
+                {choices.length > 0 ? (
+                  <NativeSelectOptGroup
+                    label={`当前分组模型: ${selectedGroup}`}
+                  >
+                    {choices.map((model) => (
+                      <NativeSelectOption key={model.value} value={model.value}>
+                        {model.label}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelectOptGroup>
+                ) : (
+                  <NativeSelectOption value='' disabled>
+                    {isFetchingGroupModels
+                      ? '正在加载模型...'
+                      : '该分组暂无可用模型'}
+                  </NativeSelectOption>
+                )}
+              </NativeSelect>
+            </CompactField>
+
+            <CompactField label='Skill'>
+              <NativeSelect
+                size='sm'
+                value={normalizeBuiltinSkillValue(node.data.skill)}
+                title={selectedSkill.description}
+                onChange={(event) =>
+                  onUpdateNode({ skill: event.target.value })
+                }
+                className='w-full'
+              >
+                <NativeSelectOption value={NO_SKILL_CHOICE.value}>
+                  {NO_SKILL_CHOICE.label}
                 </NativeSelectOption>
-              )
-            )}
-          </NativeSelect>
-        </CompactField>
-      </div>
+                {skillChoicesForNodeKind(skillChoices, node.data.kind).map(
+                  (skill) => (
+                    <NativeSelectOption key={skill.value} value={skill.value}>
+                      {skill.label}
+                    </NativeSelectOption>
+                  )
+                )}
+              </NativeSelect>
+            </CompactField>
+          </div>
+          <div className='border-border/60 mt-3 border-t pt-3'>
+            <div className='text-muted-foreground mb-2 text-[11px] font-medium'>
+              执行策略
+            </div>
+            <ExecutionPolicyConfig
+              settings={node.data.settings}
+              onUpdateSetting={onUpdateSetting}
+            />
+          </div>
+          <div className='text-muted-foreground mt-2 text-[10px]'>
+            节点 ID：{node.id}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   )
 }
@@ -5639,6 +5986,27 @@ function ExecutionPreviewDock({
 }) {
   const logNode = selectedNode ?? executionNodes[0] ?? null
   const latestBackendLog = backendExecutionLogs[0]
+  const [clockNow, setClockNow] = useState(() => Date.now())
+  const executionSummary = buildExecutionPreviewSummary(
+    executionNodes,
+    executionLog,
+    latestBackendLog,
+    clockNow
+  )
+  const currentExecutionNode = executionSummary.currentNodeId
+    ? executionNodes.find((node) => node.id === executionSummary.currentNodeId)
+    : null
+  const showRuntimeSummary =
+    executionNodes.length > 0 && executionSummary.hasExecution
+  const showNodeProgress =
+    showRuntimeSummary && executionSummary.hasNodeProgress
+
+  useEffect(() => {
+    if (executionSummary.status !== 'running') return
+
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [executionSummary.status])
 
   return (
     <section className='border-border/70 bg-background shrink-0 border-t'>
@@ -5654,19 +6022,126 @@ function ExecutionPreviewDock({
         )}
         <FileSpreadsheetIcon className='text-muted-foreground size-3.5 shrink-0' />
         <span className='text-xs font-semibold'>执行预览</span>
-        <span className='text-muted-foreground truncate text-[11px]'>
-          {executionNodes.length} 个节点 · 当前蓝图链路
-        </span>
+        {showRuntimeSummary ? (
+          <span className='text-muted-foreground flex min-w-0 flex-1 items-center gap-x-2 overflow-hidden text-[11px] whitespace-nowrap'>
+            <span className='flex shrink-0 items-center gap-1'>
+              <span
+                className={cn(
+                  'size-1.5 rounded-full',
+                  executionSummary.status === 'running' && 'bg-blue-500',
+                  executionSummary.status === 'completed' && 'bg-emerald-500',
+                  executionSummary.status === 'failed' && 'bg-destructive',
+                  executionSummary.status === 'paused' && 'bg-amber-500'
+                )}
+              />
+              {formatExecutionPreviewStatus(executionSummary.status)}
+            </span>
+            {showNodeProgress && (
+              <span>
+                {executionSummary.isProgressIndeterminate
+                  ? `节点进度 ${executionSummary.completedNodes}/${executionSummary.totalNodes} · 同步中`
+                  : `节点进度 ${executionSummary.completedNodes}/${executionSummary.totalNodes} · ${executionSummary.progressPercent}%`}
+              </span>
+            )}
+            {currentExecutionNode && (
+              <span className='max-w-52 min-w-0 truncate'>
+                当前：{currentExecutionNode.data.title}
+              </span>
+            )}
+            {executionSummary.elapsedMs !== undefined && (
+              <span className='shrink-0'>
+                已用时 {formatElapsedTime(executionSummary.elapsedMs)}
+              </span>
+            )}
+          </span>
+        ) : (
+          <span className='text-muted-foreground truncate text-[11px]'>
+            {executionNodes.length} 个节点 · 当前蓝图链路
+          </span>
+        )}
       </button>
 
       {isOpen && (
         <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-hidden border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
+          {showRuntimeSummary && (
+            <div className='border-border/70 bg-muted/10 min-w-0 rounded-[8px] border px-3 py-2 xl:col-span-2'>
+              <div className='text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px]'>
+                <span className='text-foreground font-semibold'>执行进度</span>
+                <span className='flex shrink-0 items-center gap-1'>
+                  <span
+                    className={cn(
+                      'size-1.5 rounded-full',
+                      executionSummary.status === 'running' && 'bg-blue-500',
+                      executionSummary.status === 'completed' &&
+                        'bg-emerald-500',
+                      executionSummary.status === 'failed' && 'bg-destructive',
+                      executionSummary.status === 'paused' && 'bg-amber-500'
+                    )}
+                  />
+                  {formatExecutionPreviewStatus(executionSummary.status)}
+                </span>
+                {showNodeProgress && (
+                  <span>
+                    {executionSummary.isProgressIndeterminate
+                      ? `节点进度 ${executionSummary.completedNodes}/${executionSummary.totalNodes} · 同步中`
+                      : `节点进度 ${executionSummary.completedNodes}/${executionSummary.totalNodes} · ${executionSummary.progressPercent}%`}
+                  </span>
+                )}
+                <span className='min-w-0 truncate'>
+                  当前节点：
+                  {currentExecutionNode?.data.title ??
+                    (executionSummary.status === 'completed' ? '已完成' : '-')}
+                </span>
+                {executionSummary.elapsedMs !== undefined && (
+                  <span className='shrink-0'>
+                    已用时 {formatElapsedTime(executionSummary.elapsedMs)}
+                  </span>
+                )}
+              </div>
+              {showNodeProgress && (
+                <div
+                  aria-label={
+                    executionSummary.isProgressIndeterminate
+                      ? '执行进度同步中'
+                      : `执行进度 ${executionSummary.progressPercent}%`
+                  }
+                  aria-valuemax={100}
+                  aria-valuemin={0}
+                  aria-valuenow={
+                    executionSummary.isProgressIndeterminate
+                      ? undefined
+                      : executionSummary.progressPercent
+                  }
+                  className='bg-muted mt-2 h-1.5 overflow-hidden rounded-full'
+                  role='progressbar'
+                >
+                  <div
+                    className={cn(
+                      'h-full rounded-full transition-[width] duration-500',
+                      executionSummary.isProgressIndeterminate &&
+                        'w-1/3 animate-pulse',
+                      executionSummary.status === 'running' && 'bg-blue-500',
+                      executionSummary.status === 'completed' &&
+                        'bg-emerald-500',
+                      executionSummary.status === 'failed' && 'bg-destructive',
+                      executionSummary.status === 'paused' && 'bg-amber-500'
+                    )}
+                    style={
+                      executionSummary.isProgressIndeterminate
+                        ? undefined
+                        : { width: `${executionSummary.progressPercent}%` }
+                    }
+                  />
+                </div>
+              )}
+            </div>
+          )}
           {latestBackendLog && (
             <BackendExecutionLogBanner log={latestBackendLog} />
           )}
           {executionNodes.length === 0 ? (
             <div className='text-muted-foreground py-4 text-center text-xs xl:col-span-2'>
-              画布上还没有可执行的节点，从左侧拖入组件开始搭建。
+              画布上还没有可执行的步骤，请从左侧添加。
             </div>
           ) : (
             <>
@@ -5751,16 +6226,23 @@ function ExecutionPreviewDock({
 
 function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
   const isFailed = log.status === 'failed'
-  const isRunning = log.status === 'running'
+  const isRunning = log.status === 'running' || log.status === 'pending'
+  const isPaused = log.status === 'paused'
+  const isCompleted = log.status === 'completed'
   return (
     <div
       className={cn(
         'flex min-w-0 flex-wrap items-center gap-2 rounded-[8px] border px-3 py-2 text-[11px] xl:col-span-2',
         isFailed && 'border-destructive/35 bg-destructive/5 text-destructive',
         isRunning && 'border-blue-500/30 bg-blue-500/5 text-blue-700',
+        isPaused && 'border-amber-500/30 bg-amber-500/5 text-amber-700',
+        isCompleted &&
+          'border-emerald-500/30 bg-emerald-500/5 text-emerald-700',
         !isFailed &&
           !isRunning &&
-          'border-emerald-500/30 bg-emerald-500/5 text-emerald-700'
+          !isPaused &&
+          !isCompleted &&
+          'border-border/70 bg-muted/20 text-muted-foreground'
       )}
     >
       <span className='font-semibold'>后端正式运行</span>
@@ -5785,6 +6267,7 @@ function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
 
 function formatBackendLogStatus(status: string) {
   const labels: Record<string, string> = {
+    pending: '准备中',
     running: '执行中',
     completed: '已完成',
     failed: '执行失败',
@@ -5939,7 +6422,7 @@ function reportOutputFormatForTemplatePath(path: string) {
       return 'CSV 表格'
     case 'md':
     case 'markdown':
-      return 'Markdown 日报'
+      return 'Markdown 文档'
     case 'doc':
     case 'docx':
       return 'Word 文档'
@@ -5992,25 +6475,6 @@ function reportExtensionForLabel(label: string) {
     return 'csv'
   }
   return 'md'
-}
-
-function findReportTemplateForExtension(
-  node: AgentFlowNode,
-  extension: string
-) {
-  const targetExt = normalizeExtension(extension)
-  const bindings = parseTemplateBindings(
-    node.data.settings['模板文件'] || '',
-    node.data.settings
-  )
-  return bindings.find((binding) => {
-    const pathExt = normalizeExtension(binding.path.split('.').pop() || '')
-    if (pathExt === targetExt) return true
-    if (targetExt === 'html' && pathExt === 'htm') return true
-    if (targetExt === 'xlsx' && pathExt === 'xls') return true
-    if (targetExt === 'docx' && pathExt === 'doc') return true
-    return false
-  })
 }
 
 function normalizeExtension(value: string) {
@@ -6254,7 +6718,7 @@ function SettingControl({
         />
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
           同名浏览器节点共享已登录
-          Cookie；日报或抢票蓝图保持“默认”即可复用登录态。
+          Cookie；需要保持登录态的流程使用“默认”会话即可复用。
         </div>
       </LabeledField>
     )
@@ -6295,7 +6759,7 @@ function SettingControl({
           <Textarea
             value={value}
             onChange={(event) => onChange(event.target.value)}
-            placeholder='Markdown 日报、CSV 表格、Excel 表格、Word 文档、PDF 文档、HTML 网页、TXT 文本、JSON 数据'
+            placeholder='Markdown 文档、CSV 表格、Excel 表格、Word 文档、PDF 文档、HTML 网页、TXT 文本、JSON 数据'
             className='min-h-16 rounded-[8px] text-sm'
           />
           <div className='flex flex-wrap gap-1.5'>
@@ -6900,32 +7364,6 @@ function SettingControl({
     )
   }
 
-  if (
-    nodeKind === 'order_report_data' &&
-    (label === '开始日期' || label === '结束日期')
-  ) {
-    return (
-      <LabeledField label={label}>
-        <Input
-          type='date'
-          value={value}
-          min={
-            label === '结束日期' ? settings['开始日期'] || undefined : undefined
-          }
-          max={
-            label === '开始日期' ? settings['结束日期'] || undefined : undefined
-          }
-          onChange={(event) => onChange(event.target.value)}
-          className='h-8 rounded-[8px] text-sm'
-        />
-      </LabeledField>
-    )
-  }
-
-  if (nodeKind === 'order_report_data' && label === '订单状态') {
-    return <OrderStatusSettingControl value={value} onChange={onChange} />
-  }
-
   if (label === '时区') {
     return (
       <LabeledField label={label}>
@@ -6973,58 +7411,6 @@ function SettingControl({
         onChange={(event) => onChange(event.target.value)}
         className='h-8 rounded-[8px] text-sm'
       />
-    </LabeledField>
-  )
-}
-
-function OrderStatusSettingControl({
-  value,
-  onChange,
-}: {
-  value: string
-  onChange: (value: string) => void
-}) {
-  const selected = new Set(
-    value === '全部'
-      ? []
-      : value
-          .split(/[、,，;；\n\r]+/)
-          .map((item) => item.trim())
-          .filter(Boolean)
-  )
-  const updateStatus = (status: string, checked: boolean) => {
-    const next = new Set(selected)
-    if (checked) next.add(status)
-    else next.delete(status)
-    const ordered = ORDER_STATUS_OPTIONS.filter((item) => next.has(item))
-    onChange(ordered.length > 0 ? ordered.join('、') : '全部')
-  }
-
-  return (
-    <LabeledField label='订单状态'>
-      <div className='border-border/70 grid grid-cols-2 gap-x-3 gap-y-2 rounded-[8px] border px-2.5 py-2'>
-        <label className='flex min-w-0 cursor-pointer items-center gap-2 text-xs'>
-          <Checkbox
-            checked={selected.size === 0}
-            onCheckedChange={() => onChange('全部')}
-            aria-label='全部订单状态'
-          />
-          <span>全部</span>
-        </label>
-        {ORDER_STATUS_OPTIONS.map((status) => (
-          <label
-            key={status}
-            className='flex min-w-0 cursor-pointer items-center gap-2 text-xs'
-          >
-            <Checkbox
-              checked={selected.has(status)}
-              onCheckedChange={(checked) => updateStatus(status, !!checked)}
-              aria-label={status}
-            />
-            <span className='min-w-0'>{status}</span>
-          </label>
-        ))}
-      </div>
     </LabeledField>
   )
 }
@@ -7909,8 +8295,6 @@ function readSkillNodeKinds(
     'transform',
     'image',
     'report',
-    'report_data',
-    'order_report_data',
     'webpage',
     'notify',
     'stop',
@@ -8123,6 +8507,7 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
 
     return parsed
       .filter(isSavedBlueprint)
+      .filter((blueprint) => blueprint.nodes.every(hasSupportedAgentNodeKind))
       .map((blueprint) => {
         const normalizedNodes = normalizeSavedBlueprintNodes(
           blueprint.nodes.map((node) => normalizeNode(node)),
@@ -8132,16 +8517,12 @@ function readSavedBlueprints(): SavedAgentBlueprint[] {
           normalizedNodes,
           blueprint.edges.map((edge) => normalizeEdge(edge))
         )
-        const upgraded = upgradeSavedReportDataPipeline(
-          normalizedNodes,
-          normalizedEdges
-        )
         return {
           ...blueprint,
-          nodes: upgraded.nodes,
-          edges: upgraded.edges,
+          nodes: normalizedNodes,
+          edges: normalizedEdges,
           status: normalizeSavedBlueprintStatus(
-            upgraded.nodes,
+            normalizedNodes,
             blueprint.status
           ),
           executionLog: normalizeExecutionLog(blueprint.executionLog),
@@ -8173,6 +8554,13 @@ function mergeBackendBlueprints(
     (a, b) => b.updated_time - a.updated_time
   )) {
     if (backendBlueprintRecordType(backendBlueprint) === 'execution_snapshot') {
+      continue
+    }
+    const backendNodes = backendBlueprint.nodes ?? []
+    if (
+      !backendNodes.every(isSerializedAgentNode) ||
+      backendNodes.some((node) => !hasSupportedAgentNodeKind(node))
+    ) {
       continue
     }
 
@@ -8230,20 +8618,16 @@ function savedBlueprintFromBackend(
     normalizedNodes,
     normalizedEdges
   )
-  const upgraded = upgradeSavedReportDataPipeline(
-    normalizedNodes,
-    legacyCompatibleEdges
-  )
   const status = normalizeSavedBlueprintStatus(
-    upgraded.nodes,
+    normalizedNodes,
     localBlueprintStatusFromBackend(backendBlueprint.status)
   )
 
   return {
     id: localId,
     title: backendBlueprint.name,
-    nodes: upgraded.nodes,
-    edges: upgraded.edges,
+    nodes: normalizedNodes,
+    edges: legacyCompatibleEdges,
     createdAt: backendBlueprint.created_time,
     updatedAt: backendBlueprint.updated_time,
     status,
@@ -8286,86 +8670,8 @@ function isSerializedAgentEdge(value: unknown): value is AgentFlowEdge {
   return typeof edge.source === 'string' && typeof edge.target === 'string'
 }
 
-function upgradeSavedReportDataPipeline(
-  nodes: AgentFlowNode[],
-  edges: AgentFlowEdge[]
-) {
-  if (
-    nodes.some(
-      (node) =>
-        node.data.kind === 'report_data' ||
-        node.data.kind === 'order_report_data'
-    )
-  ) {
-    return { nodes, edges }
-  }
-  const report = nodes.find(
-    (node) =>
-      node.data.kind === 'report' &&
-      Boolean(node.data.settings['模板文件']?.trim())
-  )
-  if (!report) return { nodes, edges }
-
-  const processorKind = isOrderReportTemplate(report)
-    ? 'order_report_data'
-    : 'report_data'
-  const meta = NODE_META[processorKind]
-  const processorId = `${processorKind.replace(/_/g, '-')}-${report.id}`
-  const processor: AgentFlowNode = {
-    id: processorId,
-    type: 'agentNode',
-    position: { x: report.position.x + 350, y: report.position.y },
-    data: {
-      kind: processorKind,
-      componentId:
-        processorKind === 'order_report_data'
-          ? 'component.order-report-data'
-          : 'component.report-data',
-      title: meta.label,
-      description: meta.description,
-      group: report.data.group,
-      model: report.data.model,
-      skill: DEFAULT_SKILL_BY_NODE_KIND[processorKind] ?? NO_SKILL_VALUE,
-      inputs: [...meta.inputs],
-      outputs: [...meta.outputs],
-      settings: { ...meta.settings },
-      status: 'ready',
-    },
-  }
-  const outgoing = edges.filter((edge) => edge.source === report.id)
-  const retained = edges.filter((edge) => edge.source !== report.id)
-  const nextEdges = [
-    ...retained,
-    decorateEdge({
-      id: `e-${report.id}-${processorId}`,
-      source: report.id,
-      target: processorId,
-    }),
-    ...outgoing.map((edge) =>
-      decorateEdge({
-        ...edge,
-        id: `e-${processorId}-${edge.target}`,
-        source: processorId,
-      })
-    ),
-  ]
-  return { nodes: [...nodes, processor], edges: nextEdges }
-}
-
-function isOrderReportTemplate(report: AgentFlowNode) {
-  const settings = report.data.settings
-  const haystack = [
-    settings['模板预览'],
-    settings['模板原文件名'],
-    settings['模板文件'],
-    report.data.title,
-    report.data.description,
-  ]
-    .filter(Boolean)
-    .join('\n')
-  return /订单编号|订单号|下单时间|下单日期|订单日期|退款状态|成交价|成交金额/.test(
-    haystack
-  )
+function hasSupportedAgentNodeKind(node: AgentFlowNode) {
+  return Object.prototype.hasOwnProperty.call(NODE_META, node.data?.kind)
 }
 
 function writeSavedBlueprints(blueprints: SavedAgentBlueprint[]) {
@@ -8487,8 +8793,8 @@ function buildBackendBlueprintForm(
     skills: Array.from(new Set(skills)),
     input_variables: buildBackendInputVariables(blueprint, options),
     archive_config: {
-      type: 'platform',
-      triggerOn: 'success',
+      type: ArchiveType.PLATFORM,
+      triggerOn: 'success' as const,
     },
     nodes: stripTransientNodeSettings(blueprint.nodes),
     edges: blueprint.edges,
@@ -8498,10 +8804,10 @@ function buildBackendBlueprintForm(
 function buildBackendTriggerConfig(
   nodes: AgentFlowNode[],
   mode: BackendBlueprintFormOptions['triggerMode'] = 'auto'
-) {
+): TriggerConfig {
   if (mode === 'manual') {
     return {
-      type: 'manual',
+      type: TriggerType.MANUAL,
       timezone: 'Asia/Shanghai',
     }
   }
@@ -8509,25 +8815,24 @@ function buildBackendTriggerConfig(
   const schedule = nodes.find((node) => node.data.kind === 'schedule')
   if (!schedule) {
     return {
-      type: 'manual',
+      type: TriggerType.MANUAL,
       timezone: 'Asia/Shanghai',
     }
   }
   return {
-    type: 'scheduled',
+    type: TriggerType.SCHEDULED,
     frequency: backendFrequencyFromLabel(schedule.data.settings['执行频率']),
     time: schedule.data.settings['执行时间'] || '08:30',
     timezone: schedule.data.settings['时区'] || 'Asia/Shanghai',
   }
 }
 
-function backendFrequencyFromLabel(value?: string) {
-  if (value === '每小时') return 'hourly'
-  if (value === '工作日') return 'weekdays'
-  if (value === '每周') return 'weekly'
-  if (value === '每月') return 'monthly'
-  if (value === '仅一次') return 'once'
-  return 'daily'
+function backendFrequencyFromLabel(value?: string): FrequencyType {
+  if (value === '每小时') return FrequencyType.HOURLY
+  if (value === '每周') return FrequencyType.WEEKLY
+  if (value === '每月') return FrequencyType.MONTHLY
+  if (value === '仅一次') return FrequencyType.ONCE
+  return FrequencyType.DAILY
 }
 
 function buildBackendInputVariables(
@@ -8609,7 +8914,11 @@ function hasScheduleNode(nodes: AgentFlowNode[]) {
 }
 
 function hasManualTriggerNode(nodes: AgentFlowNode[]) {
-  return nodes.some((node) => node.data.kind === 'start')
+  return nodes.some(
+    (node) =>
+      node.data.kind === 'start' ||
+      node.data.componentId === 'component.webhook'
+  )
 }
 
 function getRunPreviewButtonLabel(status: AgentBlueprintStatus) {
@@ -8675,7 +8984,8 @@ function isAgentNodeLogStatus(status: unknown): status is AgentNodeLogStatus {
     status === 'pending' ||
     status === 'running' ||
     status === 'completed' ||
-    status === 'stopped'
+    status === 'stopped' ||
+    status === 'failed'
   )
 }
 
@@ -8716,7 +9026,7 @@ function updateNodeSettingValue(
 function normalizeNode(node: AgentFlowNode): AgentFlowNode {
   const data = node.data ?? ({} as Partial<AgentNodeData>)
   const kind =
-    data.kind && NODE_META[data.kind] ? data.kind : ('start' as AgentNodeKind)
+    data.kind && NODE_META[data.kind] ? data.kind : ('custom' as AgentNodeKind)
   const meta = NODE_META[kind]
   const outputs = Array.isArray(data.outputs) ? data.outputs : meta.outputs
   const settings = normalizeNodeSettings(kind, data.settings, meta.settings)
@@ -8924,11 +9234,38 @@ function shouldUseCatalogComponent(
   component: AgentComponentItem,
   baseComponentIds: Set<string>
 ) {
-  if (!component.enabled) return false
+  if (!component.enabled || !isSupportedComponentGroup(component.group)) {
+    return false
+  }
   if (component.source === 'custom') return true
   if (baseComponentIds.has(component.id)) return false
 
   return normalizeTemplateKind(component.kind) === 'custom'
+}
+
+const SUPPORTED_COMPONENT_GROUPS = new Set([
+  'trigger',
+  'collect',
+  'collection',
+  'source',
+  'process',
+  'processor',
+  'transform',
+  'control',
+  'flow',
+  'workflow',
+  'output',
+  'sink',
+  '触发',
+  '采集',
+  '处理',
+  '落档',
+])
+
+function isSupportedComponentGroup(group?: string) {
+  const normalized = group?.trim().toLowerCase()
+  if (!normalized) return true
+  return SUPPORTED_COMPONENT_GROUPS.has(normalized)
 }
 
 function componentToNodeTemplate(
@@ -8949,7 +9286,7 @@ function componentToNodeTemplate(
   const settings = {
     ...meta.settings,
     ...(config.settings ?? {}),
-    组件来源: component.source === 'custom' ? '自定义' : '系统内置',
+    步骤来源: component.source === 'custom' ? '自定义' : '系统内置',
   }
   return {
     kind,
@@ -8993,24 +9330,16 @@ function componentPaletteGroup(
     case 'control':
     case 'flow':
     case 'workflow':
-    case '控制':
-    case '控制流':
-      return '控制流'
-    case 'template':
-    case 'recipe':
-    case '模板':
-    case '业务模板':
-      return '业务模板'
+      return '处理'
     case 'output':
     case 'sink':
-    case '输出':
-      return '输出'
+    case '落档':
+      return '落档'
     case 'process':
     case 'processor':
     case 'transform':
     case '处理':
-    case '智能处理':
-      return '智能处理'
+      return '处理'
     default:
       return fallback
   }
@@ -9152,19 +9481,50 @@ function createInitialNodes(templates: NodeTemplate[]) {
     {
       kind: 'start',
       id: 'start',
-      position: { x: -260, y: 0 },
+      position: { x: -560, y: 0 },
       patch: {
-        title: '手动开始',
-        description: '手动触发当前蓝图。',
+        title: '触发',
+        description: '设置任务何时开始，可改为定时或外部事件触发。',
+      },
+    },
+    {
+      kind: 'request',
+      id: 'collect',
+      position: { x: -280, y: 0 },
+      patch: {
+        title: '采集',
+        description: '从网页、接口、文件或数据库取得本次任务需要的数据。',
+        settings: {
+          网址: '',
+          请求参数: '',
+        },
+      },
+    },
+    {
+      kind: 'transform',
+      id: 'process',
+      position: { x: 0, y: 0 },
+      patch: {
+        title: '处理',
+        description: '说明要如何筛选、判断、汇总或转换采集到的数据。',
+      },
+    },
+    {
+      kind: 'report',
+      id: 'archive',
+      position: { x: 280, y: 0 },
+      patch: {
+        title: '落档',
+        description: '将处理结果保存为文件或报告，也可替换为网页或通知。',
       },
     },
     {
       kind: 'stop',
       id: 'stop',
-      position: { x: 220, y: 0 },
+      position: { x: 560, y: 0 },
       patch: {
         title: '结束',
-        description: '结束当前蓝图流程。',
+        description: '记录任务完成状态并结束本轮流程。',
       },
     },
   ]
@@ -9400,7 +9760,7 @@ function buildComponentPaletteSections(
     ...(customTemplates.length
       ? [
           {
-            title: '自定义组件',
+            title: '自定义步骤',
             badge: '自定义',
             templates: customTemplates,
           },
@@ -9445,7 +9805,11 @@ function buildManualPreviewGraph(
 ) {
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
   const startIds = nodes
-    .filter((node) => node.data.kind === 'start')
+    .filter(
+      (node) =>
+        node.data.kind === 'start' ||
+        node.data.componentId === 'component.webhook'
+    )
     .map((node) => node.id)
 
   if (startIds.length === 0) {
