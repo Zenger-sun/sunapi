@@ -951,6 +951,8 @@
     "Conversation": "Conversation",
     "Images": "Images",
     "Videos": "Videos",
+    "Knowledge Base": "Knowledge Base",
+    "Manage reusable documents for agent retrieval.": "Manage reusable documents for agent retrieval.",
     "Agents": "Agents",
     "Workspace": "Workspace",
     "Contract review, compliance, summarisation": "Contract review, compliance, summarisation",

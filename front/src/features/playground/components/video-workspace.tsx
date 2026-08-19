@@ -83,6 +83,7 @@ import type {
   VideoResolutionPreset,
 } from '../types'
 import { ModelCapsule } from './model-capsule'
+import { KnowledgeScopeSelector } from './knowledge-scope-selector'
 
 interface VideoWorkspaceProps {
   params: VideoGenerationParams
@@ -356,6 +357,9 @@ export function VideoWorkspace({
         aspect_ratio: generationParams.aspectRatio,
         resolution: generationParams.resolution,
         seed: generationParams.seed,
+        knowledge_base_ids: generationParams.knowledgeBaseIds,
+        knowledge_disabled: generationParams.knowledgeDisabled,
+        knowledge_manual: generationParams.knowledgeManual,
         reference_images: referenceImages,
       })
       const taskId = response.id || response.task_id || response.request_id
@@ -841,6 +845,20 @@ export function VideoParamsPanel({
             </div>
           </Field>
         </div>
+
+        <KnowledgeScopeSelector
+          value={value}
+          disabled={disabled}
+          compact={compact}
+          onChange={(next) =>
+            onChange({
+              ...value,
+              knowledgeBaseIds: next.knowledgeBaseIds,
+              knowledgeDisabled: next.knowledgeDisabled,
+              knowledgeManual: next.knowledgeManual,
+            })
+          }
+        />
       </CollapsibleContent>
     </Collapsible>
   )

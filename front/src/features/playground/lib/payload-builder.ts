@@ -28,7 +28,13 @@ import {
 export function buildChatCompletionPayload(
   messages: Message[],
   config: PlaygroundConfig,
-  parameterEnabled: ParameterEnabled
+  parameterEnabled: ParameterEnabled,
+  conversationId?: number | null,
+  knowledge?: {
+    knowledgeBaseIds?: string[]
+    knowledgeDisabled?: boolean
+    knowledgeManual?: boolean
+  }
 ): ChatCompletionRequest {
   // Filter and format valid messages
   const validMessages = messages.filter(isValidMessage)
@@ -56,6 +62,19 @@ export function buildChatCompletionPayload(
     group: config.group,
     messages: processedMessages,
     stream: config.stream,
+  }
+
+  if (conversationId && conversationId > 0) {
+    payload.knowledge_conversation_id = conversationId
+  }
+  if (knowledge?.knowledgeBaseIds?.length) {
+    payload.knowledge_base_ids = knowledge.knowledgeBaseIds
+  }
+  if (
+    knowledge?.knowledgeDisabled ||
+    (knowledge?.knowledgeManual && !knowledge.knowledgeBaseIds?.length)
+  ) {
+    payload.knowledge_disabled = true
   }
 
   // Add enabled parameters

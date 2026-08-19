@@ -3956,9 +3956,16 @@ func firstNonEmpty(values ...string) string {
 func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, inputVars map[string]interface{}) (string, error) {
 	templateContext := buildBlueprintTemplatePromptContext(store, inputVars)
 	skillContext := buildBlueprintSkillPromptContext(ctx, store, bp)
+	userPrompt := buildBlueprintUserPrompt(bp, inputVars)
 
 	// 构建系统 Prompt
 	systemPrompt := buildBlueprintSystemPrompt(bp, inputVars, templateContext, skillContext)
+	knowledgeScope := applyKnowledgeInputScope(KnowledgeSearchScope{
+		Module:      "agent",
+		AgentID:     bp.AgentID,
+		BlueprintID: bp.ID,
+	}, inputVars)
+	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, userPrompt, 6, knowledgeScope)
 
 	// 构建请求体
 	type chatMsg struct {
@@ -3969,7 +3976,7 @@ func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, 
 		"model": bp.ModelName,
 		"messages": []chatMsg{
 			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: buildBlueprintUserPrompt(bp, inputVars)},
+			{Role: "user", Content: userPrompt},
 		},
 		"stream": false,
 	}
@@ -4069,11 +4076,19 @@ func callLLMForAgentNode(
 	if err != nil {
 		return "", err
 	}
+	userPrompt := buildAgentNodeUserPrompt(node, upstream, inputVars, configuredFiles)
+	systemPrompt := buildAgentNodeSystemPrompt(ctx, store, bp, node)
+	knowledgeScope := applyKnowledgeInputScope(KnowledgeSearchScope{
+		Module:      "agent",
+		AgentID:     bp.AgentID,
+		BlueprintID: bp.ID,
+	}, inputVars)
+	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, userPrompt, 6, knowledgeScope)
 	reqBody := map[string]interface{}{
 		"model": model,
 		"messages": []chatMsg{
-			{Role: "system", Content: buildAgentNodeSystemPrompt(ctx, store, bp, node)},
-			{Role: "user", Content: buildAgentNodeUserPrompt(node, upstream, inputVars, configuredFiles)},
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
 		},
 		"stream": false,
 	}

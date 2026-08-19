@@ -29,6 +29,10 @@ import { useStreamRequest } from './use-stream-request'
 interface UseChatHandlerOptions {
   config: PlaygroundConfig
   parameterEnabled: ParameterEnabled
+  conversationId?: number | null
+  knowledgeBaseIds?: string[]
+  knowledgeDisabled?: boolean
+  knowledgeManual?: boolean
   onMessageUpdate: (updater: (prev: Message[]) => Message[]) => void
 }
 
@@ -38,6 +42,10 @@ interface UseChatHandlerOptions {
 export function useChatHandler({
   config,
   parameterEnabled,
+  conversationId,
+  knowledgeBaseIds,
+  knowledgeDisabled,
+  knowledgeManual,
   onMessageUpdate,
 }: UseChatHandlerOptions) {
   const { sendStreamRequest, stopStream, isStreaming } = useStreamRequest()
@@ -102,7 +110,9 @@ export function useChatHandler({
       const payload = buildChatCompletionPayload(
         messages,
         config,
-        parameterEnabled
+        parameterEnabled,
+        conversationId,
+        { knowledgeBaseIds, knowledgeDisabled, knowledgeManual }
       )
       sendStreamRequest(
         payload,
@@ -114,6 +124,10 @@ export function useChatHandler({
     [
       config,
       parameterEnabled,
+      conversationId,
+      knowledgeBaseIds,
+      knowledgeDisabled,
+      knowledgeManual,
       sendStreamRequest,
       handleStreamUpdate,
       handleStreamComplete,
@@ -127,7 +141,9 @@ export function useChatHandler({
       const payload = buildChatCompletionPayload(
         messages,
         config,
-        parameterEnabled
+        parameterEnabled,
+        conversationId,
+        { knowledgeBaseIds, knowledgeDisabled, knowledgeManual }
       )
 
       try {
@@ -159,7 +175,16 @@ export function useChatHandler({
         handleStreamError(parsed.message, parsed.code)
       }
     },
-    [config, parameterEnabled, onMessageUpdate, handleStreamError]
+    [
+      config,
+      parameterEnabled,
+      conversationId,
+      knowledgeBaseIds,
+      knowledgeDisabled,
+      knowledgeManual,
+      onMessageUpdate,
+      handleStreamError,
+    ]
   )
 
   // Send chat request (stream or non-stream based on config)

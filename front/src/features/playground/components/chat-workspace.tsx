@@ -22,6 +22,10 @@ import type {
   ModelOption,
 } from '../types'
 import { ChatSuggestions } from './chat-suggestions'
+import {
+  KnowledgeScopeSelector,
+  type KnowledgeScopeValue,
+} from './knowledge-scope-selector'
 import { PlaygroundChat } from './playground-chat'
 import { PlaygroundInput } from './playground-input'
 
@@ -31,6 +35,7 @@ interface ChatWorkspaceProps {
   messages: MessageType[]
   models: ModelOption[]
   groups: GroupOption[]
+  activeSessionId?: number | null
   isLoadingModels: boolean
   onConfigChange: <
     K extends keyof ReturnType<typeof usePlaygroundState>['config'],
@@ -50,6 +55,7 @@ export function ChatWorkspace({
   messages,
   models,
   groups,
+  activeSessionId,
   isLoadingModels,
   onConfigChange,
   updateMessages,
@@ -66,10 +72,19 @@ export function ChatWorkspace({
     filename?: string
   } | null>(null)
   const submitLockRef = useRef(false)
+  const [knowledgeScope, setKnowledgeScope] = useState<KnowledgeScopeValue>({})
+
+  useEffect(() => {
+    setKnowledgeScope({})
+  }, [activeSessionId])
 
   const { sendChat, stopGeneration, isGenerating } = useChatHandler({
     config,
     parameterEnabled,
+    conversationId: activeSessionId,
+    knowledgeBaseIds: knowledgeScope.knowledgeBaseIds,
+    knowledgeDisabled: knowledgeScope.knowledgeDisabled,
+    knowledgeManual: knowledgeScope.knowledgeManual,
     onMessageUpdate: updateMessages,
   })
 
@@ -216,6 +231,13 @@ export function ChatWorkspace({
 
       <div className='bg-background shrink-0 px-3 pt-2 pb-3 md:px-6'>
         <div className='mx-auto w-full max-w-3xl'>
+          <KnowledgeScopeSelector
+            value={knowledgeScope}
+            onChange={setKnowledgeScope}
+            disabled={isGenerating}
+            compact
+            className='mb-2'
+          />
           <PlaygroundInput
             disabled={isGenerating}
             groupValue={config.group}

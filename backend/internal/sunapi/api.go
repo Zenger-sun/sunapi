@@ -874,10 +874,10 @@ func RegisterPlaygroundRoutes(engine *gin.Engine, store *Store, base *handlers.B
 	pg.Use(playgroundAccessMetadata())
 	pg.Use(playgroundResolveAttachments(store))
 	{
-		pg.POST("/chat/completions", openaiHandlers.ChatCompletions)
-		pg.POST("/images/generations", openaiHandlers.ImagesGenerations)
-		pg.POST("/images/edits", openaiHandlers.ImagesEdits)
-		pg.POST("/videos", openaiHandlers.XAIVideosGenerations)
+		pg.POST("/chat/completions", playgroundKnowledgeHandler(store, "chat", openaiHandlers.ChatCompletions))
+		pg.POST("/images/generations", playgroundKnowledgeHandler(store, "image", openaiHandlers.ImagesGenerations))
+		pg.POST("/images/edits", playgroundKnowledgeHandler(store, "image", openaiHandlers.ImagesEdits))
+		pg.POST("/videos", playgroundKnowledgeHandler(store, "video", openaiHandlers.XAIVideosGenerations))
 		pg.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
 	}
 }

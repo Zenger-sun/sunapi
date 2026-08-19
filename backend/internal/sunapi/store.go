@@ -368,6 +368,49 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_time INTEGER NOT NULL,
 			updated_time INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_bases (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 0,
+			document_count INTEGER NOT NULL DEFAULT 0,
+			chunk_count INTEGER NOT NULL DEFAULT 0,
+			created_time INTEGER NOT NULL,
+			updated_time INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_documents (
+			id TEXT PRIMARY KEY,
+			knowledge_base_id TEXT NOT NULL,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			filename TEXT NOT NULL,
+			media_type TEXT NOT NULL DEFAULT '',
+			size INTEGER NOT NULL DEFAULT 0,
+			content_hash TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			created_time INTEGER NOT NULL,
+			updated_time INTEGER NOT NULL,
+			UNIQUE(knowledge_base_id, content_hash)
+		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_chunks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			document_id TEXT NOT NULL,
+			knowledge_base_id TEXT NOT NULL,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			chunk_index INTEGER NOT NULL,
+			content TEXT NOT NULL,
+			created_time INTEGER NOT NULL,
+			UNIQUE(document_id, chunk_index)
+		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_bindings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			knowledge_base_id TEXT NOT NULL,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			target_type TEXT NOT NULL,
+			target_id TEXT NOT NULL DEFAULT '',
+			created_time INTEGER NOT NULL,
+			UNIQUE(knowledge_base_id, target_type, target_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS agent_execution_logs (
 			id TEXT PRIMARY KEY,
 			blueprint_id TEXT NOT NULL,
@@ -386,6 +429,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_agent_blueprints_user ON agent_blueprints(user_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_skills_user ON agent_skills(user_id, created_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_components_user ON agent_components(user_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_bases_user ON knowledge_bases(user_id, updated_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_documents_base ON knowledge_documents(knowledge_base_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_base ON knowledge_chunks(user_id, knowledge_base_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_base ON knowledge_bindings(knowledge_base_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_scope ON knowledge_bindings(user_id, target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_execution_logs_blueprint ON agent_execution_logs(blueprint_id, start_time DESC)`,
 	}
 	for _, stmt := range stmts {

@@ -40,6 +40,7 @@ import type {
   ImageGenerationParams,
   ImageResolutionPreset,
 } from '../types'
+import { KnowledgeScopeSelector } from './knowledge-scope-selector'
 
 interface ImageParamsPanelProps {
   value: ImageGenerationParams
@@ -271,6 +272,20 @@ export function ImageParamsPanel({
             </Button>
           </div>
         </Field>
+
+        <KnowledgeScopeSelector
+          value={value}
+          disabled={disabled}
+          compact={compact}
+          onChange={(next) =>
+            onChange({
+              ...value,
+              knowledgeBaseIds: next.knowledgeBaseIds,
+              knowledgeDisabled: next.knowledgeDisabled,
+              knowledgeManual: next.knowledgeManual,
+            })
+          }
+        />
       </CollapsibleContent>
     </Collapsible>
   )

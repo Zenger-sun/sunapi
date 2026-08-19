@@ -12,6 +12,7 @@ permission from the SunAPI project owner.
 */
 import { useMemo, useState, useEffect, useRef } from 'react'
 import {
+  BookOpenIcon,
   BotIcon,
   MessageSquarePlus,
   SearchIcon,
@@ -27,6 +28,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
+import { CopyButton } from '@/components/copy-button'
 import { useLayout } from '@/context/layout-provider'
 import { Button } from '@/components/ui/button'
 import {
@@ -59,7 +61,12 @@ import {
 } from '../lib/agent-blueprints'
 import type { PlaygroundSession } from '../types'
 
-export type PlaygroundCapability = 'chat' | 'image' | 'video' | 'agent'
+export type PlaygroundCapability =
+  | 'chat'
+  | 'image'
+  | 'video'
+  | 'knowledge'
+  | 'agent'
 
 export type CapabilityDescriptor = {
   value: PlaygroundCapability
@@ -93,6 +100,12 @@ const CAPABILITY_META: Record<
     icon: FilmIcon,
     accent:
       'data-[active=true]:bg-amber-500/10 data-[active=true]:text-amber-600 dark:data-[active=true]:text-amber-300',
+  },
+  knowledge: {
+    label: 'Knowledge Base',
+    icon: BookOpenIcon,
+    accent:
+      'data-[active=true]:bg-cyan-500/10 data-[active=true]:text-cyan-600 dark:data-[active=true]:text-cyan-300',
   },
   agent: {
     label: 'Agents',
@@ -582,7 +595,13 @@ type CapabilityTabsProps = {
 
 function CapabilityTabs({ activeCapability, onChange }: CapabilityTabsProps) {
   const { t } = useTranslation()
-  const order: PlaygroundCapability[] = ['chat', 'image', 'video', 'agent']
+  const order: PlaygroundCapability[] = [
+    'chat',
+    'image',
+    'video',
+    'knowledge',
+    'agent',
+  ]
 
   return (
     <SidebarGroup className='px-2 pt-1 pb-1'>
@@ -811,6 +830,16 @@ function SessionItem({
                 </span>
               </span>
             </button>
+
+            {!isPending && (
+              <CopyButton
+                value={String(session.id)}
+                size='icon'
+                className='absolute top-1.5 right-8 size-6 p-0 opacity-0 group-hover/session:opacity-100'
+                iconClassName='size-3'
+                tooltip='复制对话 ID'
+              />
+            )}
 
             {!isPending && (
               <DropdownMenu>

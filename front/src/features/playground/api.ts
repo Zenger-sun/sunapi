@@ -32,6 +32,13 @@ import type {
   GroupOption,
   ImageGenerationItem,
   ImageGenerationParams,
+  KnowledgeBaseFormData,
+  KnowledgeBinding,
+  KnowledgeBindingFormData,
+  KnowledgeBaseItem,
+  KnowledgeAgentOption,
+  KnowledgeBlueprintOption,
+  KnowledgeDocumentItem,
   MessageAttachment,
   PlaygroundAttachment,
   PlaygroundSession,
@@ -448,6 +455,166 @@ export async function deleteAgentSkill(id: string): Promise<void> {
   }
 }
 
+export async function listKnowledgeBases(): Promise<KnowledgeBaseItem[]> {
+  const res = await api.get(API_ENDPOINTS.KNOWLEDGE_BASES, {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list knowledge bases')
+  }
+  return data.data as KnowledgeBaseItem[]
+}
+
+export async function createKnowledgeBase(
+  payload: KnowledgeBaseFormData
+): Promise<KnowledgeBaseItem> {
+  const res = await api.post(API_ENDPOINTS.KNOWLEDGE_BASES, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to create knowledge base')
+  }
+  return data.data as KnowledgeBaseItem
+}
+
+export async function updateKnowledgeBase(
+  id: string,
+  payload: KnowledgeBaseFormData
+): Promise<KnowledgeBaseItem> {
+  const res = await api.put(`${API_ENDPOINTS.KNOWLEDGE_BASES}/${id}`, payload, {
+    skipBusinessError: true,
+    skipErrorHandler: true,
+  })
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to update knowledge base')
+  }
+  return data.data as KnowledgeBaseItem
+}
+
+export async function toggleKnowledgeBase(
+  id: string,
+  enabled: boolean
+): Promise<void> {
+  const res = await api.put(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${id}/toggle`,
+    { enabled },
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Failed to toggle knowledge base')
+  }
+}
+
+export async function deleteKnowledgeBase(id: string): Promise<void> {
+  const res = await api.delete(`${API_ENDPOINTS.KNOWLEDGE_BASES}/${id}`, {
+    skipErrorHandler: true,
+  })
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Failed to delete knowledge base')
+  }
+}
+
+export async function listKnowledgeBindings(
+  knowledgeBaseId: string
+): Promise<KnowledgeBinding[]> {
+  const res = await api.get(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/bindings`,
+    { skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list knowledge bindings')
+  }
+  return data.data as KnowledgeBinding[]
+}
+
+export async function setKnowledgeBindings(
+  knowledgeBaseId: string,
+  bindings: KnowledgeBindingFormData[]
+): Promise<KnowledgeBinding[]> {
+  const res = await api.put(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/bindings`,
+    { bindings },
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to save knowledge bindings')
+  }
+  return data.data as KnowledgeBinding[]
+}
+
+export async function listKnowledgeAgents(): Promise<KnowledgeAgentOption[]> {
+  const res = await api.get('/api/agents', { skipErrorHandler: true })
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list agents')
+  }
+  return data.data as KnowledgeAgentOption[]
+}
+
+export async function listKnowledgeBlueprints(
+  agentId: string
+): Promise<KnowledgeBlueprintOption[]> {
+  const res = await api.get(`/api/agents/${agentId}/blueprints`, {
+    skipErrorHandler: true,
+  })
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list blueprints')
+  }
+  return data.data as KnowledgeBlueprintOption[]
+}
+
+export async function listKnowledgeDocuments(
+  knowledgeBaseId: string
+): Promise<KnowledgeDocumentItem[]> {
+  const res = await api.get(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/documents`,
+    { skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list knowledge documents')
+  }
+  return data.data as KnowledgeDocumentItem[]
+}
+
+export async function uploadKnowledgeDocument(
+  knowledgeBaseId: string,
+  file: File
+): Promise<KnowledgeDocumentItem> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const res = await api.post(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/documents`,
+    formData,
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to upload knowledge document')
+  }
+  return data.data as KnowledgeDocumentItem
+}
+
+export async function deleteKnowledgeDocument(
+  knowledgeBaseId: string,
+  documentId: string
+): Promise<void> {
+  const res = await api.delete(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/documents/${documentId}`,
+    { skipErrorHandler: true }
+  )
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Failed to delete knowledge document')
+  }
+}
+
 export async function getImageGenerationHistory(): Promise<
   ImageGenerationItem[]
 > {
@@ -560,6 +727,8 @@ type ImageGenerationRequestPayload = {
   style: ImageGenerationParams['style']
   n: number
   seed: number | null
+  knowledge_base_ids?: string[]
+  knowledge_disabled?: boolean
   images?: Array<{ image_url: string }>
   response_format: 'url'
 }
@@ -575,6 +744,9 @@ function buildImageGenerationRequest(payload: {
   style: ImageGenerationParams['style']
   n: number
   seed: number | null
+  knowledge_base_ids?: string[]
+  knowledge_disabled?: boolean
+  knowledge_manual?: boolean
   reference_images?: MessageAttachment[]
 }): ImageGenerationRequestPayload {
   const referenceImages =
@@ -602,6 +774,13 @@ function buildImageGenerationRequest(payload: {
     style: payload.style,
     n: payload.n,
     seed: payload.seed,
+    ...(payload.knowledge_base_ids?.length
+      ? { knowledge_base_ids: payload.knowledge_base_ids }
+      : {}),
+    ...(payload.knowledge_disabled ||
+    (payload.knowledge_manual && !payload.knowledge_base_ids?.length)
+      ? { knowledge_disabled: true }
+      : {}),
   }
   return {
     ...requestPayload,
@@ -621,6 +800,9 @@ export async function generateImage(payload: {
   style: ImageGenerationParams['style']
   n: number
   seed: number | null
+  knowledge_base_ids?: string[]
+  knowledge_disabled?: boolean
+  knowledge_manual?: boolean
   reference_images?: MessageAttachment[]
 }): Promise<ImageGenerationResponse> {
   const requestPayload = buildImageGenerationRequest(payload)
@@ -649,6 +831,9 @@ export async function startImageGenerationTask(
     style: item.params.style,
     n: item.params.n,
     seed: item.params.seed,
+    knowledge_base_ids: item.params.knowledgeBaseIds,
+    knowledge_disabled: item.params.knowledgeDisabled,
+    knowledge_manual: item.params.knowledgeManual,
     reference_images: item.referenceImages,
   })
   const res = await api.post(
@@ -744,6 +929,9 @@ export async function submitVideoTask(payload: {
   aspect_ratio: VideoGenerationParams['aspectRatio']
   resolution: VideoGenerationParams['resolution']
   seed: number | null
+  knowledge_base_ids?: string[]
+  knowledge_disabled?: boolean
+  knowledge_manual?: boolean
   reference_images?: MessageAttachment[]
 }): Promise<VideoTaskResponse> {
   const referenceImages =
@@ -763,6 +951,13 @@ export async function submitVideoTask(payload: {
       aspect_ratio: payload.aspect_ratio,
       resolution: payload.resolution,
       seed: payload.seed ?? undefined,
+      ...(payload.knowledge_base_ids?.length
+        ? { knowledge_base_ids: payload.knowledge_base_ids }
+        : {}),
+      ...(payload.knowledge_disabled ||
+      (payload.knowledge_manual && !payload.knowledge_base_ids?.length)
+        ? { knowledge_disabled: true }
+        : {}),
       ...(inputImage ? { image: inputImage } : {}),
       ...(referenceImages.length > 1
         ? { reference_images: referenceImages.slice(0, 7) }

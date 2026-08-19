@@ -21,6 +21,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { SectionPageLayout } from '@/components/layout'
+import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -266,6 +267,16 @@ function AgentDetailPanel({ agent }: { agent: Agent }) {
               {agent.description}
             </p>
           )}
+          <div className='text-muted-foreground mt-1 flex items-center gap-1 text-[10px]'>
+            <span className='truncate'>ID: {agent.id}</span>
+            <CopyButton
+              value={agent.id}
+              size='icon'
+              className='size-4 p-0'
+              iconClassName='size-2.5'
+              tooltip='复制智能体 ID'
+            />
+          </div>
         </div>
       </div>
 

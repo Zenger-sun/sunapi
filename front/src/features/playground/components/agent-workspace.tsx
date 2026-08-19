@@ -50,6 +50,7 @@ import {
 import '@xyflow/react/dist/style.css'
 import {
   BellIcon,
+  BookOpenIcon,
   BotIcon,
   ChartNetworkIcon,
   CheckCircle2Icon,
@@ -76,6 +77,7 @@ import {
   SparklesIcon,
   StopCircleIcon,
   Table2Icon,
+  TriangleAlertIcon,
   Trash2Icon,
   Undo2Icon,
   UploadIcon,
@@ -165,6 +167,8 @@ import type {
   GroupOption,
   ModelOption,
 } from '../types'
+import { KnowledgeBaseManager } from './knowledge-base-manager'
+import type { KnowledgeScopeValue } from './knowledge-scope-selector'
 
 type AgentNodeKind =
   | 'start'
@@ -339,7 +343,7 @@ type SkillStore = {
   builtin?: boolean
 }
 
-type AgentToolPanel = 'components' | 'skills'
+type AgentToolPanel = 'components' | 'skills' | 'knowledge'
 
 type BuiltinSkillDefinition = SkillChoice & {
   appliesTo: AgentNodeKind[]
@@ -408,6 +412,7 @@ type SavedAgentBlueprint = {
   backendAgentId?: string
   backendBlueprintId?: string
   syncState?: 'synced' | 'draft'
+  knowledgeScope?: KnowledgeScopeValue
 }
 
 type BlueprintChoice = {
@@ -1245,6 +1250,9 @@ export function AgentWorkspace({
   const [blueprintTitle, setBlueprintTitle] = useState(
     initialBlueprint?.title ?? '自动化任务蓝图'
   )
+  const [knowledgeScope, setKnowledgeScope] = useState<KnowledgeScopeValue>(
+    initialBlueprint?.knowledgeScope ?? {}
+  )
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(
     initialBlueprint && !isLocalBlueprintDraft(initialBlueprint)
       ? initialBlueprint.updatedAt
@@ -1665,6 +1673,7 @@ export function AgentWorkspace({
     bumpHistoryVersion()
     setBlueprintTitle('新的智能体蓝图')
     setCurrentBlueprintId(null)
+    setKnowledgeScope({})
     setLastSavedAt(null)
     setNodes(createInitialNodes(templates))
     setEdges(INITIAL_EDGES.map((edge) => decorateEdge(edge)))
@@ -1707,6 +1716,7 @@ export function AgentWorkspace({
       backendAgentId: existing?.backendAgentId,
       backendBlueprintId: existing?.backendBlueprintId,
       syncState: 'draft',
+      knowledgeScope,
     }
 
     setBlueprintTitle(title)
@@ -1756,6 +1766,7 @@ export function AgentWorkspace({
     edges,
     executionLog,
     nodes,
+    knowledgeScope,
     refreshBackendExecutionLogs,
   ])
 
@@ -1771,6 +1782,7 @@ export function AgentWorkspace({
       bumpHistoryVersion()
       setCurrentBlueprintId(blueprint.id)
       setBlueprintTitle(blueprint.title)
+      setKnowledgeScope(blueprint.knowledgeScope ?? {})
       setLastSavedAt(
         isLocalBlueprintDraft(blueprint) ? null : blueprint.updatedAt
       )
@@ -2515,6 +2527,7 @@ export function AgentWorkspace({
             value: blueprint.backendBlueprintId!,
           }))}
         blueprintTitle={blueprintTitle}
+        knowledgeScope={knowledgeScope}
         backendExecutionLogs={backendExecutionLogs}
         canRedo={canRedoBlueprint}
         canUndo={canUndoBlueprint}
@@ -2548,6 +2561,7 @@ export function AgentWorkspace({
         onRunPreview={handleRunPreview}
         onStopPreview={handleStopPreview}
         onSaveBlueprint={handleSaveBlueprint}
+        onKnowledgeScopeChange={setKnowledgeScope}
         onSearchChange={setSearch}
         onSelectNode={setSelectedNodeId}
         onSetNodeSkill={handleSetNodeSkill}
@@ -2581,6 +2595,7 @@ type BlueprintWorkspaceProps = {
   isComponentCatalogLoading: boolean
   isSkillCatalogLoading: boolean
   blueprintTitle: string
+  knowledgeScope: KnowledgeScopeValue
   backendExecutionLogs: AgentExecutionLog[]
   canRedo: boolean
   canUndo: boolean
@@ -2604,6 +2619,7 @@ type BlueprintWorkspaceProps = {
   onDeleteEdge: (edgeId: string) => void
   onTitleChange: (value: string) => void
   onSaveBlueprint: () => void
+  onKnowledgeScopeChange: (value: KnowledgeScopeValue) => void
   onUpdateNode: (patch: Partial<AgentNodeData>) => void
   onUpdateSetting: (key: string, value: string) => void
   onAddSkill: (skill: SkillChoice) => Promise<void>
@@ -2634,6 +2650,7 @@ function BlueprintWorkspace({
   isComponentCatalogLoading,
   isSkillCatalogLoading,
   blueprintTitle,
+  knowledgeScope,
   backendExecutionLogs,
   canRedo,
   canUndo,
@@ -2654,6 +2671,7 @@ function BlueprintWorkspace({
   onDeleteEdge,
   onTitleChange,
   onSaveBlueprint,
+  onKnowledgeScopeChange,
   onUpdateNode,
   onUpdateSetting,
   onAddSkill,
@@ -2727,11 +2745,13 @@ function BlueprintWorkspace({
           marketplaceSkills={marketplaceSkills}
           managedSkills={managedSkills}
           modelChoices={modelChoices}
+          knowledgeScope={knowledgeScope}
           onAddNode={onAddNode}
           onAddSkill={onAddSkill}
           onCreateComponent={onCreateComponent}
           onDeleteComponent={onDeleteComponent}
           onDeleteSkill={onDeleteSkill}
+          onKnowledgeScopeChange={onKnowledgeScopeChange}
           onPanelChange={setActiveToolPanel}
           onSearchChange={onSearchChange}
           search={search}
@@ -2765,99 +2785,86 @@ function BlueprintWorkspace({
                 />
                 <div className='text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11px]'>
                   <span className='truncate'>
-                    {nodes.length} 个步骤 · {edges.length} 条连线 ·{' '}
+                    {nodes.length} 个节点 · {edges.length} 条连线 ·{' '}
                     {getAgentBlueprintStatusLabel(currentBlueprintStatus)}
                     {lastSavedAt
                       ? ` · ${formatBlueprintTime(lastSavedAt)} 已保存`
                       : ''}
                   </span>
-                  <span
-                    className={cn(
-                      'shrink-0 font-medium',
-                      workflowReadiness.ready
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : 'text-amber-600 dark:text-amber-400'
-                    )}
-                    title={workflowReadiness.issues
-                      .map((issue) => issue.message)
-                      .join('\n')}
-                  >
-                    {workflowReadiness.ready
-                      ? '流程已闭环'
-                      : `待完善 ${workflowReadiness.issues.length} 项`}
-                  </span>
                 </div>
-                <WorkflowStageStrip readiness={workflowReadiness} />
               </div>
             </div>
 
-            <TooltipProvider>
-              <div className='bg-background/88 border-border/70 pointer-events-auto flex items-center gap-1 rounded-[8px] border p-1 shadow-sm backdrop-blur'>
-                <CanvasToolbarButton label='重置' onClick={onReset}>
-                  <RotateCcwIcon className='size-3.5' />
-                </CanvasToolbarButton>
-                <CanvasToolbarButton
-                  label='前一步'
-                  disabled={!canUndo}
-                  onClick={onUndo}
-                >
-                  <Undo2Icon className='size-3.5' />
-                </CanvasToolbarButton>
-                <CanvasToolbarButton
-                  label='后一步'
-                  disabled={!canRedo}
-                  onClick={onRedo}
-                >
-                  <Redo2Icon className='size-3.5' />
-                </CanvasToolbarButton>
-                <CanvasToolbarButton label='保存' onClick={onSaveBlueprint}>
-                  <SaveIcon className='size-3.5' />
-                </CanvasToolbarButton>
-                {hasScheduledBlueprint ? (
-                  <>
-                    {currentBlueprintStatus === 'paused' ? (
-                      <CanvasToolbarButton
-                        label='继续定时'
-                        onClick={() => onRunPreview()}
-                      >
-                        <PlayIcon className='size-3.5' />
-                      </CanvasToolbarButton>
-                    ) : (
-                      <CanvasToolbarButton
-                        label='暂停定时'
-                        variant='destructive'
-                        onClick={onStopPreview}
-                      >
-                        <PauseIcon className='size-3.5' />
-                      </CanvasToolbarButton>
-                    )}
-                    {hasManualTrigger && (
-                      <CanvasToolbarButton
-                        label='立即运行一次'
-                        onClick={() => onRunPreview('manual')}
-                      >
-                        <ZapIcon className='size-3.5' />
-                      </CanvasToolbarButton>
-                    )}
-                  </>
-                ) : hasManualTrigger && currentBlueprintStatus === 'running' ? (
-                  <CanvasToolbarButton
-                    label='停止'
-                    variant='destructive'
-                    onClick={onStopPreview}
-                  >
-                    <StopCircleIcon className='size-3.5' />
+            <div className='pointer-events-auto flex max-w-full items-start gap-2'>
+              <TooltipProvider>
+                <div className='bg-background/88 border-border/70 flex items-center gap-1 rounded-[8px] border p-1 shadow-sm backdrop-blur'>
+                  <CanvasToolbarButton label='重置' onClick={onReset}>
+                    <RotateCcwIcon className='size-3.5' />
                   </CanvasToolbarButton>
-                ) : hasManualTrigger ? (
                   <CanvasToolbarButton
-                    label={getRunPreviewButtonLabel(currentBlueprintStatus)}
-                    onClick={() => onRunPreview()}
+                    label='前一步'
+                    disabled={!canUndo}
+                    onClick={onUndo}
                   >
-                    <ZapIcon className='size-3.5' />
+                    <Undo2Icon className='size-3.5' />
                   </CanvasToolbarButton>
-                ) : null}
-              </div>
-            </TooltipProvider>
+                  <CanvasToolbarButton
+                    label='后一步'
+                    disabled={!canRedo}
+                    onClick={onRedo}
+                  >
+                    <Redo2Icon className='size-3.5' />
+                  </CanvasToolbarButton>
+                  <CanvasToolbarButton label='保存' onClick={onSaveBlueprint}>
+                    <SaveIcon className='size-3.5' />
+                  </CanvasToolbarButton>
+                  {hasScheduledBlueprint ? (
+                    <>
+                      {currentBlueprintStatus === 'paused' ? (
+                        <CanvasToolbarButton
+                          label='继续定时'
+                          onClick={() => onRunPreview()}
+                        >
+                          <PlayIcon className='size-3.5' />
+                        </CanvasToolbarButton>
+                      ) : (
+                        <CanvasToolbarButton
+                          label='暂停定时'
+                          variant='destructive'
+                          onClick={onStopPreview}
+                        >
+                          <PauseIcon className='size-3.5' />
+                        </CanvasToolbarButton>
+                      )}
+                      {hasManualTrigger && (
+                        <CanvasToolbarButton
+                          label='立即运行一次'
+                          onClick={() => onRunPreview('manual')}
+                        >
+                          <ZapIcon className='size-3.5' />
+                        </CanvasToolbarButton>
+                      )}
+                    </>
+                  ) : hasManualTrigger &&
+                    currentBlueprintStatus === 'running' ? (
+                    <CanvasToolbarButton
+                      label='停止'
+                      variant='destructive'
+                      onClick={onStopPreview}
+                    >
+                      <StopCircleIcon className='size-3.5' />
+                    </CanvasToolbarButton>
+                  ) : hasManualTrigger ? (
+                    <CanvasToolbarButton
+                      label={getRunPreviewButtonLabel(currentBlueprintStatus)}
+                      onClick={() => onRunPreview()}
+                    >
+                      <ZapIcon className='size-3.5' />
+                    </CanvasToolbarButton>
+                  ) : null}
+                </div>
+              </TooltipProvider>
+            </div>
           </div>
 
           <ReactFlow<AgentFlowNode, AgentFlowEdge>
@@ -2930,6 +2937,7 @@ function BlueprintWorkspace({
               executionLog={executionLog}
               executionNodes={executionNodes}
               isOpen={isPreviewOpen}
+              readiness={workflowReadiness}
               selectedNode={selectedNode}
               skillChoices={skillChoices}
               onSelectNode={onSelectNode}
@@ -2957,27 +2965,47 @@ function BlueprintWorkspace({
   )
 }
 
-function WorkflowStageStrip({ readiness }: { readiness: WorkflowReadiness }) {
+function WorkflowStageStrip({
+  readiness,
+  className,
+}: {
+  readiness: WorkflowReadiness
+  className?: string
+}) {
   return (
-    <div className='mt-1.5 flex min-w-0 items-center gap-1 overflow-x-auto pb-0.5 whitespace-nowrap'>
+    <div
+      aria-label='调用流程缩略图'
+      className={cn(
+        'min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap',
+        className
+      )}
+    >
       {readiness.stages.map((stage, index) => (
         <div key={stage.label} className='flex shrink-0 items-center gap-1'>
           {index > 0 && (
             <span className='text-muted-foreground/60 text-[10px]' aria-hidden>
-              →
+              &rarr;
             </span>
           )}
           <span
+            title={
+              stage.complete
+                ? `${stage.label}阶段已就绪`
+                : stage.present
+                  ? `${stage.label}阶段待完善`
+                  : `缺少${stage.label}阶段`
+            }
             className={cn(
               'inline-flex items-center gap-1 rounded-[6px] border px-1.5 py-0.5 text-[10px] font-medium',
               stage.complete
                 ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                 : stage.present
                   ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                  : 'border-border/70 bg-muted/40 text-muted-foreground'
+                  : 'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300'
             )}
           >
             {stage.complete && <CheckCircle2Icon className='size-3' />}
+            {!stage.present && <TriangleAlertIcon className='size-3' />}
             {stage.label}
           </span>
         </div>
@@ -2987,6 +3015,7 @@ function WorkflowStageStrip({ readiness }: { readiness: WorkflowReadiness }) {
 }
 
 function Palette({
+  activePanel,
   groupChoices,
   groups,
   isComponentCatalogLoading,
@@ -2995,6 +3024,7 @@ function Palette({
   managedSkills,
   marketplaceSkills,
   modelChoices,
+  knowledgeScope,
   search,
   onSearchChange,
   onAddNode,
@@ -3002,6 +3032,8 @@ function Palette({
   onCreateComponent,
   onDeleteComponent,
   onDeleteSkill,
+  onKnowledgeScopeChange,
+  onPanelChange,
 }: {
   activePanel: AgentToolPanel
   groupChoices: GroupOption[]
@@ -3012,6 +3044,7 @@ function Palette({
   managedSkills: SkillChoice[]
   marketplaceSkills: SkillChoice[]
   modelChoices: ModelChoice[]
+  knowledgeScope: KnowledgeScopeValue
   search: string
   onSearchChange: (value: string) => void
   onAddNode: (templateKey: AgentNodeKind | string) => void
@@ -3019,32 +3052,55 @@ function Palette({
   onCreateComponent: (payload: AgentComponentFormData) => Promise<void>
   onDeleteComponent: (componentId: string) => Promise<void>
   onDeleteSkill: (skillValue: string) => Promise<void>
+  onKnowledgeScopeChange: (value: KnowledgeScopeValue) => void
   onPanelChange: (panel: AgentToolPanel) => void
 }) {
   return (
     <div className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
-      <Tabs defaultValue='components' className='flex min-h-0 flex-1 flex-col'>
+      <Tabs
+        value={activePanel}
+        onValueChange={(value) => onPanelChange(value as AgentToolPanel)}
+        className='flex min-h-0 flex-1 flex-col'
+      >
         {/* 顶部：标题 + Tab 导航 */}
         <div className='border-border/70 shrink-0 border-b px-3 pt-3'>
           <div className='mb-2.5 flex items-center gap-2'>
             <div className='bg-primary text-primary-foreground flex size-7 shrink-0 items-center justify-center rounded-[7px]'>
               <BotIcon className='size-3.5' />
             </div>
-            <span className='text-sm font-semibold'>流程步骤</span>
+            <span className='min-w-0 flex-1 truncate text-sm font-semibold'>
+              处理节点
+            </span>
+            <Button
+              type='button'
+              size='sm'
+              variant={activePanel === 'knowledge' ? 'secondary' : 'ghost'}
+              className='h-7 shrink-0 gap-1.5 rounded-[6px] px-2 text-xs'
+              aria-pressed={activePanel === 'knowledge'}
+              onClick={() => onPanelChange('knowledge')}
+            >
+              <BookOpenIcon className='size-3.5' />
+              知识库
+              {!!knowledgeScope.knowledgeBaseIds?.length && (
+                <span className='bg-background/80 rounded-full px-1.5 text-[10px] leading-[14px]'>
+                  {knowledgeScope.knowledgeBaseIds.length}
+                </span>
+              )}
+            </Button>
           </div>
 
           <TabsList className='h-7 w-full gap-0 rounded-none border-0 bg-transparent p-0'>
             <TabsTrigger
               value='components'
-              className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+              className='data-active:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-active:bg-transparent data-active:shadow-none'
             >
-              步骤
+              处理节点
             </TabsTrigger>
             <TabsTrigger
               value='skills'
-              className='data-[state=active]:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-[state=active]:bg-transparent data-[state=active]:shadow-none'
+              className='data-active:border-primary h-7 flex-1 rounded-none border-b-2 border-transparent bg-transparent px-2 text-xs font-medium shadow-none data-active:bg-transparent data-active:shadow-none'
             >
-              高级能力
+              Skill
               <span className='bg-muted text-muted-foreground ml-1 rounded-full px-1.5 py-0 text-[10px] leading-[14px]'>
                 {skillChoices.length}
               </span>
@@ -3064,7 +3120,7 @@ function Palette({
               <Input
                 value={search}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder='搜索步骤…'
+                placeholder='搜索处理节点…'
                 className='h-7 rounded-[7px] pl-7 text-xs'
               />
             </div>
@@ -3118,6 +3174,22 @@ function Palette({
               onDeleteSkill={onDeleteSkill}
             />
           </div>
+        </TabsContent>
+
+        <TabsContent
+          value='knowledge'
+          className='m-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden'
+        >
+          <KnowledgeBaseManager
+            selectedKnowledgeBaseIds={knowledgeScope.knowledgeBaseIds}
+            onSelectedKnowledgeBaseIdsChange={(knowledgeBaseIds) =>
+              onKnowledgeScopeChange({
+                knowledgeBaseIds,
+                knowledgeDisabled: knowledgeBaseIds.length === 0,
+                knowledgeManual: true,
+              })
+            }
+          />
         </TabsContent>
       </Tabs>
     </div>
@@ -5971,6 +6043,7 @@ function ExecutionPreviewDock({
   executionNodes,
   skillChoices,
   isOpen,
+  readiness,
   selectedNode,
   onSelectNode,
   onOpenChange,
@@ -5980,6 +6053,7 @@ function ExecutionPreviewDock({
   executionNodes: AgentFlowNode[]
   skillChoices: SkillChoice[]
   isOpen: boolean
+  readiness: WorkflowReadiness
   selectedNode: AgentFlowNode | null
   onSelectNode: (nodeId: string) => void
   onOpenChange: (open: boolean) => void
@@ -6022,7 +6096,31 @@ function ExecutionPreviewDock({
         )}
         <FileSpreadsheetIcon className='text-muted-foreground size-3.5 shrink-0' />
         <span className='text-xs font-semibold'>执行预览</span>
-        {showRuntimeSummary ? (
+        <WorkflowStageStrip
+          readiness={readiness}
+          className='hidden shrink-0 lg:flex'
+        />
+        <span
+          className={cn(
+            'flex min-w-0 items-center gap-1 text-[11px] font-medium',
+            readiness.ready
+              ? 'shrink-0 text-emerald-600 dark:text-emerald-400'
+              : 'flex-1 text-amber-700 dark:text-amber-300'
+          )}
+          title={readiness.issues.map((issue) => issue.message).join('\n')}
+        >
+          {readiness.ready ? (
+            <CheckCircle2Icon className='size-3 shrink-0' />
+          ) : (
+            <TriangleAlertIcon className='size-3 shrink-0' />
+          )}
+          <span className='truncate'>
+            {readiness.ready
+              ? '流程完整'
+              : `缺 ${readiness.issues.length} 项 · ${readiness.issues[0]?.message ?? '请完善调用流程。'}`}
+          </span>
+        </span>
+        {showRuntimeSummary && readiness.ready ? (
           <span className='text-muted-foreground flex min-w-0 flex-1 items-center gap-x-2 overflow-hidden text-[11px] whitespace-nowrap'>
             <span className='flex shrink-0 items-center gap-1'>
               <span
@@ -6054,15 +6152,53 @@ function ExecutionPreviewDock({
               </span>
             )}
           </span>
-        ) : (
+        ) : readiness.ready ? (
           <span className='text-muted-foreground truncate text-[11px]'>
             {executionNodes.length} 个节点 · 当前蓝图链路
           </span>
-        )}
+        ) : null}
       </button>
 
       {isOpen && (
         <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-hidden border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
+          {!readiness.ready && (
+            <div className='min-w-0 rounded-[8px] border border-amber-500/35 bg-amber-500/5 px-3 py-2 xl:col-span-2'>
+              <div className='flex items-center gap-1.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300'>
+                <TriangleAlertIcon className='size-3.5 shrink-0' />
+                调用流程还缺 {readiness.issues.length} 项
+              </div>
+              <div className='mt-1.5 flex max-h-14 flex-wrap gap-1 overflow-y-auto'>
+                {readiness.issues.map((issue, index) => {
+                  const content = (
+                    <>
+                      <span className='text-amber-700/70 dark:text-amber-300/70'>
+                        {index + 1}.
+                      </span>
+                      <span>{issue.message}</span>
+                    </>
+                  )
+                  return issue.nodeId ? (
+                    <button
+                      key={`${issue.nodeId}-${issue.message}`}
+                      type='button'
+                      className='bg-background inline-flex max-w-full items-center gap-1 rounded-[5px] border border-amber-500/30 px-1.5 py-0.5 text-left text-[10px] text-amber-800 transition-colors hover:bg-amber-500/10 dark:text-amber-200'
+                      onClick={() => onSelectNode(issue.nodeId!)}
+                      title='定位到对应节点'
+                    >
+                      {content}
+                    </button>
+                  ) : (
+                    <span
+                      key={`${index}-${issue.message}`}
+                      className='bg-background inline-flex max-w-full items-center gap-1 rounded-[5px] border border-amber-500/30 px-1.5 py-0.5 text-[10px] text-amber-800 dark:text-amber-200'
+                    >
+                      {content}
+                    </span>
+                  )
+                })}
+              </div>
+            </div>
+          )}
           {showRuntimeSummary && (
             <div className='border-border/70 bg-muted/10 min-w-0 rounded-[8px] border px-3 py-2 xl:col-span-2'>
               <div className='text-muted-foreground flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px]'>
@@ -8635,6 +8771,21 @@ function savedBlueprintFromBackend(
     backendAgentId: agentId,
     backendBlueprintId: backendBlueprint.id,
     syncState: 'synced',
+    knowledgeScope: knowledgeScopeFromBackendBlueprint(backendBlueprint),
+  }
+}
+
+function knowledgeScopeFromBackendBlueprint(
+  blueprint: Blueprint
+): KnowledgeScopeValue {
+  const rawIDs = blueprint.input_variables?.knowledge_base_ids
+  const knowledgeBaseIds = Array.isArray(rawIDs)
+    ? rawIDs.filter((value): value is string => typeof value === 'string')
+    : []
+  return {
+    knowledgeBaseIds,
+    knowledgeDisabled: knowledgeBaseIds.length === 0,
+    knowledgeManual: true,
   }
 }
 
@@ -8846,6 +8997,9 @@ function buildBackendInputVariables(
     saved_at: blueprint.updatedAt,
     nodes_count: blueprint.nodes.length,
     edges_count: blueprint.edges.length,
+    knowledge_base_ids: blueprint.knowledgeScope?.knowledgeBaseIds ?? [],
+    knowledge_disabled: !blueprint.knowledgeScope?.knowledgeBaseIds?.length,
+    knowledge_manual: true,
   }
 }
 

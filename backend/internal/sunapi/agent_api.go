@@ -50,6 +50,19 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	api.POST("/agents/browser-capture", handleCaptureAgentBrowserPage(store))
 	api.POST("/agents/http-request", handleAgentHTTPRequest(store))
 
+	// ── 创作台知识库 ────────────────────────────────────────────────────
+	api.GET("/knowledge-bases", handleListKnowledgeBases(store))
+	api.POST("/knowledge-bases", handleCreateKnowledgeBase(store))
+	api.POST("/knowledge-bases/search", handleSearchKnowledge(store))
+	api.PUT("/knowledge-bases/:id", handleUpdateKnowledgeBase(store))
+	api.PUT("/knowledge-bases/:id/toggle", handleToggleKnowledgeBase(store))
+	api.GET("/knowledge-bases/:id/bindings", handleListKnowledgeBindings(store))
+	api.PUT("/knowledge-bases/:id/bindings", handleSetKnowledgeBindings(store))
+	api.DELETE("/knowledge-bases/:id", handleDeleteKnowledgeBase(store))
+	api.GET("/knowledge-bases/:id/documents", handleListKnowledgeDocuments(store))
+	api.POST("/knowledge-bases/:id/documents", handleUploadKnowledgeDocument(store))
+	api.DELETE("/knowledge-bases/:id/documents/:docID", handleDeleteKnowledgeDocument(store))
+
 	// ── Skill CRUD ────────────────────────────────────────────────────────
 	api.GET("/agent-skills", handleListSkills(store))
 	api.GET("/agent-skills/marketplace", handleListSkillMarketplace(store))

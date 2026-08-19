@@ -97,6 +97,9 @@ func startPlaygroundImageTask(
 	}
 
 	requestBody := normalizePlaygroundImageTaskRequest(rawRequest, saved)
+	if enriched, enrichErr := enrichPlaygroundKnowledgeRequest(ctx, store, userID, "image", requestBody); enrichErr == nil {
+		requestBody = enriched
+	}
 	go runPlaygroundImageTask(store, imageHandlers, userID, saved, requestBody)
 	return saved, nil
 }

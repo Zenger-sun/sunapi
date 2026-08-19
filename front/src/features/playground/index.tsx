@@ -13,6 +13,7 @@ permission from the SunAPI project owner.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import { BookOpenIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { AuthenticatedLayout } from '@/components/layout'
 import { getUserGroups, getUserModels } from './api'
@@ -28,6 +29,7 @@ import {
   PlaygroundSidebar,
   type PlaygroundCapability,
 } from './components/playground-sidebar'
+import { KnowledgeBaseManager } from './components/knowledge-base-manager'
 import {
   useVideoDefaultParams,
   VideoNotice,
@@ -237,6 +239,7 @@ export function Playground() {
               messages={messages}
               models={models}
               groups={groups}
+              activeSessionId={activeSessionId}
               isLoadingModels={isLoadingModels}
               onConfigChange={updateConfig}
               updateMessages={updateMessages}
@@ -274,6 +277,27 @@ export function Playground() {
               onGroupChange={(value) => updateConfig('group', value)}
               onGeneratingChange={setIsWorkspaceGenerating}
             />
+          )}
+
+          {activeCapability === 'knowledge' && (
+            <div className='flex min-h-0 flex-1 flex-col p-3 md:p-4'>
+              <div className='mb-3 flex shrink-0 items-center gap-2 px-1'>
+                <div className='bg-primary/10 text-primary flex size-8 items-center justify-center rounded-lg'>
+                  <BookOpenIcon className='size-4' />
+                </div>
+                <div className='min-w-0'>
+                  <h1 className='text-base font-semibold'>
+                    {t('Knowledge Base')}
+                  </h1>
+                  <p className='text-muted-foreground text-xs'>
+                    {t('Manage reusable documents for agent retrieval.')}
+                  </p>
+                </div>
+              </div>
+              <div className='border-border/60 bg-muted/20 flex min-h-0 flex-1 overflow-hidden rounded-2xl border'>
+                <KnowledgeBaseManager />
+              </div>
+            </div>
           )}
 
           {activeCapability === 'agent' && (

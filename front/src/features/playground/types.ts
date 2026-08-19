@@ -75,6 +75,9 @@ export interface ChatCompletionRequest {
   group?: string
   messages: ChatCompletionMessage[]
   stream: boolean
+  knowledge_disabled?: boolean
+  knowledge_base_ids?: string[]
+  knowledge_conversation_id?: number
   temperature?: number
   top_p?: number
   max_tokens?: number
@@ -238,6 +241,70 @@ export interface AgentSkillFormData {
   config?: Record<string, unknown>
 }
 
+export interface KnowledgeBaseItem {
+  id: string
+  user_id: number
+  name: string
+  description?: string
+  enabled: boolean
+  document_count: number
+  chunk_count: number
+  created_time: number
+  updated_time: number
+  bindings?: KnowledgeBinding[]
+}
+
+export type KnowledgeBindingTargetType =
+  | 'module'
+  | 'agent'
+  | 'blueprint'
+  | 'conversation'
+
+export interface KnowledgeBinding {
+  id: number
+  knowledge_base_id: string
+  user_id: number
+  target_type: KnowledgeBindingTargetType
+  target_id: string
+  created_time: number
+}
+
+export interface KnowledgeBindingFormData {
+  target_type: KnowledgeBindingTargetType
+  target_id: string
+}
+
+export interface KnowledgeAgentOption {
+  id: string
+  name: string
+  blueprint_count?: number
+}
+
+export interface KnowledgeBlueprintOption {
+  id: string
+  agent_id: string
+  name: string
+  status?: string
+}
+
+export interface KnowledgeBaseFormData {
+  name: string
+  description?: string
+}
+
+export interface KnowledgeDocumentItem {
+  id: string
+  knowledge_base_id: string
+  user_id: number
+  filename: string
+  media_type?: string
+  size: number
+  content_hash: string
+  chunk_count: number
+  created_time: number
+  updated_time: number
+}
+
 export interface AgentBrowserCaptureRequest {
   url: string
   login_state?: string
@@ -383,6 +450,9 @@ export interface ImageGenerationParams {
   n: number
   seed: number | null
   negativePrompt: string
+  knowledgeBaseIds?: string[]
+  knowledgeDisabled?: boolean
+  knowledgeManual?: boolean
 }
 
 export interface ImageGenerationItem {
@@ -417,6 +487,9 @@ export interface VideoGenerationParams {
   resolution: VideoResolutionPreset
   durationSec: number
   seed: number | null
+  knowledgeBaseIds?: string[]
+  knowledgeDisabled?: boolean
+  knowledgeManual?: boolean
 }
 
 export interface VideoGenerationItem {

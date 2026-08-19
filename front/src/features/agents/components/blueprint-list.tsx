@@ -33,6 +33,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/copy-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -134,6 +135,16 @@ function BlueprintCard({
             {blueprint.description}
           </p>
         )}
+        <div className='text-muted-foreground flex items-center gap-1 text-[10px]'>
+          <span className='truncate'>蓝图 ID: {blueprint.id}</span>
+          <CopyButton
+            value={blueprint.id}
+            size='icon'
+            className='size-4 p-0'
+            iconClassName='size-2.5'
+            tooltip='复制蓝图 ID'
+          />
+        </div>
 
         {/* 执行信息行 */}
         <div className='text-muted-foreground mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs'>
