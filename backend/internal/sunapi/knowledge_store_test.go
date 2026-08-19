@@ -24,8 +24,8 @@ func TestKnowledgeBaseLifecycleAndSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if base.Enabled {
-		t.Fatal("new knowledge bases should be disabled by default")
+	if !base.Enabled {
+		t.Fatal("knowledge bases should be available for explicit selection")
 	}
 	document, err := store.AddKnowledgeDocument(ctx, base.ID, 7, "manual.md", "text/markdown", 42, "SunAPI 创作台支持知识库检索。\n知识库可以被开启并注入模型上下文。")
 	if err != nil {
@@ -34,17 +34,23 @@ func TestKnowledgeBaseLifecycleAndSearch(t *testing.T) {
 	if document.ChunkCount == 0 {
 		t.Fatal("document should be chunked")
 	}
-	beforeEnable, err := store.SearchKnowledge(ctx, 7, "知识库检索", 5)
+	loadedDocument, err := store.GetKnowledgeDocument(ctx, base.ID, document.ID, 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(beforeEnable) != 0 {
-		t.Fatal("disabled knowledge bases must not be searched")
+	if loadedDocument == nil || strings.TrimSpace(loadedDocument.Content) == "" {
+		t.Fatal("document content should be available for preview")
 	}
-	if err := store.ToggleKnowledgeBase(ctx, base.ID, 7, true); err != nil {
+	beforeSelection, err := store.SearchKnowledge(ctx, 7, "知识库检索", 5)
+	if err != nil {
 		t.Fatal(err)
 	}
-	matches, err := store.SearchKnowledge(ctx, 7, "开启知识库", 5)
+	if len(beforeSelection) != 0 {
+		t.Fatal("knowledge search without an explicit selection must be empty")
+	}
+	matches, err := store.SearchKnowledgeForScope(ctx, 7, "开启知识库", 5, KnowledgeSearchScope{
+		KnowledgeBaseIDs: []string{base.ID},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

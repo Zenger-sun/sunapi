@@ -60,22 +60,6 @@ func handleUpdateKnowledgeBase(store *Store) gin.HandlerFunc {
 	}
 }
 
-func handleToggleKnowledgeBase(store *Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var body struct {
-			Enabled bool `json:"enabled"`
-		}
-		if !bindJSON(c, &body) {
-			return
-		}
-		if err := store.ToggleKnowledgeBase(c.Request.Context(), strings.TrimSpace(c.Param("id")), playgroundUserID(c), body.Enabled); err != nil {
-			fail(c, http.StatusBadRequest, err)
-			return
-		}
-		ok(c, gin.H{"enabled": body.Enabled})
-	}
-}
-
 func handleDeleteKnowledgeBase(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if err := store.DeleteKnowledgeBase(c.Request.Context(), strings.TrimSpace(c.Param("id")), playgroundUserID(c)); err != nil {
@@ -120,6 +104,23 @@ func handleListKnowledgeDocuments(store *Store) gin.HandlerFunc {
 			return
 		}
 		ok(c, items)
+	}
+}
+
+func handleGetKnowledgeDocument(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		item, err := store.GetKnowledgeDocument(
+			c.Request.Context(), strings.TrimSpace(c.Param("id")), strings.TrimSpace(c.Param("docID")), playgroundUserID(c),
+		)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		if item == nil {
+			fail(c, http.StatusNotFound, errors.New("knowledge document not found"))
+			return
+		}
+		ok(c, item)
 	}
 }
 
@@ -173,8 +174,10 @@ func handleDeleteKnowledgeDocument(store *Store) gin.HandlerFunc {
 func handleSearchKnowledge(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var body struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
+			Query            string   `json:"query"`
+			Limit            int      `json:"limit"`
+			KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+			Disabled         bool     `json:"disabled"`
 		}
 		if !bindJSON(c, &body) {
 			return
@@ -183,7 +186,10 @@ func handleSearchKnowledge(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusBadRequest, errors.New("search query is required"))
 			return
 		}
-		items, err := store.SearchKnowledge(c.Request.Context(), playgroundUserID(c), body.Query, body.Limit)
+		items, err := store.SearchKnowledgeForScope(c.Request.Context(), playgroundUserID(c), body.Query, body.Limit, KnowledgeSearchScope{
+			KnowledgeBaseIDs: body.KnowledgeBaseIDs,
+			Disabled:         body.Disabled,
+		})
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return

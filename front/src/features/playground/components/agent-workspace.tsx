@@ -167,8 +167,10 @@ import type {
   GroupOption,
   ModelOption,
 } from '../types'
-import { KnowledgeBaseManager } from './knowledge-base-manager'
-import type { KnowledgeScopeValue } from './knowledge-scope-selector'
+import {
+  KnowledgeScopeSelector,
+  type KnowledgeScopeValue,
+} from './knowledge-scope-selector'
 
 type AgentNodeKind =
   | 'start'
@@ -3180,15 +3182,10 @@ function Palette({
           value='knowledge'
           className='m-0 flex min-h-0 flex-1 flex-col data-[state=inactive]:hidden'
         >
-          <KnowledgeBaseManager
-            selectedKnowledgeBaseIds={knowledgeScope.knowledgeBaseIds}
-            onSelectedKnowledgeBaseIdsChange={(knowledgeBaseIds) =>
-              onKnowledgeScopeChange({
-                knowledgeBaseIds,
-                knowledgeDisabled: knowledgeBaseIds.length === 0,
-                knowledgeManual: true,
-              })
-            }
+          <KnowledgeScopeSelector
+            value={knowledgeScope}
+            onChange={onKnowledgeScopeChange}
+            className='mx-2 my-2'
           />
         </TabsContent>
       </Tabs>

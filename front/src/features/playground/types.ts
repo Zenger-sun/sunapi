@@ -300,6 +300,7 @@ export interface KnowledgeDocumentItem {
   media_type?: string
   size: number
   content_hash: string
+  content?: string
   chunk_count: number
   created_time: number
   updated_time: number

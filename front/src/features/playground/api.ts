@@ -495,20 +495,6 @@ export async function updateKnowledgeBase(
   return data.data as KnowledgeBaseItem
 }
 
-export async function toggleKnowledgeBase(
-  id: string,
-  enabled: boolean
-): Promise<void> {
-  const res = await api.put(
-    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${id}/toggle`,
-    { enabled },
-    { skipBusinessError: true, skipErrorHandler: true }
-  )
-  if (!res.data.success) {
-    throw new Error(res.data.message || 'Failed to toggle knowledge base')
-  }
-}
-
 export async function deleteKnowledgeBase(id: string): Promise<void> {
   const res = await api.delete(`${API_ENDPOINTS.KNOWLEDGE_BASES}/${id}`, {
     skipErrorHandler: true,
@@ -582,6 +568,21 @@ export async function listKnowledgeDocuments(
     throw new Error(data.message || 'Failed to list knowledge documents')
   }
   return data.data as KnowledgeDocumentItem[]
+}
+
+export async function getKnowledgeDocument(
+  knowledgeBaseId: string,
+  documentId: string
+): Promise<KnowledgeDocumentItem> {
+  const res = await api.get(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/documents/${documentId}`,
+    { skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to get knowledge document')
+  }
+  return data.data as KnowledgeDocumentItem
 }
 
 export async function uploadKnowledgeDocument(

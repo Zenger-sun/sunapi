@@ -10,7 +10,7 @@ This source is available for evaluation, but modification, redistribution,
 hosting, sale, resale, sublicensing, or commercial use requires prior written
 permission from the SunAPI project owner.
 */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { BookOpenIcon, Loader2Icon } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
@@ -20,7 +20,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { listKnowledgeBases } from '../api'
 import type { KnowledgeBaseItem } from '../types'
 
-type KnowledgeMode = 'auto' | 'manual' | 'off'
+type KnowledgeMode = 'manual' | 'off'
 
 export interface KnowledgeScopeValue {
   knowledgeBaseIds?: string[]
@@ -68,16 +68,12 @@ export function KnowledgeScopeSelector({
     }
   }, [])
 
-  const enabledItems = useMemo(
-    () => items.filter((item) => item.enabled),
-    [items]
-  )
   const selectedIds = value.knowledgeBaseIds ?? []
-  const mode: KnowledgeMode = value.knowledgeDisabled
-    ? 'off'
-    : value.knowledgeManual || selectedIds.length > 0
+  const mode: KnowledgeMode =
+    !value.knowledgeDisabled &&
+    (value.knowledgeManual || selectedIds.length > 0)
       ? 'manual'
-      : 'auto'
+      : 'off'
 
   const setMode = (nextMode: KnowledgeMode) => {
     if (nextMode === 'off') {
@@ -96,11 +92,6 @@ export function KnowledgeScopeSelector({
       })
       return
     }
-    onChange({
-      knowledgeDisabled: false,
-      knowledgeBaseIds: [],
-      knowledgeManual: false,
-    })
   }
 
   const toggleBase = (id: string, checked: boolean) => {
@@ -119,9 +110,9 @@ export function KnowledgeScopeSelector({
       ? '已关闭'
       : mode === 'manual'
         ? selectedIds.length > 0
-          ? '手动 ' + selectedIds.length + ' 个'
-          : '手动选择'
-        : '自动'
+          ? '已选择 ' + selectedIds.length + ' 个'
+          : '选择知识库'
+        : '未启用'
 
   return (
     <section
@@ -144,8 +135,8 @@ export function KnowledgeScopeSelector({
         )}
       </div>
 
-      <div className='grid grid-cols-3 gap-1'>
-        {(['auto', 'manual', 'off'] as KnowledgeMode[]).map((item) => (
+      <div className='grid grid-cols-2 gap-1'>
+        {(['manual', 'off'] as KnowledgeMode[]).map((item) => (
           <Button
             key={item}
             type='button'
@@ -155,19 +146,19 @@ export function KnowledgeScopeSelector({
             disabled={disabled}
             onClick={() => setMode(item)}
           >
-            {item === 'auto' ? '自动' : item === 'manual' ? '选择' : '关闭'}
+            {item === 'manual' ? '选择知识库' : '关闭'}
           </Button>
         ))}
       </div>
 
       {mode === 'manual' && (
         <div className='mt-2 max-h-40 space-y-1 overflow-y-auto pr-1'>
-          {enabledItems.length === 0 ? (
+          {items.length === 0 ? (
             <div className='text-muted-foreground px-1 py-2 text-[10px]'>
-              暂无已启用知识库
+              暂无知识库，请先在知识库页面上传文档
             </div>
           ) : (
-            enabledItems.map((item) => (
+            items.map((item) => (
               <label
                 key={item.id}
                 className='border-border/50 hover:bg-muted/50 flex items-center gap-2 rounded-md border px-2 py-1.5 text-[10px]'
@@ -180,7 +171,9 @@ export function KnowledgeScopeSelector({
                   }
                 />
                 <span className='min-w-0 flex-1'>
-                  <span className='block truncate font-medium'>{item.name}</span>
+                  <span className='block truncate font-medium'>
+                    {item.name}
+                  </span>
                   <span className='text-muted-foreground block truncate'>
                     {item.document_count} 个文档 / {item.chunk_count} 个分块
                   </span>

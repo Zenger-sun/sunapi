@@ -55,12 +55,12 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	api.POST("/knowledge-bases", handleCreateKnowledgeBase(store))
 	api.POST("/knowledge-bases/search", handleSearchKnowledge(store))
 	api.PUT("/knowledge-bases/:id", handleUpdateKnowledgeBase(store))
-	api.PUT("/knowledge-bases/:id/toggle", handleToggleKnowledgeBase(store))
 	api.GET("/knowledge-bases/:id/bindings", handleListKnowledgeBindings(store))
 	api.PUT("/knowledge-bases/:id/bindings", handleSetKnowledgeBindings(store))
 	api.DELETE("/knowledge-bases/:id", handleDeleteKnowledgeBase(store))
 	api.GET("/knowledge-bases/:id/documents", handleListKnowledgeDocuments(store))
 	api.POST("/knowledge-bases/:id/documents", handleUploadKnowledgeDocument(store))
+	api.GET("/knowledge-bases/:id/documents/:docID", handleGetKnowledgeDocument(store))
 	api.DELETE("/knowledge-bases/:id/documents/:docID", handleDeleteKnowledgeDocument(store))
 
 	// ── Skill CRUD ────────────────────────────────────────────────────────

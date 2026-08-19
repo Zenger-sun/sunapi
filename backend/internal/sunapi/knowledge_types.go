@@ -26,6 +26,7 @@ type KnowledgeDocument struct {
 	MediaType       string `json:"media_type,omitempty"`
 	Size            int64  `json:"size"`
 	ContentHash     string `json:"content_hash"`
+	Content         string `json:"content,omitempty"`
 	ChunkCount      int    `json:"chunk_count"`
 	CreatedTime     int64  `json:"created_time"`
 	UpdatedTime     int64  `json:"updated_time"`

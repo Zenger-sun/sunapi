@@ -13,6 +13,7 @@ permission from the SunAPI project owner.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BookOpenIcon,
+  EyeIcon,
   FileTextIcon,
   Loader2Icon,
   PencilIcon,
@@ -23,7 +24,6 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -34,15 +34,14 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import {
   createKnowledgeBase,
   deleteKnowledgeBase,
   deleteKnowledgeDocument,
+  getKnowledgeDocument,
   listKnowledgeBases,
   listKnowledgeDocuments,
-  toggleKnowledgeBase,
   updateKnowledgeBase,
   uploadKnowledgeDocument,
 } from '../api'
@@ -52,16 +51,7 @@ type DeleteTarget =
   | { kind: 'base'; id: string; name: string }
   | { kind: 'document'; id: string; name: string; baseId: string }
 
-interface KnowledgeBaseManagerProps {
-  selectedKnowledgeBaseIds?: string[]
-  onSelectedKnowledgeBaseIdsChange?: (ids: string[]) => void
-}
-
-export function KnowledgeBaseManager({
-  selectedKnowledgeBaseIds = [],
-  onSelectedKnowledgeBaseIdsChange,
-}: KnowledgeBaseManagerProps = {}) {
-  const isBlueprintSelection = onSelectedKnowledgeBaseIdsChange !== undefined
+export function KnowledgeBaseManager() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [items, setItems] = useState<KnowledgeBaseItem[]>([])
   const [documents, setDocuments] = useState<KnowledgeDocumentItem[]>([])
@@ -77,6 +67,9 @@ export function KnowledgeBaseManager({
   const [isSaving, setIsSaving] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
   const [isDeleting, setIsDeleting] = useState(false)
+  const [viewingDocument, setViewingDocument] =
+    useState<KnowledgeDocumentItem | null>(null)
+  const [isDocumentViewing, setIsDocumentViewing] = useState(false)
 
   const loadBases = useCallback(async () => {
     try {
@@ -174,32 +167,6 @@ export function KnowledgeBaseManager({
     }
   }
 
-  const toggle = async (item: KnowledgeBaseItem, enabled: boolean) => {
-    if (onSelectedKnowledgeBaseIdsChange) {
-      const nextIds = enabled
-        ? Array.from(new Set([...selectedKnowledgeBaseIds, item.id]))
-        : selectedKnowledgeBaseIds.filter((id) => id !== item.id)
-      onSelectedKnowledgeBaseIdsChange(nextIds)
-      return
-    }
-    setItems((current) =>
-      current.map((entry) =>
-        entry.id === item.id ? { ...entry, enabled } : entry
-      )
-    )
-    try {
-      await toggleKnowledgeBase(item.id, enabled)
-      toast.success(enabled ? '知识库已开启' : '知识库已停用')
-    } catch (error) {
-      setItems((current) =>
-        current.map((entry) =>
-          entry.id === item.id ? { ...entry, enabled: item.enabled } : entry
-        )
-      )
-      toast.error(error instanceof Error ? error.message : '状态更新失败')
-    }
-  }
-
   const uploadFiles = async (files: FileList | null) => {
     if (!selectedId || !files?.length) return
     setIsUploading(true)
@@ -228,11 +195,6 @@ export function KnowledgeBaseManager({
     try {
       if (deleteTarget.kind === 'base') {
         await deleteKnowledgeBase(deleteTarget.id)
-        if (onSelectedKnowledgeBaseIdsChange) {
-          onSelectedKnowledgeBaseIdsChange(
-            selectedKnowledgeBaseIds.filter((id) => id !== deleteTarget.id)
-          )
-        }
         await loadBases()
         toast.success('知识库已删除')
       } else {
@@ -278,75 +240,56 @@ export function KnowledgeBaseManager({
           <EmptyState icon={BookOpenIcon} label='暂无知识库' />
         ) : (
           <div className='space-y-1'>
-            {filteredItems.map((item) => {
-              const enabled = isBlueprintSelection
-                ? selectedKnowledgeBaseIds.includes(item.id)
-                : item.enabled
-              return (
-                <div
-                  key={item.id}
-                  className={cn(
-                    'border-border/70 hover:bg-muted/60 flex w-full items-start gap-2 rounded-[7px] border px-2 py-2 text-left transition-colors',
-                    selectedId === item.id && 'border-primary/40 bg-primary/5'
-                  )}
+            {filteredItems.map((item) => (
+              <div
+                key={item.id}
+                className={cn(
+                  'border-border/70 hover:bg-muted/60 flex w-full items-start gap-2 rounded-[7px] border px-2 py-2 text-left transition-colors',
+                  selectedId === item.id && 'border-primary/40 bg-primary/5'
+                )}
+              >
+                <BookOpenIcon className='text-muted-foreground mt-0.5 size-3.5 shrink-0' />
+                <button
+                  type='button'
+                  className='min-w-0 flex-1 text-left'
+                  onClick={() => setSelectedId(item.id)}
                 >
-                  <BookOpenIcon className='text-muted-foreground mt-0.5 size-3.5 shrink-0' />
-                  <button
-                    type='button'
-                    className='min-w-0 flex-1 text-left'
-                    onClick={() => setSelectedId(item.id)}
-                  >
-                    <span className='block truncate text-xs font-medium'>
-                      {item.name}
-                    </span>
-                    <span className='text-muted-foreground mt-0.5 block text-[10px]'>
-                      {item.document_count} 个文档 · {item.chunk_count} 个分块
-                    </span>
-                  </button>
-                  <span className='flex shrink-0 items-center gap-0.5'>
-                    <Switch
-                      size='sm'
-                      checked={enabled}
-                      onCheckedChange={(enabled) => void toggle(item, enabled)}
-                      aria-label={
-                        isBlueprintSelection
-                          ? enabled
-                            ? '从当前蓝图移除知识库'
-                            : '为当前蓝图开启知识库'
-                          : enabled
-                            ? '停用知识库'
-                            : '开启知识库'
-                      }
-                    />
-                    <Button
-                      size='icon-xs'
-                      variant='ghost'
-                      onClick={() => openEdit(item)}
-                      aria-label='编辑知识库'
-                      title='编辑'
-                    >
-                      <PencilIcon className='size-3' />
-                    </Button>
-                    <Button
-                      size='icon-xs'
-                      variant='ghost'
-                      className='text-destructive hover:text-destructive'
-                      onClick={() =>
-                        setDeleteTarget({
-                          kind: 'base',
-                          id: item.id,
-                          name: item.name,
-                        })
-                      }
-                      aria-label='删除知识库'
-                      title='删除'
-                    >
-                      <Trash2Icon className='size-3' />
-                    </Button>
+                  <span className='block truncate text-xs font-medium'>
+                    {item.name}
                   </span>
-                </div>
-              )
-            })}
+                  <span className='text-muted-foreground mt-0.5 block text-[10px]'>
+                    {item.document_count} 个文档 · {item.chunk_count} 个分块
+                  </span>
+                </button>
+                <span className='flex shrink-0 items-center gap-0.5'>
+                  <Button
+                    size='icon-xs'
+                    variant='ghost'
+                    onClick={() => openEdit(item)}
+                    aria-label='编辑知识库'
+                    title='编辑'
+                  >
+                    <PencilIcon className='size-3' />
+                  </Button>
+                  <Button
+                    size='icon-xs'
+                    variant='ghost'
+                    className='text-destructive hover:text-destructive'
+                    onClick={() =>
+                      setDeleteTarget({
+                        kind: 'base',
+                        id: item.id,
+                        name: item.name,
+                      })
+                    }
+                    aria-label='删除知识库'
+                    title='删除'
+                  >
+                    <Trash2Icon className='size-3' />
+                  </Button>
+                </span>
+              </div>
+            ))}
           </div>
         )}
 
@@ -356,13 +299,6 @@ export function KnowledgeBaseManager({
               <div className='min-w-0 flex-1'>
                 <div className='flex items-center gap-1.5'>
                   <span className='truncate text-xs font-semibold'>文档</span>
-                  {(isBlueprintSelection
-                    ? selectedKnowledgeBaseIds.includes(selected.id)
-                    : selected.enabled) && (
-                    <Badge variant='secondary' className='h-4 px-1 text-[9px]'>
-                      {isBlueprintSelection ? '用于当前蓝图' : '已开启'}
-                    </Badge>
-                  )}
                 </div>
                 {selected.description && (
                   <p className='text-muted-foreground mt-0.5 line-clamp-2 text-[10px]'>
@@ -423,6 +359,36 @@ export function KnowledgeBaseManager({
                     <Button
                       size='icon-xs'
                       variant='ghost'
+                      className='text-muted-foreground'
+                      disabled={isDocumentViewing}
+                      onClick={async () => {
+                        setIsDocumentViewing(true)
+                        try {
+                          setViewingDocument(
+                            await getKnowledgeDocument(selected.id, document.id)
+                          )
+                        } catch (error) {
+                          toast.error(
+                            error instanceof Error
+                              ? error.message
+                              : '文档内容加载失败'
+                          )
+                        } finally {
+                          setIsDocumentViewing(false)
+                        }
+                      }}
+                      aria-label='查看文档'
+                      title='查看文档'
+                    >
+                      {isDocumentViewing ? (
+                        <Loader2Icon className='size-3 animate-spin' />
+                      ) : (
+                        <EyeIcon className='size-3' />
+                      )}
+                    </Button>
+                    <Button
+                      size='icon-xs'
+                      variant='ghost'
                       className='text-muted-foreground hover:text-destructive'
                       onClick={() =>
                         setDeleteTarget({
@@ -450,7 +416,7 @@ export function KnowledgeBaseManager({
           <DialogHeader>
             <DialogTitle>{editing ? '编辑知识库' : '新建知识库'}</DialogTitle>
             <DialogDescription>
-              创建后可在蓝图中独立选择是否使用这个知识库。
+              知识库仅在此处管理；使用时请在对话、图片、视频或智能体中选择。
             </DialogDescription>
           </DialogHeader>
           <div className='space-y-3'>
@@ -477,6 +443,27 @@ export function KnowledgeBaseManager({
               保存
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={viewingDocument !== null}
+        onOpenChange={(open) => !open && setViewingDocument(null)}
+      >
+        <DialogContent className='max-w-3xl'>
+          <DialogHeader>
+            <DialogTitle className='truncate'>
+              {viewingDocument?.filename ?? '文档内容'}
+            </DialogTitle>
+            <DialogDescription>
+              {viewingDocument
+                ? `${formatBytes(viewingDocument.size)} · ${viewingDocument.chunk_count} 个分块`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <pre className='bg-muted/40 max-h-[60vh] overflow-auto rounded-md p-3 text-xs leading-5 whitespace-pre-wrap'>
+            {viewingDocument?.content || '暂无可预览内容'}
+          </pre>
         </DialogContent>
       </Dialog>
 
