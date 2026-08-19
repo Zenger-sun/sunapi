@@ -64,6 +64,7 @@ import {
   GlobeIcon,
   ImageIcon,
   MergeIcon,
+  MessagesSquareIcon,
   MonitorIcon,
   NetworkIcon,
   PauseIcon,
@@ -176,6 +177,7 @@ type AgentNodeKind =
   | 'start'
   | 'schedule'
   | 'browser'
+  | 'xianyu'
   | 'request'
   | 'transform'
   | 'image'
@@ -501,7 +503,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser', 'custom'],
+    appliesTo: ['browser', 'xianyu', 'custom'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -540,7 +542,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.rag-file-search',
     description: '知识库、文档检索、片段引用和问答总结的检索增强能力。',
     source: 'built-in',
-    appliesTo: ['browser', 'request', 'transform', 'report', 'custom'],
+    appliesTo: ['browser', 'xianyu', 'request', 'transform', 'report', 'custom'],
     capabilities: ['语义检索', '片段引用', '答案合成'],
     instructions: [
       '围绕问题检索最相关的文档片段，并基于片段回答，不使用未命中的外部背景补全。',
@@ -642,6 +644,7 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   start: 'skill.mcp-workflow',
   schedule: 'skill.mcp-workflow',
   browser: 'skill.browser-automation',
+  xianyu: 'skill.browser-automation',
   request: 'skill.api-function',
   transform: 'skill.code-interpreter',
   image: 'skill.code-interpreter',
@@ -693,6 +696,11 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   运行模式: ['单次执行', '循环执行', '仅预览', '失败后重试'],
   登录态: ['持久化登录会话（首次登录后复用）', '每次等待手动登录', '无需登录'],
   登录等待: ['30s', '60s', '120s', '180s'],
+  列表等待: ['3s', '5s', '8s', '12s'],
+  单会话等待: ['1s', '2s', '3s'],
+  历史加载轮数: ['1', '3', '6', '10'],
+  会话数量: ['10', '20', '50', '100'],
+  同步范围: ['仅归档未归档或有新消息的会话', '每次归档当前列表全部会话'],
   权限: ['只读采集', '读写操作需确认', '禁止写入'],
   方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   超时: ['10s', '30s', '60s', '120s'],
@@ -800,6 +808,32 @@ const NODE_META: Record<
       登录等待: '120s',
       权限: '只读采集',
       采集等待: '6s',
+    },
+  },
+  xianyu: {
+    label: '闲鱼客服归档',
+    group: '采集',
+    role: 'reasoning',
+    icon: MessagesSquareIcon,
+    accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
+    description:
+      '复用浏览器中的闲鱼卖家登录态，只读遍历客服会话，逐条读取对话并将脱敏总结写入当前智能体选择的知识库。',
+    inputs: ['闲鱼客服会话', '当前智能体知识库'],
+    outputs: ['知识库文档', '会话统计'],
+    settings: {
+      网址: 'https://seller.goofish.com/?site=COMM',
+      登录态: '持久化登录会话（首次登录后复用）',
+      会话名称: '闲鱼客服',
+      登录等待: '180s',
+      列表等待: '8s',
+      会话数量: '20',
+      同步范围: '仅归档未归档或有新消息的会话',
+      单会话等待: '1s',
+      历史加载轮数: '6',
+      对话列表选择器: '',
+      消息区域选择器: '',
+      权限: '只读采集',
+      节点超时: '10m',
     },
   },
   request: {
@@ -1037,7 +1071,7 @@ const PALETTE_GROUPS: Array<{
   kinds: AgentNodeKind[]
 }> = [
   { title: '触发', kinds: ['start', 'schedule'] },
-  { title: '采集', kinds: ['browser', 'request'] },
+  { title: '采集', kinds: ['browser', 'xianyu', 'request'] },
   { title: '处理', kinds: ['transform', 'image'] },
   { title: '落档', kinds: ['report', 'webpage', 'notify'] },
   { title: '结束', kinds: ['stop'] },
@@ -1135,7 +1169,9 @@ function validateWorkflowStructure(
 
   for (const node of nodes) {
     if (
-      (node.data.kind === 'browser' || node.data.kind === 'request') &&
+      (node.data.kind === 'browser' ||
+        node.data.kind === 'xianyu' ||
+        node.data.kind === 'request') &&
       !node.data.settings['网址']?.trim()
     ) {
       issues.push({
@@ -4964,6 +5000,7 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     start: 220,
     schedule: 260,
     browser: 1800,
+    xianyu: 30000,
     request: 1200,
     transform: 980,
     image: 2600,
@@ -8424,6 +8461,7 @@ function readSkillNodeKinds(
     'start',
     'schedule',
     'browser',
+    'xianyu',
     'request',
     'transform',
     'image',

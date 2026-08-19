@@ -863,6 +863,8 @@ func executeAgentBlueprintNode(
 		}
 	case "browser":
 		result = executeAgentBrowserGraphNode(ctx, store, node, result)
+	case "xianyu":
+		result = executeAgentXianyuKnowledgeGraphNode(ctx, store, bp, node, inputVars, result)
 	case "request":
 		result = executeAgentRequestGraphNode(ctx, node, upstream, result)
 	case "transform":
@@ -4284,10 +4286,10 @@ var builtinAgentSkillOrder = []string{
 var builtinAgentSkillAppliesTo = map[string][]string{
 	"skill.web-research":       {"browser", "request", "webpage", "report", "custom"},
 	"skill.file-document":      {"transform", "report", "webpage", "custom"},
-	"skill.browser-automation": {"browser", "custom"},
+	"skill.browser-automation": {"browser", "xianyu", "custom"},
 	"skill.code-interpreter":   {"transform", "image", "report", "custom"},
 	"skill.api-function":       {"request", "notify", "custom"},
-	"skill.rag-file-search":    {"browser", "request", "transform", "report", "custom"},
+	"skill.rag-file-search":    {"browser", "xianyu", "request", "transform", "report", "custom"},
 	"skill.database-sql":       {"request", "transform", "report", "custom"},
 	"skill.mcp-workflow":       {"start", "schedule", "custom", "notify", "stop"},
 }
