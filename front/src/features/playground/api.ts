@@ -39,6 +39,8 @@ import type {
   KnowledgeAgentOption,
   KnowledgeBlueprintOption,
   KnowledgeDocumentItem,
+  KnowledgeFAQFormData,
+  KnowledgeFAQItem,
   MessageAttachment,
   PlaygroundAttachment,
   PlaygroundSession,
@@ -613,6 +615,66 @@ export async function deleteKnowledgeDocument(
   )
   if (!res.data.success) {
     throw new Error(res.data.message || 'Failed to delete knowledge document')
+  }
+}
+
+export async function listKnowledgeFAQs(
+  knowledgeBaseId: string
+): Promise<KnowledgeFAQItem[]> {
+  const res = await api.get(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/faqs`,
+    { skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !Array.isArray(data.data)) {
+    throw new Error(data.message || 'Failed to list knowledge FAQs')
+  }
+  return data.data as KnowledgeFAQItem[]
+}
+
+export async function createKnowledgeFAQ(
+  knowledgeBaseId: string,
+  payload: KnowledgeFAQFormData
+): Promise<KnowledgeFAQItem> {
+  const res = await api.post(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/faqs`,
+    payload,
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to create knowledge FAQ')
+  }
+  return data.data as KnowledgeFAQItem
+}
+
+export async function updateKnowledgeFAQ(
+  knowledgeBaseId: string,
+  faqId: string,
+  payload: KnowledgeFAQFormData
+): Promise<KnowledgeFAQItem> {
+  const res = await api.put(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/faqs/${faqId}`,
+    payload,
+    { skipBusinessError: true, skipErrorHandler: true }
+  )
+  const { data } = res
+  if (!data.success || !data.data) {
+    throw new Error(data.message || 'Failed to update knowledge FAQ')
+  }
+  return data.data as KnowledgeFAQItem
+}
+
+export async function deleteKnowledgeFAQ(
+  knowledgeBaseId: string,
+  faqId: string
+): Promise<void> {
+  const res = await api.delete(
+    `${API_ENDPOINTS.KNOWLEDGE_BASES}/${knowledgeBaseId}/faqs/${faqId}`,
+    { skipErrorHandler: true }
+  )
+  if (!res.data.success) {
+    throw new Error(res.data.message || 'Failed to delete knowledge FAQ')
   }
 }
 

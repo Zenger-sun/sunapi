@@ -17,6 +17,11 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
 import { listKnowledgeBases } from '../api'
 import type { KnowledgeBaseItem } from '../types'
 
@@ -33,6 +38,7 @@ interface KnowledgeScopeSelectorProps {
   onChange: (next: KnowledgeScopeValue) => void
   disabled?: boolean
   compact?: boolean
+  toolbar?: boolean
   className?: string
 }
 
@@ -41,6 +47,7 @@ export function KnowledgeScopeSelector({
   onChange,
   disabled,
   compact = false,
+  toolbar = false,
   className,
 }: KnowledgeScopeSelectorProps) {
   const [items, setItems] = useState<KnowledgeBaseItem[]>([])
@@ -114,14 +121,8 @@ export function KnowledgeScopeSelector({
           : '选择知识库'
         : '未启用'
 
-  return (
-    <section
-      className={cn(
-        'border-border/60 bg-card/40 rounded-lg border p-2.5',
-        compact && 'p-2',
-        className
-      )}
-    >
+  const selectorContent = (
+    <>
       <div className='mb-2 flex items-center justify-between gap-2'>
         <div className='flex min-w-0 items-center gap-1.5'>
           <BookOpenIcon className='text-muted-foreground size-3.5 shrink-0' />
@@ -183,6 +184,58 @@ export function KnowledgeScopeSelector({
           )}
         </div>
       )}
+    </>
+  )
+
+  if (toolbar) {
+    return (
+      <Popover>
+        <PopoverTrigger
+          render={
+            <Button
+              type='button'
+              variant='outline'
+              size='sm'
+              disabled={disabled}
+              aria-label='知识库'
+              className={cn(
+                'border font-medium',
+                mode === 'manual' && 'border-primary/40 bg-primary/5',
+                className
+              )}
+            />
+          }
+        >
+          <BookOpenIcon className='size-3.5' />
+          <span>知识库</span>
+          <Badge
+            variant={mode === 'off' ? 'secondary' : 'default'}
+            className='h-4 px-1 text-[9px]'
+          >
+            {summary}
+          </Badge>
+        </PopoverTrigger>
+        <PopoverContent
+          align='start'
+          side='top'
+          sideOffset={8}
+          className='w-[min(21rem,calc(100vw-2rem))] p-2.5'
+        >
+          {selectorContent}
+        </PopoverContent>
+      </Popover>
+    )
+  }
+
+  return (
+    <section
+      className={cn(
+        'border-border/60 bg-card/40 rounded-lg border p-2.5',
+        compact && 'p-2',
+        className
+      )}
+    >
+      {selectorContent}
     </section>
   )
 }

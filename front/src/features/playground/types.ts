@@ -306,6 +306,23 @@ export interface KnowledgeDocumentItem {
   updated_time: number
 }
 
+export interface KnowledgeFAQItem {
+  id: string
+  knowledge_base_id: string
+  user_id: number
+  question: string
+  answer: string
+  keywords?: string[]
+  created_time: number
+  updated_time: number
+}
+
+export interface KnowledgeFAQFormData {
+  question: string
+  answer: string
+  keywords?: string[]
+}
+
 export interface AgentBrowserCaptureRequest {
   url: string
   login_state?: string

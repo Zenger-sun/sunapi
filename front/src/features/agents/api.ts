@@ -11,6 +11,7 @@ import { api } from '@/lib/api'
 import {
   type Agent,
   type AgentExecutionLog,
+  type AgentXianyuReplyRecord,
   type Blueprint,
   type Skill,
   type SkillMarketplaceItem,
@@ -114,6 +115,18 @@ export async function listBlueprintExecutionLogs(
   return extractData<AgentExecutionLog[]>(resp) ?? []
 }
 
+export async function listXianyuReplyRecords(
+  agentId: string,
+  blueprintId: string,
+  limit = 50
+): Promise<AgentXianyuReplyRecord[]> {
+  const resp = await api.get(
+    `/api/agents/${agentId}/blueprints/${blueprintId}/reply-records`,
+    { params: { limit } }
+  )
+  return extractData<AgentXianyuReplyRecord[]>(resp) ?? []
+}
+
 // ============================================================================
 // Skill API
 // ============================================================================
@@ -155,6 +168,12 @@ export const blueprintsByAgentQueryOptions = (agentId: string) =>
     queryKey: ['blueprints', agentId],
     queryFn: () => getBlueprintsByAgent(agentId),
     enabled: !!agentId,
+    // A run completes asynchronously. Poll only while it is active so the UI
+    // cannot keep showing a completed or failed execution as "running".
+    refetchInterval: (query) =>
+      query.state.data?.some((blueprint) => blueprint.status === 'running')
+        ? 3000
+        : false,
   })
 
 export const skillsQueryOptions = queryOptions({

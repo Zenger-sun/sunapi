@@ -208,6 +208,49 @@ export interface AgentExecutionLog {
   archive_path?: string
 }
 
+export interface AgentXianyuReplyMessage {
+  key?: string
+  text: string
+  direction: string
+}
+
+export interface AgentXianyuReplyRecord {
+  id: string
+  blueprint_id: string
+  agent_id: string
+  node_id: string
+  conversation_key?: string
+  conversation_title?: string
+  conversation_preview?: string
+  incoming_message: string
+  incoming_direction?: string
+  recent_messages?: AgentXianyuReplyMessage[]
+  product?: {
+    found?: boolean
+    title?: string
+    status?: string
+    availability?: string
+    description?: string
+    text?: string
+  }
+  knowledge_match_count: number
+  knowledge_query?: string
+  model_draft?: string
+  final_reply?: string
+  status: string
+  fallback?: boolean
+  error?: string
+  started_at: number
+  model_started_at?: number
+  model_completed_at?: number
+  sent_at?: number
+  completed_at: number
+  model_duration_ms?: number
+  send_duration_ms?: number
+  duration_ms: number
+  created_at: number
+}
+
 // ============================================================================
 // 智能体 Schema
 // ============================================================================
