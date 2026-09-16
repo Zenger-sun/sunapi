@@ -15,18 +15,49 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	agentArchiveDirName          = "agent-archives"
-	agentBlueprintRunTimeout     = 10 * time.Minute
+	agentArchiveDirName = "agent-archives"
+	// A full Xianyu scan can legitimately take longer than ten minutes when
+	// every conversation is read to its oldest message before summarization.
+	// Individual node timeouts still provide a tighter bound when configured.
+	agentBlueprintRunTimeout     = time.Hour
 	agentBlueprintCleanupTimeout = 5 * time.Second
+	agentLLMMaxAttempts          = 6
+	agentLLMRetryBaseDelay       = 2 * time.Second
+	agentLLMRetryMaxDelay        = 16 * time.Second
 )
 
 type agentSubflowStackContextKey struct{}
+
+// agentExecutionProgressFunc is intentionally lightweight: progress is best
+// effort and must never make a running blueprint fail. The callback is
+// installed by runBlueprintTaskWithContext and writes a small status envelope
+// into the execution log so the UI can show long-running node activity.
+type agentExecutionProgressFunc func(map[string]interface{})
+
+type agentExecutionProgressContextKey struct{}
+
+func withAgentExecutionProgress(ctx context.Context, fn agentExecutionProgressFunc) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, agentExecutionProgressContextKey{}, fn)
+}
+
+func reportAgentExecutionProgress(ctx context.Context, progress map[string]interface{}) {
+	if ctx == nil || progress == nil {
+		return
+	}
+	if fn, ok := ctx.Value(agentExecutionProgressContextKey{}).(agentExecutionProgressFunc); ok && fn != nil {
+		fn(progress)
+	}
+}
 
 func agentSubflowStack(ctx context.Context) []string {
 	stack, _ := ctx.Value(agentSubflowStackContextKey{}).([]string)
@@ -52,7 +83,13 @@ func runBlueprintTask(store *Store, bp *AgentBlueprint) {
 }
 
 func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *AgentBlueprint) {
-	ctx, cancel := context.WithTimeout(parent, agentBlueprintRunTimeout)
+	ctx := parent
+	cancel := func() {}
+	if timeout := effectiveAgentBlueprintRunTimeout(bp); timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
 	defer cancel()
 
 	startedAt := time.Now()
@@ -70,6 +107,29 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 		}
 		return
 	}
+	store.registerAgentRun(bp.ID, execLog.ID, cancel)
+	defer store.unregisterAgentRun(bp.ID, execLog.ID)
+	var progressMu sync.Mutex
+	ctx = withAgentExecutionProgress(ctx, func(progress map[string]interface{}) {
+		// Progress is advisory. Use a short independent context because the
+		// blueprint context may be cancelled while the final status is flushed.
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		payload, marshalErr := json.Marshal(map[string]interface{}{
+			"mode":         "node_graph_progress",
+			"blueprint_id": bp.ID,
+			"progress":     progress,
+		})
+		if marshalErr != nil {
+			return
+		}
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer updateCancel()
+		if updateErr := store.UpdateExecutionProgress(updateCtx, execLog.ID, payload); updateErr != nil {
+			log.WithError(updateErr).WithField("execution_id", execLog.ID).
+				Debug("agent: failed to persist execution progress")
+		}
+	})
 
 	log.WithFields(log.Fields{
 		"blueprint_id": bp.ID,
@@ -128,6 +188,93 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 		"status":       executionStatus,
 		"duration_ms":  durationMs,
 	}).Info("agent: blueprint execution finished")
+}
+
+func (s *Store) registerAgentRun(blueprintID, runID string, cancel context.CancelFunc) {
+	if s == nil || strings.TrimSpace(blueprintID) == "" || strings.TrimSpace(runID) == "" || cancel == nil {
+		return
+	}
+	s.agentActiveRunsMu.Lock()
+	defer s.agentActiveRunsMu.Unlock()
+	if s.agentActiveRuns == nil {
+		s.agentActiveRuns = make(map[string]map[string]context.CancelFunc)
+	}
+	runs := s.agentActiveRuns[blueprintID]
+	if runs == nil {
+		runs = make(map[string]context.CancelFunc)
+		s.agentActiveRuns[blueprintID] = runs
+	}
+	runs[runID] = cancel
+}
+
+func (s *Store) unregisterAgentRun(blueprintID, runID string) {
+	if s == nil {
+		return
+	}
+	s.agentActiveRunsMu.Lock()
+	defer s.agentActiveRunsMu.Unlock()
+	runs := s.agentActiveRuns[blueprintID]
+	delete(runs, runID)
+	if len(runs) == 0 {
+		delete(s.agentActiveRuns, blueprintID)
+	}
+}
+
+func (s *Store) isAgentRunActive(blueprintID string) bool {
+	if s == nil {
+		return false
+	}
+	s.agentActiveRunsMu.Lock()
+	defer s.agentActiveRunsMu.Unlock()
+	return len(s.agentActiveRuns[blueprintID]) > 0
+}
+
+func (s *Store) cancelAgentRuns(blueprintID string) {
+	if s == nil {
+		return
+	}
+	s.agentActiveRunsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.agentActiveRuns[blueprintID]))
+	for _, cancel := range s.agentActiveRuns[blueprintID] {
+		cancels = append(cancels, cancel)
+	}
+	s.agentActiveRunsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (s *Store) cancelAllAgentRuns() {
+	if s == nil {
+		return
+	}
+	s.agentActiveRunsMu.Lock()
+	cancels := make([]context.CancelFunc, 0)
+	for _, runs := range s.agentActiveRuns {
+		for _, cancel := range runs {
+			cancels = append(cancels, cancel)
+		}
+	}
+	s.agentActiveRunsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func effectiveAgentBlueprintRunTimeout(bp *AgentBlueprint) time.Duration {
+	if bp == nil {
+		return agentBlueprintRunTimeout
+	}
+	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
+	if err != nil {
+		return agentBlueprintRunTimeout
+	}
+	for _, node := range nodes {
+		if isAgentXianyuLongRunningNode(node) {
+			return 0
+		}
+	}
+	return agentBlueprintRunTimeout
 }
 
 func blueprintHasScheduleNode(bp *AgentBlueprint) bool {
@@ -299,12 +446,30 @@ func executeBlueprintNodeGraph(
 	var warnings []string
 	var graphErr error
 
-	for _, node := range ordered {
+	for nodeIndex, node := range ordered {
 		if !agentGraphNodeHasActiveInput(node.ID, edges, outputsByNodeID, skippedNodeIDs) {
 			results = append(results, skippedAgentBlueprintNodeResult(node))
 			skippedNodeIDs[node.ID] = true
+			reportAgentExecutionProgress(ctx, map[string]interface{}{
+				"phase":           "node",
+				"node_id":         node.ID,
+				"node_kind":       node.Data.Kind,
+				"node_title":      node.Data.Title,
+				"message":         fmt.Sprintf("已跳过节点 %d/%d：%s", nodeIndex+1, len(ordered), node.Data.Title),
+				"completed_nodes": len(results),
+				"total_nodes":     len(ordered),
+			})
 			continue
 		}
+		reportAgentExecutionProgress(ctx, map[string]interface{}{
+			"phase":           "node",
+			"node_id":         node.ID,
+			"node_kind":       node.Data.Kind,
+			"node_title":      node.Data.Title,
+			"message":         fmt.Sprintf("正在执行节点 %d/%d：%s", nodeIndex+1, len(ordered), node.Data.Title),
+			"completed_nodes": len(results),
+			"total_nodes":     len(ordered),
+		})
 		upstream := upstreamAgentNodeOutputs(node.ID, edges, outputsByNodeID)
 		loopItems, hasLoopItems := agentLoopItemsForNode(node.ID, edges, outputsByNodeID)
 		var result agentBlueprintNodeResult
@@ -314,6 +479,16 @@ func executeBlueprintNodeGraph(
 			result = executeAgentBlueprintNodeWithPolicy(ctx, store, bp, node, upstream, inputVars)
 		}
 		results = append(results, result)
+		reportAgentExecutionProgress(ctx, map[string]interface{}{
+			"phase":           "node",
+			"node_id":         node.ID,
+			"node_kind":       node.Data.Kind,
+			"node_title":      node.Data.Title,
+			"message":         result.Message,
+			"status":          result.Status,
+			"completed_nodes": len(results),
+			"total_nodes":     len(ordered),
+		})
 		if result.Status == "failed" {
 			warnings = append(warnings, fmt.Sprintf("%s: %s", node.ID, result.Error))
 			graphErr = fmt.Errorf("node %s failed: %s", node.ID, firstNonEmpty(result.Error, result.Message))
@@ -662,6 +837,15 @@ func parseAgentBlueprintNodes(raw json.RawMessage) ([]agentBlueprintGraphNode, e
 	for _, node := range nodes {
 		node.ID = strings.TrimSpace(node.ID)
 		node.Data.Kind = strings.TrimSpace(node.Data.Kind)
+		if node.Data.Kind == "custom" && node.Data.ComponentID == "component.xianyu" {
+			node.Data.Kind = "xianyu"
+		}
+		if node.Data.Kind == "custom" && node.Data.ComponentID == "component.xianyu-reply" {
+			node.Data.Kind = "xianyu_reply"
+		}
+		if node.Data.Kind == "custom" && node.Data.ComponentID == "component.xianyu-review" {
+			node.Data.Kind = "xianyu_review"
+		}
 		if node.ID == "" || node.Data.Kind == "" {
 			continue
 		}
@@ -865,6 +1049,10 @@ func executeAgentBlueprintNode(
 		result = executeAgentBrowserGraphNode(ctx, store, node, result)
 	case "xianyu":
 		result = executeAgentXianyuKnowledgeGraphNode(ctx, store, bp, node, inputVars, result)
+	case "xianyu_reply":
+		result = executeAgentXianyuReplyGraphNode(ctx, store, bp, node, inputVars, result)
+	case "xianyu_review":
+		result = executeAgentXianyuReviewGraphNode(ctx, store, bp, node, inputVars, result)
 	case "request":
 		result = executeAgentRequestGraphNode(ctx, node, upstream, result)
 	case "transform":
@@ -876,7 +1064,7 @@ func executeAgentBlueprintNode(
 	case "image":
 		result = executeAgentImageGraphNode(ctx, store, bp, node, upstream, result)
 	case "report":
-		result = executeAgentReportGraphNode(store, node, upstream, result)
+		result = executeAgentReportGraphNode(ctx, store, node, upstream, result)
 	case "webpage":
 		result = executeAgentWebpageGraphNode(store, node, upstream, result)
 	case "notify":
@@ -903,7 +1091,7 @@ func executeAgentBlueprintNodeWithPolicy(
 ) agentBlueprintNodeResult {
 	retries := parseAgentNodeRetryCount(node.Data.Settings["失败重试"])
 	retryInterval := parseAgentNodeRetryInterval(node.Data.Settings["重试间隔"])
-	timeout := parseAgentNodeTimeout(node.Data.Settings["节点超时"])
+	timeout := effectiveAgentNodeTimeout(node)
 	var last agentBlueprintNodeResult
 
 	for attempt := 1; attempt <= retries+1; attempt++ {
@@ -952,6 +1140,26 @@ func executeAgentBlueprintNodeWithPolicy(
 		last.Output["skipped"] = strings.Contains(failureMode, "跳过")
 	}
 	return last
+}
+
+func effectiveAgentNodeTimeout(node agentBlueprintGraphNode) time.Duration {
+	timeout := parseAgentNodeTimeout(node.Data.Settings["节点超时"])
+	// Existing Xianyu blueprints may carry the old 10m or 1h default. A complete
+	// archive is resumable and each browser/model operation is independently
+	// bounded, so the aggregate node must not discard work at a fixed deadline.
+	if isAgentXianyuLongRunningNode(node) {
+		return 0
+	}
+	return timeout
+}
+
+func isAgentXianyuLongRunningNode(node agentBlueprintGraphNode) bool {
+	return node.Data.Kind == "xianyu" ||
+		node.Data.ComponentID == "component.xianyu" ||
+		node.Data.Kind == "xianyu_reply" ||
+		node.Data.ComponentID == "component.xianyu-reply" ||
+		node.Data.Kind == "xianyu_review" ||
+		node.Data.ComponentID == "component.xianyu-review"
 }
 
 func parseAgentNodeRetryCount(value string) int {
@@ -1123,6 +1331,7 @@ func executeAgentBrowserGraphNode(
 		"final_url":          captured.FinalURL,
 		"title":              captured.Title,
 		"text":               captured.Text,
+		"tables":             captured.Tables,
 		"text_length":        len([]rune(captured.Text)),
 		"screenshot_path":    captured.ScreenshotPath,
 		"screenshot_error":   captured.ScreenshotError,
@@ -1811,6 +2020,7 @@ func resolveAgentImageSize(resolution, aspectRatio string) string {
 }
 
 func executeAgentReportGraphNode(
+	ctx context.Context,
 	store *Store,
 	node agentBlueprintGraphNode,
 	upstream map[string]interface{},
@@ -1823,8 +2033,16 @@ func executeAgentReportGraphNode(
 		result.Output = map[string]interface{}{"error": result.Error}
 		return result
 	}
-	content := buildAgentGraphReportContent(node, upstream)
-	files := agentGraphReportFiles(node, content, upstream)
+	templateData, productCount, autoCollectedProducts, err := prepareAgentReportTemplateData(ctx, store, node, upstream)
+	if err != nil {
+		result.Status = "failed"
+		result.Message = "生成文件节点准备商品明细失败。"
+		result.Error = err.Error()
+		result.Output = map[string]interface{}{"error": result.Error}
+		return result
+	}
+	content := buildAgentGraphReportContent(node, templateData)
+	files := agentGraphReportFiles(node, content, templateData)
 	writeResult, err := writeAgentReportFiles(store.DataDir(), AgentReportWriteRequest{
 		Title:           firstNonEmpty(node.Data.Title, "生成文件"),
 		OutputDirectory: firstNonEmpty(node.Data.Settings["输出目录"], "data/output/reports"),
@@ -1838,11 +2056,17 @@ func executeAgentReportGraphNode(
 		return result
 	}
 	result.Message = "结果文件已按节点配置写入。"
+	if autoCollectedProducts {
+		result.Message = fmt.Sprintf("已自动采集并处理 %d 条商品明细，结果文件已写入。", productCount)
+	} else if productCount > 0 {
+		result.Message = fmt.Sprintf("已写入 %d 条上游商品明细，结果文件已写入。", productCount)
+	}
 	result.ArchivePath = writeResult.OutputDirectory
 	result.Output = map[string]interface{}{
 		"content":          content,
 		"output_directory": writeResult.OutputDirectory,
 		"files":            writeResult.Files,
+		"product_count":    productCount,
 	}
 	return result
 }
@@ -3967,7 +4191,11 @@ func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, 
 		AgentID:     bp.AgentID,
 		BlueprintID: bp.ID,
 	}, inputVars)
-	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, userPrompt, 6, knowledgeScope)
+	knowledgeQuery := userPrompt
+	if explicitQuery := strings.TrimSpace(stringFromAny(inputVars["knowledge_query"])); explicitQuery != "" {
+		knowledgeQuery = explicitQuery
+	}
+	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, knowledgeQuery, 6, knowledgeScope)
 
 	// 构建请求体
 	type chatMsg struct {
@@ -4038,11 +4266,19 @@ func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, 
 		return "", fmt.Errorf("llm api returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	// 解析响应内容
+	return parseAgentLLMResponse(respBody)
+}
+
+// parseAgentLLMResponse accepts the string and content-part forms emitted by
+// OpenAI-compatible gateways, but never treats a reasoning-only response as a
+// usable answer. The latter is important for the knowledge archive: saving
+// hidden reasoning would both produce poor knowledge and leak internal text.
+func parseAgentLLMResponse(respBody []byte) (string, error) {
 	var chatResp struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          json.RawMessage `json:"content"`
+				ReasoningContent json.RawMessage `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -4050,9 +4286,51 @@ func callLLMForBlueprint(ctx context.Context, store *Store, bp *AgentBlueprint, 
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("empty response from model")
+		return "", errors.New("empty response from model")
 	}
-	return chatResp.Choices[0].Message.Content, nil
+	message := chatResp.Choices[0].Message
+	content, err := parseAgentLLMMessageContent(message.Content)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content) == "" {
+		if len(bytes.TrimSpace(message.ReasoningContent)) > 0 &&
+			!bytes.Equal(bytes.TrimSpace(message.ReasoningContent), []byte("null")) {
+			return "", errors.New("model returned empty assistant content (reasoning-only response)")
+		}
+		return "", errors.New("model returned empty assistant content")
+	}
+	return content, nil
+}
+
+func parseAgentLLMMessageContent(raw json.RawMessage) (string, error) {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return "", nil
+	}
+	if value[0] == '"' {
+		var content string
+		if err := json.Unmarshal(value, &content); err != nil {
+			return "", fmt.Errorf("failed to parse assistant content: %w", err)
+		}
+		return content, nil
+	}
+	if value[0] == '[' {
+		var parts []struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(value, &parts); err != nil {
+			return "", fmt.Errorf("failed to parse assistant content parts: %w", err)
+		}
+		content := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if strings.TrimSpace(part.Text) != "" {
+				content = append(content, part.Text)
+			}
+		}
+		return strings.Join(content, ""), nil
+	}
+	return "", errors.New("unsupported assistant content format")
 }
 
 func callLLMForAgentNode(
@@ -4063,8 +4341,27 @@ func callLLMForAgentNode(
 	upstream map[string]interface{},
 	inputVars map[string]interface{},
 ) (string, error) {
+	return callLLMForAgentNodeWithPolicy(ctx, store, bp, node, upstream, inputVars, 5*time.Minute, agentLLMMaxAttempts)
+}
+
+func callLLMForAgentNodeWithPolicy(
+	ctx context.Context,
+	store *Store,
+	bp *AgentBlueprint,
+	node agentBlueprintGraphNode,
+	upstream map[string]interface{},
+	inputVars map[string]interface{},
+	requestTimeout time.Duration,
+	maxAttempts int,
+) (string, error) {
 	if store == nil || bp == nil {
 		return "", errors.New("agent node model context is required")
+	}
+	if requestTimeout <= 0 {
+		requestTimeout = 5 * time.Minute
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 	type chatMsg struct {
 		Role    string `json:"role"`
@@ -4085,7 +4382,11 @@ func callLLMForAgentNode(
 		AgentID:     bp.AgentID,
 		BlueprintID: bp.ID,
 	}, inputVars)
-	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, userPrompt, 6, knowledgeScope)
+	knowledgeQuery := userPrompt
+	if explicitQuery := strings.TrimSpace(stringFromAny(inputVars["knowledge_query"])); explicitQuery != "" {
+		knowledgeQuery = explicitQuery
+	}
+	systemPrompt += store.BuildKnowledgeContextForScope(ctx, bp.UserID, knowledgeQuery, 6, knowledgeScope)
 	reqBody := map[string]interface{}{
 		"model": model,
 		"messages": []chatMsg{
@@ -4094,16 +4395,28 @@ func callLLMForAgentNode(
 		},
 		"stream": false,
 	}
-	if group := firstNonEmpty(node.Data.Group, bp.ModelGroup); group != "" {
-		reqBody["group"] = group
-	}
+	// The /v1 scheduler selects a route from the authenticated API key metadata.
+	// Do not copy the node's configured group into the payload: after failover the
+	// key can belong to another group, and a stale payload group is misleading to
+	// both the proxy and upstream provider.
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
-	apiKey, err := store.getInternalAPIKey(ctx)
+	preferredGroup := firstNonEmpty(node.Data.Group, bp.ModelGroup)
+	apiKeys, err := store.getInternalAPIKeys(ctx, preferredGroup, model)
 	if err != nil {
-		return "", fmt.Errorf("no available api key: %w", err)
+		return "", fmt.Errorf("failed to load internal api keys: %w", err)
+	}
+	if len(apiKeys) == 0 {
+		// Keep the original error path for a malformed/stale model registry. The
+		// request will still produce the upstream diagnostic instead of silently
+		// dropping the conversation.
+		apiKey, keyErr := store.getInternalAPIKey(ctx)
+		if keyErr != nil {
+			return "", fmt.Errorf("no available api key: %w", keyErr)
+		}
+		apiKeys = []agentInternalAPIKey{{Secret: apiKey}}
 	}
 	settings, err := store.Settings(ctx)
 	if err != nil {
@@ -4117,45 +4430,86 @@ func callLLMForAgentNode(
 	if port <= 0 {
 		port = 3000
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(
-		reqCtx,
-		http.MethodPost,
-		fmt.Sprintf("http://%s:%d/v1/chat/completions", host, port),
-		bytes.NewReader(bodyBytes),
-	)
-	if err != nil {
-		return "", err
+	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", host, port)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		selectedKey := apiKeys[(attempt-1)%len(apiKeys)]
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+selectedKey.Secret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("http request failed: %w", err)
+			if attempt < maxAttempts && waitAgentLLMRetry(reqCtx, attempt) {
+				continue
+			}
+			return "", lastErr
+		}
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("failed to read response: %w", readErr)
+			if attempt < maxAttempts && waitAgentLLMRetry(reqCtx, attempt) {
+				continue
+			}
+			return "", lastErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("llm api returned %d from model %q (requested group %q, route group %q): %s", resp.StatusCode, model, preferredGroup, selectedKey.Group, string(respBody))
+			if shouldRetryAgentLLMStatus(resp.StatusCode) && attempt < maxAttempts && waitAgentLLMRetry(reqCtx, attempt) {
+				continue
+			}
+			if shouldRetryAgentLLMStatus(resp.StatusCode) {
+				return "", fmt.Errorf("llm request failed after %d attempts across %d routes: %w", attempt, len(apiKeys), lastErr)
+			}
+			return "", lastErr
+		}
+		content, parseErr := parseAgentLLMResponse(respBody)
+		if parseErr != nil {
+			lastErr = parseErr
+			if attempt < maxAttempts && waitAgentLLMRetry(reqCtx, attempt) {
+				continue
+			}
+			return "", fmt.Errorf("llm response rejected after %d attempts across %d routes: %w", attempt, len(apiKeys), lastErr)
+		}
+		return content, nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http request failed: %w", err)
+	if lastErr != nil {
+		return "", fmt.Errorf("llm request failed after %d attempts across %d routes: %w", maxAttempts, len(apiKeys), lastErr)
 	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+	return "", errors.New("llm request failed without a response")
+}
+
+func shouldRetryAgentLLMStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= 500
+}
+
+func waitAgentLLMRetry(ctx context.Context, attempt int) bool {
+	delay := agentLLMRetryDelay(attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("llm api returned %d: %s", resp.StatusCode, string(respBody))
+}
+
+func agentLLMRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
 	}
-	var chatResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+	delay := time.Duration(1<<uint(attempt-1)) * agentLLMRetryBaseDelay
+	if delay > agentLLMRetryMaxDelay {
+		return agentLLMRetryMaxDelay
 	}
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-	if len(chatResp.Choices) == 0 {
-		return "", errors.New("empty response from model")
-	}
-	return chatResp.Choices[0].Message.Content, nil
+	return delay
 }
 
 // getInternalAPIKey 获取一个可用的内部 API Key（状态为启用且额度足够）
@@ -4169,6 +4523,89 @@ func (s *Store) getInternalAPIKey(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return key, nil
+}
+
+// agentInternalAPIKey is a local API key together with the user-selected
+// routing group. Agent calls run through the public /v1 endpoint, so the key's
+// group (rather than the JSON "group" field) controls scheduler selection.
+type agentInternalAPIKey struct {
+	Secret string
+	Group  string
+}
+
+// getInternalAPIKeys returns usable local keys that can route the requested
+// model. The preferred group is ordered first, followed by other enabled
+// groups. This gives agent jobs a bounded cross-group failover path when one
+// upstream temporarily returns 503/429.
+func (s *Store) getInternalAPIKeys(ctx context.Context, preferredGroup, model string) ([]agentInternalAPIKey, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("store is not initialized")
+	}
+	preferredGroup = normalizeGroupName(preferredGroup)
+	model = strings.TrimSpace(model)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT k.token_key, k.group_name
+		FROM api_keys k
+		WHERE k.status = 1
+		  AND (k.unlimited_quota = 1 OR k.remain_quota > 0)
+		ORDER BY CASE WHEN k.group_name = ? THEN 0 ELSE 1 END, k.id`,
+		preferredGroup)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	keys := make([]agentInternalAPIKey, 0, 4)
+	for rows.Next() {
+		var key agentInternalAPIKey
+		if err := rows.Scan(&key.Secret, &key.Group); err != nil {
+			return nil, err
+		}
+		key.Secret = strings.TrimSpace(key.Secret)
+		key.Group = normalizeGroupName(key.Group)
+		if key.Secret == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if model == "" || len(keys) == 0 {
+		return keys, nil
+	}
+
+	// Channel model lists can contain legacy whitespace/newline formatting. Reuse
+	// modelList instead of relying on SQL string matching, which can accidentally
+	// route a key through a group that cannot serve this model.
+	channels, err := s.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	modelGroups := make(map[string]struct{})
+	for _, channel := range channels {
+		if !channel.Enabled {
+			continue
+		}
+		for _, channelModel := range modelList(channel.Models) {
+			if strings.EqualFold(strings.TrimSpace(channelModel), model) {
+				modelGroups[normalizeGroupName(channel.Group)] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(modelGroups) == 0 {
+		// Preserve the old behavior for a stale model registry. The caller will
+		// still make the request and return the provider's concrete diagnostic.
+		return keys, nil
+	}
+	filtered := make([]agentInternalAPIKey, 0, len(keys))
+	for _, key := range keys {
+		if _, ok := modelGroups[key.Group]; ok {
+			filtered = append(filtered, key)
+		}
+	}
+	return filtered, nil
 }
 
 // ── Prompt 构建 ───────────────────────────────────────────────────────────────
@@ -4286,10 +4723,10 @@ var builtinAgentSkillOrder = []string{
 var builtinAgentSkillAppliesTo = map[string][]string{
 	"skill.web-research":       {"browser", "request", "webpage", "report", "custom"},
 	"skill.file-document":      {"transform", "report", "webpage", "custom"},
-	"skill.browser-automation": {"browser", "xianyu", "custom"},
+	"skill.browser-automation": {"browser", "xianyu", "xianyu_reply", "custom"},
 	"skill.code-interpreter":   {"transform", "image", "report", "custom"},
 	"skill.api-function":       {"request", "notify", "custom"},
-	"skill.rag-file-search":    {"browser", "xianyu", "request", "transform", "report", "custom"},
+	"skill.rag-file-search":    {"browser", "xianyu", "xianyu_reply", "request", "transform", "report", "custom"},
 	"skill.database-sql":       {"request", "transform", "report", "custom"},
 	"skill.mcp-workflow":       {"start", "schedule", "custom", "notify", "stop"},
 }

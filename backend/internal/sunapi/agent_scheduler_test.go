@@ -93,6 +93,24 @@ func TestBuildAgentTriggeredBlueprintKeepsOnlySchedulePath(t *testing.T) {
 	}
 }
 
+func TestParseAgentBlueprintNodesNormalizesLegacyXianyuComponent(t *testing.T) {
+	node := agentBlueprintGraphNode{ID: "xianyu"}
+	node.Data.Kind = "custom"
+	node.Data.ComponentID = "component.xianyu"
+	raw, err := json.Marshal([]agentBlueprintGraphNode{node})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := parseAgentBlueprintNodes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Data.Kind != "xianyu" {
+		t.Fatalf("normalized node = %#v, want xianyu kind", nodes)
+	}
+}
+
 func TestScheduledBlueprintPersistsActiveScheduleState(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
 	if err != nil {

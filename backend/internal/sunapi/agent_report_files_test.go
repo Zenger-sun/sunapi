@@ -171,6 +171,47 @@ func TestBuildAgentReportWorksheetFieldUpdatesFillsProductRows(t *testing.T) {
 	}
 }
 
+func TestBuildAgentReportWorksheetFieldUpdatesMapsProductAliases(t *testing.T) {
+	cells := []agentReportWorksheetCell{
+		{Reference: "A1", Value: "商品ID"},
+		{Reference: "B1", Value: "商品标题"},
+		{Reference: "C1", Value: "浏览次数"},
+		{Reference: "A2", Value: "old"},
+		{Reference: "B2", Value: "old title"},
+		{Reference: "C2", Value: "0"},
+	}
+	updates := buildAgentReportWorksheetFieldUpdates(cells, agentReportTemplateContext{
+		fields: map[string]string{},
+		products: []map[string]string{{
+			"商品编号": "p-1",
+			"商品名称": "新商品",
+			"访问次数": "88",
+		}},
+	})
+	if updates["A2"] != "p-1" || updates["B2"] != "新商品" || updates["C2"] != "88" {
+		t.Fatalf("product aliases=%#v", updates)
+	}
+}
+
+func TestBuildAgentReportTemplateContextExtractsProductsFromBrowserTables(t *testing.T) {
+	context := buildAgentReportTemplateContext(map[string]interface{}{
+		"browser": map[string]interface{}{
+			"tables": []interface{}{
+				[]interface{}{
+					[]interface{}{"商品ID", "商品标题", "曝光次数"},
+					[]interface{}{"p-1", "新商品", "88"},
+				},
+			},
+		},
+	})
+	if len(context.products) != 1 {
+		t.Fatalf("products=%#v, want one row", context.products)
+	}
+	if context.products[0]["商品ID"] != "p-1" || context.products[0]["商品标题"] != "新商品" || context.products[0]["曝光次数"] != "88" {
+		t.Fatalf("product row=%#v", context.products[0])
+	}
+}
+
 func TestBuildAgentReportWorksheetFieldUpdatesFillsRankingRows(t *testing.T) {
 	cells := []agentReportWorksheetCell{
 		{Reference: "A1", Value: "排行类型"},

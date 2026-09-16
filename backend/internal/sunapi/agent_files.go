@@ -992,6 +992,9 @@ func buildAgentReportTemplateContext(templateData map[string]interface{}) agentR
 		rankings: extractAgentReportTemplateRows(templateData, "rankings", "商品排行"),
 		orders:   extractAgentReportTemplateRows(templateData, "orders", "订单明细"),
 	}
+	if len(context.products) == 0 {
+		context.products = extractAgentReportProductRowsFromTables(templateData)
+	}
 	texts := []string{}
 	var walk func(string, interface{})
 	walk = func(key string, value interface{}) {
@@ -1019,6 +1022,9 @@ func buildAgentReportTemplateContext(templateData map[string]interface{}) agentR
 			if normalizedKey != "" {
 				context.fields[normalizedKey] = trimmed
 			}
+			if (normalizedKey == "date" || normalizedKey == "period" || normalizedKey == normalizeAgentReportFieldName("统计日期")) && context.date == "" {
+				context.date = extractAgentReportDate(trimmed)
+			}
 			if normalizedKey == "text" || normalizedKey == "content" || normalizedKey == "body" {
 				texts = append(texts, trimmed)
 			}
@@ -1039,10 +1045,12 @@ func buildAgentReportTemplateContext(templateData map[string]interface{}) agentR
 	}
 	walk("", templateData)
 
-	for _, text := range texts {
-		if date := extractAgentReportDate(text); date != "" {
-			context.date = date
-			break
+	if context.date == "" {
+		for _, text := range texts {
+			if date := extractAgentReportDate(text); date != "" {
+				context.date = date
+				break
+			}
 		}
 	}
 	for _, text := range texts {
@@ -1083,6 +1091,111 @@ func extractAgentReportTemplateRows(value interface{}, keys ...string) []map[str
 		return nil
 	}
 	return walk(value)
+}
+
+func extractAgentReportProductRowsFromTables(value interface{}) []map[string]string {
+	var walk func(interface{}) []map[string]string
+	walk = func(current interface{}) []map[string]string {
+		switch typed := current.(type) {
+		case [][][]string:
+			for _, table := range typed {
+				if rows := agentReportProductRowsFromTable(table); len(rows) > 0 {
+					return rows
+				}
+			}
+		case []interface{}:
+			if table, ok := agentReportStringTable(typed); ok {
+				if rows := agentReportProductRowsFromTable(table); len(rows) > 0 {
+					return rows
+				}
+			}
+			for _, child := range typed {
+				if rows := walk(child); len(rows) > 0 {
+					return rows
+				}
+			}
+		case map[string]interface{}:
+			for key, child := range typed {
+				if normalizeAgentReportFieldName(key) == "tables" {
+					if rows := walk(child); len(rows) > 0 {
+						return rows
+					}
+				}
+				if rows := walk(child); len(rows) > 0 {
+					return rows
+				}
+			}
+		}
+		return nil
+	}
+	return walk(value)
+}
+
+func agentReportStringTable(value []interface{}) ([][]string, bool) {
+	if len(value) < 2 {
+		return nil, false
+	}
+	table := make([][]string, 0, len(value))
+	for _, rawRow := range value {
+		var rawCells []interface{}
+		switch typed := rawRow.(type) {
+		case []interface{}:
+			rawCells = typed
+		case []string:
+			row := append([]string(nil), typed...)
+			table = append(table, row)
+			continue
+		default:
+			return nil, false
+		}
+		row := make([]string, 0, len(rawCells))
+		for _, rawCell := range rawCells {
+			if rawCell == nil {
+				row = append(row, "")
+				continue
+			}
+			row = append(row, strings.TrimSpace(fmt.Sprint(rawCell)))
+		}
+		table = append(table, row)
+	}
+	return table, true
+}
+
+func agentReportProductRowsFromTable(table [][]string) []map[string]string {
+	if len(table) < 2 {
+		return nil
+	}
+	headers := make([]string, len(table[0]))
+	hasProductID := false
+	hasProductTitle := false
+	for index, header := range table[0] {
+		headers[index] = strings.TrimSpace(header)
+		switch normalizeAgentReportFieldName(header) {
+		case normalizeAgentReportFieldName("商品ID"):
+			hasProductID = true
+		case normalizeAgentReportFieldName("商品标题"):
+			hasProductTitle = true
+		}
+	}
+	if !hasProductID || !hasProductTitle {
+		return nil
+	}
+	products := make([]map[string]string, 0, len(table)-1)
+	for _, values := range table[1:] {
+		row := make(map[string]string, len(headers))
+		for index, value := range values {
+			if index >= len(headers) || headers[index] == "" {
+				continue
+			}
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				row[headers[index]] = trimmed
+			}
+		}
+		if len(row) > 0 {
+			products = append(products, row)
+		}
+	}
+	return products
 }
 
 func agentReportStringRows(value interface{}) []map[string]string {
@@ -1377,7 +1490,16 @@ func lookupAgentReportRowValue(row map[string]string, label string) string {
 		return ""
 	}
 	aliases := map[string][]string{
+		normalizeAgentReportFieldName("商品ID"):    {"商品ID", "商品编号", "宝贝ID", "宝贝编号"},
+		normalizeAgentReportFieldName("商品标题"):    {"商品标题", "商品名称", "商品", "宝贝标题", "宝贝名称"},
 		normalizeAgentReportFieldName("价格"):      {"价格", "价格(元)", "售价"},
+		normalizeAgentReportFieldName("曝光次数"):    {"曝光次数", "商品曝光次数", "曝光量"},
+		normalizeAgentReportFieldName("曝光人数"):    {"曝光人数", "商品曝光人数"},
+		normalizeAgentReportFieldName("浏览次数"):    {"浏览次数", "商品浏览次数", "商品访问次数", "访问次数"},
+		normalizeAgentReportFieldName("浏览人数"):    {"浏览人数", "商品浏览人数", "访客数"},
+		normalizeAgentReportFieldName("点击率"):     {"点击率", "曝光点击率"},
+		normalizeAgentReportFieldName("订单人数"):    {"订单人数", "下单人数"},
+		normalizeAgentReportFieldName("支付人数"):    {"支付人数", "支付买家数"},
 		normalizeAgentReportFieldName("支付订单数"):   {"支付订单数", "支付笔数", "订单数"},
 		normalizeAgentReportFieldName("支付金额"):    {"支付金额", "支付金额(元)", "成交金额"},
 		normalizeAgentReportFieldName("浏览支付转化率"): {"浏览支付转化率", "支付转化率"},

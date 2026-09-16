@@ -23,6 +23,7 @@ import (
 type Store struct {
 	db                        *sql.DB
 	dataDir                   string
+	knowledgeFTSAvailable     bool
 	playgroundImageHandlersMu sync.RWMutex
 	playgroundImageHandlers   *openai.OpenAIAPIHandler
 	agentSchedulerMu          sync.Mutex
@@ -30,6 +31,8 @@ type Store struct {
 	agentSchedulerWG          sync.WaitGroup
 	agentScheduledRunsMu      sync.Mutex
 	agentScheduledRuns        map[string]struct{}
+	agentActiveRunsMu         sync.Mutex
+	agentActiveRuns           map[string]map[string]context.CancelFunc
 }
 
 const (
@@ -53,6 +56,7 @@ func OpenStore(path string) (*Store, error) {
 		db:                 db,
 		dataDir:            filepath.Dir(path),
 		agentScheduledRuns: make(map[string]struct{}),
+		agentActiveRuns:    make(map[string]map[string]context.CancelFunc),
 	}
 	if err := store.migrate(context.Background()); err != nil {
 		_ = db.Close()
@@ -72,6 +76,7 @@ func (s *Store) Close() error {
 		cancel()
 		s.agentSchedulerWG.Wait()
 	}
+	s.cancelAllAgentRuns()
 	return s.db.Close()
 }
 
@@ -392,6 +397,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_time INTEGER NOT NULL,
 			UNIQUE(knowledge_base_id, content_hash)
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_faqs (
+			id TEXT PRIMARY KEY,
+			knowledge_base_id TEXT NOT NULL,
+			user_id INTEGER NOT NULL DEFAULT 1,
+			question TEXT NOT NULL,
+			answer TEXT NOT NULL,
+			keywords TEXT NOT NULL DEFAULT '',
+			created_time INTEGER NOT NULL,
+			updated_time INTEGER NOT NULL,
+			UNIQUE(knowledge_base_id, question)
+		)`,
 		`CREATE TABLE IF NOT EXISTS knowledge_chunks (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			document_id TEXT NOT NULL,
@@ -431,6 +447,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_agent_components_user ON agent_components(user_id, created_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_bases_user ON knowledge_bases(user_id, updated_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_documents_base ON knowledge_documents(knowledge_base_id, created_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_faqs_base ON knowledge_faqs(user_id, knowledge_base_id, updated_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_base ON knowledge_chunks(user_id, knowledge_base_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_base ON knowledge_bindings(knowledge_base_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_scope ON knowledge_bindings(user_id, target_type, target_id)`,
@@ -549,7 +566,34 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES ('default', '默认分组', 1, ?, ?)`, now, now); err != nil {
 		return err
 	}
+	// FTS5 is an optional acceleration layer. Keyword scanning remains the
+	// compatibility fallback for SQLite builds without the extension.
+	s.knowledgeFTSAvailable = s.ensureKnowledgeFTS(ctx) == nil
 	return nil
+}
+
+func (s *Store) ensureKnowledgeFTS(ctx context.Context) error {
+	statements := []string{
+		`CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(content, content='knowledge_chunks', content_rowid='id')`,
+		`CREATE TRIGGER IF NOT EXISTS knowledge_chunks_fts_ai AFTER INSERT ON knowledge_chunks BEGIN
+			INSERT INTO knowledge_chunks_fts(rowid, content) VALUES (new.id, new.content);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS knowledge_chunks_fts_ad AFTER DELETE ON knowledge_chunks BEGIN
+			INSERT INTO knowledge_chunks_fts(knowledge_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS knowledge_chunks_fts_au AFTER UPDATE OF content ON knowledge_chunks BEGIN
+			INSERT INTO knowledge_chunks_fts(knowledge_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
+			INSERT INTO knowledge_chunks_fts(rowid, content) VALUES (new.id, new.content);
+		END`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	// Rebuild also covers databases created before the FTS table existed.
+	_, err := s.db.ExecContext(ctx, `INSERT INTO knowledge_chunks_fts(knowledge_chunks_fts) VALUES ('rebuild')`)
+	return err
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {

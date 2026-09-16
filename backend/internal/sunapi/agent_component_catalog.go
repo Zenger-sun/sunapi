@@ -26,7 +26,6 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.schedule", "定时", "按固定时间自动触发任务。", "schedule", "trigger", "system.scheduler", "skill.mcp-workflow", []string{}, []string{"定时信号"}, map[string]string{"执行频率": "每天", "执行时间": "08:30", "时区": "Asia/Shanghai"}, []string{"trigger", "schedule"}),
 	builtinComponent("component.stop", "停止", "用于中断流程、循环控制或标记流程结束。", "stop", "control", "system.runner", "skill.mcp-workflow", []string{"执行结果"}, []string{"结束状态"}, map[string]string{"结束方式": "本轮完成后停止"}, []string{"control"}),
 	builtinComponent("component.browser", "打开浏览器", "打开指定网页并采集页面内容；需要登录时可复用已保存的浏览器会话。", "browser", "collect", "gpt-4.1-mini", "skill.browser-automation", []string{"网址", "登录要求"}, []string{"浏览器会话", "登录状态"}, map[string]string{"网址": "", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "默认", "登录等待": "120s", "权限": "只读采集", "采集等待": "6s"}, []string{"browser", "session", "data"}),
-	builtinComponent("component.xianyu", "闲鱼客服归档", "复用闲鱼卖家后台登录态，只读阅读客服对话，脱敏总结后写入当前智能体选择的知识库。", "xianyu", "collect", "gpt-4.1", "skill.browser-automation", []string{"闲鱼客服会话", "当前智能体知识库"}, []string{"知识库文档", "会话统计"}, map[string]string{"网址": "https://seller.goofish.com/?site=COMM", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "闲鱼客服", "登录等待": "180s", "列表等待": "8s", "会话数量": "20", "同步范围": "仅归档未归档或有新消息的会话", "单会话等待": "1s", "历史加载轮数": "6", "权限": "只读采集", "节点超时": "10m"}, []string{"xianyu", "customer-service", "knowledge"}),
 	builtinComponent("component.request", "API / 网页请求", "发起 HTTP 请求，获取接口或页面的结构化原始数据。", "request", "collect", "gpt-4.1-mini", "skill.api-function", []string{"任务描述"}, []string{"JSON 数据", "请求日志"}, map[string]string{"网址": "", "方法": "GET", "超时": "30s", "重试": "1 次"}, []string{"http", "api"}),
 	builtinComponent("component.webhook", "Webhook 触发", "接收外部系统回调并把请求体作为蓝图输入。", "custom", "trigger", "system.runner", "skill.api-function", []string{"Webhook 请求"}, []string{"请求体", "请求头"}, map[string]string{"路径": "/api/agent-webhooks/{blueprint_id}", "方法": "POST", "鉴权": "可选密钥", "密钥": ""}, []string{"webhook", "trigger"}),
 	builtinComponent("component.branch", "条件分支", "根据上游数据和条件表达式输出是/否分支结果。", "custom", "control", "gpt-4.1-mini", "skill.mcp-workflow", []string{"上游数据", "条件"}, []string{"分支结果", "命中数据"}, map[string]string{"条件": "status=ok", "真分支": "通过", "假分支": "未通过"}, []string{"branch", "condition", "control"}),
@@ -46,6 +45,14 @@ var builtinAgentComponents = []AgentComponent{
 	builtinComponent("component.report", "生成报告", "按上游数据、当前描述和模板生成结构化报告文档。", "report", "output", "gpt-4.1", "skill.file-document", []string{"标准表格", "关键结论", "图片 URL"}, []string{"Markdown 文档", "CSV 表格"}, map[string]string{"输出目录": "data/output/reports", "输出格式": "Markdown 文档、CSV 表格"}, []string{"report", "document"}),
 	builtinComponent("component.webpage", "输出网页", "将结果数据渲染成可访问网页，支持自定义模板。", "webpage", "output", "gpt-4.1", "skill.file-document", []string{"Markdown 文档", "CSV 表格"}, []string{"网页 URL", "数据文件"}, map[string]string{"输出目录": "data/output/web-reports", "输出模式": "输出网页 + 数据"}, []string{"html", "report"}),
 	builtinComponent("component.notify", "发送通知", "将任务结果发送到邮件、飞书、企业微信、Slack 或 Webhook。", "notify", "output", "gpt-4.1-mini", "skill.api-function", []string{"消息内容", "通知目标"}, []string{"发送结果"}, map[string]string{"渠道": "Webhook", "通知目标": "", "Webhook": "", "确认": "发送前确认", "超时": "30s"}, []string{"notification", "webhook"}),
+}
+
+// Specialized business workflows stay outside the generic built-in catalog.
+// They are exposed as custom components so the built-in palette remains reusable.
+var customAgentComponents = []AgentComponent{
+	customComponent("component.xianyu", "闲鱼客服归档", "复用闲鱼卖家后台登录态，只读阅读客服对话和当前商品信息，脱敏总结后逐会话写入当前智能体选择的知识库。默认读取列表中的全部会话，每条成功后立即保存，任务中断后可从未完成会话继续。", "xianyu", "collect", "gpt-5.6-terra", "skill.browser-automation", []string{"闲鱼客服会话", "当前智能体知识库"}, []string{"知识库文档", "会话统计"}, map[string]string{"网址": "https://seller.goofish.com/?site=COMM", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "闲鱼客服", "登录等待": "180s", "列表等待": "8s", "会话数量": "全部", "最大会话保护上限": "5000", "同步范围": "仅归档未归档或有新消息的会话", "单会话等待": "1s", "历史加载轮数": "6", "对话列表选择器": "", "消息区域选择器": "", "消息滚动容器选择器": "", "商品详情选择器": "", "权限": "只读采集", "节点超时": "不限制"}, []string{"xianyu", "customer-service", "knowledge"}),
+	customComponent("component.xianyu-reply", "闲鱼实时智能客服", "监听已打开的闲鱼卖家工作台页面。新买家消息到达时读取当前商品和最近对话，检索当前智能体知识库并直接自动回复；无匹配或模型拒答时结合商品描述和状态发送回复。", "xianyu_reply", "process", "gpt-5.6-terra", "skill.browser-automation", []string{"闲鱼新消息", "当前智能体知识库"}, []string{"自动回复统计", "监听状态"}, map[string]string{"网址": "https://seller.goofish.com/?site=COMM", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "闲鱼客服", "登录等待": "180s", "列表等待": "8s", "消息轮询间隔": "2s", "每轮最大会话数": "20", "单会话等待": "1s", "启动时处理现有未读": "是", "最大回复字数": "300", "默认回复": "开启", "无知识库命中": "商品描述和状态回复", "发送方式": "检测到买家消息立即自动发送", "对话列表选择器": "", "消息区域选择器": "", "消息滚动容器选择器": "", "商品详情选择器": "", "消息输入框选择器": "", "发送按钮选择器": "", "节点超时": "不限制"}, []string{"xianyu", "customer-service", "knowledge", "auto-reply", "realtime"}),
+	customComponent("component.xianyu-review", "闲鱼自动评价", "复用闲鱼卖家后台登录态，扫描全部客服会话和订单区域，仅对明确显示可评价入口的已完成交易填写评价并提交；已评价、无订单或无法确认状态的会话自动跳过。", "xianyu_review", "process", "system.runner", "skill.browser-automation", []string{"闲鱼客服会话", "订单信息"}, []string{"评价统计", "操作日志"}, map[string]string{"网址": "https://seller.goofish.com/?site=COMM", "登录态": "持久化登录会话（首次登录后复用）", "会话名称": "闲鱼客服", "登录等待": "180s", "列表等待": "8s", "评价内容": "沟通顺畅，交易愉快。", "评价星级": "5", "会话数量": "全部", "单会话等待": "1s", "对话列表选择器": "", "订单区域选择器": "", "评价入口选择器": "", "评价输入框选择器": "", "评价提交按钮选择器": "", "权限": "读写操作", "节点超时": "不限制"}, []string{"xianyu", "review", "order", "write-operation", "customer-service"}),
 }
 
 func builtinComponent(id, name, description, kind, group, model, skill string, inputs, outputs []string, settings map[string]string, tags []string) AgentComponent {
@@ -73,6 +80,12 @@ func builtinComponent(id, name, description, kind, group, model, skill string, i
 	}
 }
 
+func customComponent(id, name, description, kind, group, model, skill string, inputs, outputs []string, settings map[string]string, tags []string) AgentComponent {
+	component := builtinComponent(id, name, description, kind, group, model, skill, inputs, outputs, settings, append([]string{"custom-component"}, tags...))
+	component.Source = "custom"
+	return component
+}
+
 func mustComponentConfig(payload componentConfigPayload) json.RawMessage {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -81,10 +94,15 @@ func mustComponentConfig(payload componentConfigPayload) json.RawMessage {
 	return raw
 }
 
-func mergeBuiltinAgentComponents(userID int64, custom []AgentComponent) []AgentComponent {
-	out := make([]AgentComponent, 0, len(builtinAgentComponents)+len(custom))
+func mergeAgentComponents(userID int64, custom []AgentComponent) []AgentComponent {
+	out := make([]AgentComponent, 0, len(builtinAgentComponents)+len(customAgentComponents)+len(custom))
 	seen := map[string]bool{}
 	for _, component := range builtinAgentComponents {
+		component.UserID = userID
+		out = append(out, component)
+		seen[component.ID] = true
+	}
+	for _, component := range customAgentComponents {
 		component.UserID = userID
 		out = append(out, component)
 		seen[component.ID] = true

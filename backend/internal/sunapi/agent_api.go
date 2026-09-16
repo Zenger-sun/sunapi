@@ -39,6 +39,7 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 
 	// ── 执行日志 ────────────────────────────────────────────────────────
 	api.GET("/agents/:id/blueprints/:bpID/logs", handleListExecutionLogs(store))
+	api.GET("/agents/:id/blueprints/:bpID/reply-records", handleListXianyuReplyRecords(store))
 
 	// ── 归档文件下载 ────────────────────────────────────────────────────
 	api.GET("/agents/archives/files/*path", handleServeArchiveFile(store))
@@ -62,6 +63,10 @@ func registerAgentRoutes(engine *gin.Engine, store *Store) {
 	api.POST("/knowledge-bases/:id/documents", handleUploadKnowledgeDocument(store))
 	api.GET("/knowledge-bases/:id/documents/:docID", handleGetKnowledgeDocument(store))
 	api.DELETE("/knowledge-bases/:id/documents/:docID", handleDeleteKnowledgeDocument(store))
+	api.GET("/knowledge-bases/:id/faqs", handleListKnowledgeFAQs(store))
+	api.POST("/knowledge-bases/:id/faqs", handleCreateKnowledgeFAQ(store))
+	api.PUT("/knowledge-bases/:id/faqs/:faqID", handleUpdateKnowledgeFAQ(store))
+	api.DELETE("/knowledge-bases/:id/faqs/:faqID", handleDeleteKnowledgeFAQ(store))
 
 	// ── Skill CRUD ────────────────────────────────────────────────────────
 	api.GET("/agent-skills", handleListSkills(store))
@@ -214,6 +219,7 @@ func handlePauseBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
+		store.cancelAgentRuns(bpID)
 		bp.Status = "paused"
 		ok(c, bp)
 	}
@@ -258,6 +264,10 @@ func handleRetryBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
+		if store.isAgentRunActive(bp.ID) {
+			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
+			return
+		}
 		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, "running", ""); err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -278,7 +288,7 @@ func handleRunBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
-		if bp.Status == "running" || store.isAgentScheduledRunActive(bp.ID) {
+		if bp.Status == "running" || store.isAgentScheduledRunActive(bp.ID) || store.isAgentRunActive(bp.ID) {
 			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
 			return
 		}
@@ -316,21 +326,37 @@ func handleAgentWebhookTrigger(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusUnauthorized, err)
 			return
 		}
+		if blueprintHasXianyuReplyNode(bp) && (bp.Status == "running" || store.isAgentRunActive(bp.ID)) {
+			ok(c, gin.H{
+				"accepted":        true,
+				"already_running": true,
+				"blueprint_id":    bp.ID,
+				"agent_id":        bp.AgentID,
+				"status":          "running",
+			})
+			return
+		}
 
 		payload, err := buildAgentWebhookInput(c)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		inputVars, _ := json.Marshal(map[string]interface{}{
-			"webhook":         payload,
-			"webhook_body":    payload["body"],
-			"webhook_headers": payload["headers"],
-			"webhook_query":   payload["query"],
-			"webhook_method":  payload["method"],
-			"webhook_path":    payload["path"],
-			"triggered_at":    time.Now().Format(time.RFC3339),
-		})
+		// Webhook fields are transient execution inputs. Preserve blueprint-scoped
+		// variables (including the selected knowledge bases) while overlaying them.
+		vars := make(map[string]interface{})
+		if len(bp.InputVariables) > 0 && string(bp.InputVariables) != "null" {
+			if err := json.Unmarshal(bp.InputVariables, &vars); err != nil {
+				fail(c, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		vars = mergeAgentWebhookInput(vars, payload, time.Now().Format(time.RFC3339))
+		inputVars, err := json.Marshal(vars)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
 		runBP := *bp
 		runBP.InputVariables = inputVars
 
@@ -346,6 +372,22 @@ func handleAgentWebhookTrigger(store *Store) gin.HandlerFunc {
 			"status":       "running",
 		})
 	}
+}
+
+// mergeAgentWebhookInput overlays the latest webhook event while retaining
+// variables configured on the blueprint.
+func mergeAgentWebhookInput(vars map[string]interface{}, payload map[string]interface{}, triggeredAt string) map[string]interface{} {
+	if vars == nil {
+		vars = make(map[string]interface{})
+	}
+	vars["webhook"] = payload
+	vars["webhook_body"] = payload["body"]
+	vars["webhook_headers"] = payload["headers"]
+	vars["webhook_query"] = payload["query"]
+	vars["webhook_method"] = payload["method"]
+	vars["webhook_path"] = payload["path"]
+	vars["triggered_at"] = triggeredAt
+	return vars
 }
 
 func buildAgentWebhookInput(c *gin.Context) (map[string]interface{}, error) {
@@ -415,6 +457,22 @@ func blueprintHasWebhookTrigger(bp *AgentBlueprint) bool {
 	return false
 }
 
+func blueprintHasXianyuReplyNode(bp *AgentBlueprint) bool {
+	if bp == nil {
+		return false
+	}
+	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
+	if err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if node.Data.Kind == "xianyu_reply" || node.Data.ComponentID == "component.xianyu-reply" {
+			return true
+		}
+	}
+	return false
+}
+
 func agentWebhookSecret(bp *AgentBlueprint) string {
 	nodes, err := parseAgentBlueprintNodes(bp.Nodes)
 	if err == nil {
@@ -458,6 +516,34 @@ func handleListExecutionLogs(store *Store) gin.HandlerFunc {
 			return
 		}
 		ok(c, logs)
+	}
+}
+
+// handleListXianyuReplyRecords returns the compact operator audit trail for
+// the realtime Xianyu responder. The agent/blueprint ownership check prevents
+// a valid blueprint id from exposing another agent's conversation records.
+func handleListXianyuReplyRecords(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		bpID := strings.TrimSpace(c.Param("bpID"))
+		agentID := strings.TrimSpace(c.Param("id"))
+		userID := playgroundUserID(c)
+		bp, err := store.GetBlueprint(c.Request.Context(), bpID, userID)
+		if err != nil || bp == nil || (agentID != "" && bp.AgentID != agentID) {
+			fail(c, http.StatusNotFound, errNotFound("blueprint"))
+			return
+		}
+		limit := 50
+		if v := c.Query("limit"); v != "" {
+			if n, parseErr := strconv.Atoi(v); parseErr == nil && n > 0 {
+				limit = n
+			}
+		}
+		records, err := store.ListAgentXianyuReplyRecords(c.Request.Context(), bpID, limit)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, records)
 	}
 }
 
@@ -572,7 +658,7 @@ func handleListComponents(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		ok(c, mergeBuiltinAgentComponents(userID, customComponents))
+		ok(c, mergeAgentComponents(userID, customComponents))
 	}
 }
 

@@ -492,11 +492,10 @@ func (s *Store) UpdateBlueprintAfterRun(ctx context.Context, id, executionStatus
 		}
 
 		status := executionStatus
-		if isRecurringAgentScheduledBlueprint(bp) {
+		if bp.Status == "paused" {
+			status = "paused"
+		} else if isRecurringAgentScheduledBlueprint(bp) {
 			status = "running"
-			if bp.Status == "paused" {
-				status = "paused"
-			}
 		}
 		result, err := s.db.ExecContext(ctx, `
 			UPDATE agent_blueprints
@@ -769,6 +768,24 @@ func (s *Store) FinishExecutionLog(ctx context.Context, id string, status, error
 		SET status=?, end_time=?, duration_ms=?, output=?, error_msg=?, archive_path=?
 		WHERE id=?`,
 		status, now, durationMs, output, errorMsg, archivePath, id)
+	return err
+}
+
+// UpdateExecutionProgress stores a small, transient progress envelope while
+// an execution is running. The final result is written by FinishExecutionLog.
+// Keeping the status as running lets existing polling clients distinguish this
+// snapshot from a completed execution without a schema migration.
+func (s *Store) UpdateExecutionProgress(ctx context.Context, id string, output json.RawMessage) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("execution id is required")
+	}
+	if len(output) == 0 || string(output) == "null" {
+		output = json.RawMessage(`{}`)
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE agent_execution_logs
+		SET output=?
+		WHERE id=? AND status='running'`, output, id)
 	return err
 }
 

@@ -68,11 +68,35 @@ func TestBuiltinAgentComponentsDoesNotExposeBusinessTemplates(t *testing.T) {
 		"component.report-data":       true,
 		"component.order-report-data": true,
 		"component.ticket_grab":       true,
+		"component.xianyu":            true,
 	}
 	for _, component := range builtinAgentComponents {
 		if hidden[component.ID] {
 			t.Fatalf("business template must not be exposed in the generic catalog: %#v", component)
 		}
+	}
+}
+
+func TestXianyuComponentIsCustom(t *testing.T) {
+	var found bool
+	for _, component := range customAgentComponents {
+		if component.ID != "component.xianyu" {
+			continue
+		}
+		found = true
+		if component.Source != "custom" || component.Kind != "xianyu" {
+			t.Fatalf("unexpected xianyu component source: %#v", component)
+		}
+		var config componentConfigPayload
+		if err := json.Unmarshal(component.Config, &config); err != nil {
+			t.Fatal(err)
+		}
+		if config.ModelName != "gpt-5.6-terra" || config.Settings["会话数量"] != "全部" || config.Settings["最大会话保护上限"] != "5000" || config.Settings["节点超时"] != "不限制" {
+			t.Fatalf("xianyu defaults are not configured for full scan: %#v", config)
+		}
+	}
+	if !found {
+		t.Fatal("xianyu component is missing from custom catalog")
 	}
 }
 

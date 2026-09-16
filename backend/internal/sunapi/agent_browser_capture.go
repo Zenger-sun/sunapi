@@ -46,16 +46,17 @@ type AgentBrowserCaptureRequest struct {
 }
 
 type AgentBrowserCaptureResult struct {
-	URL             string `json:"url"`
-	FinalURL        string `json:"final_url"`
-	Title           string `json:"title"`
-	Text            string `json:"text"`
-	ScreenshotPath  string `json:"screenshot_path,omitempty"`
-	ScreenshotError string `json:"screenshot_error,omitempty"`
-	CapturedAt      int64  `json:"captured_at"`
-	ElapsedMS       int64  `json:"elapsed_ms"`
-	BrowserSession  string `json:"browser_session"`
-	BrowserTargetID string `json:"browser_target_id,omitempty"`
+	URL             string       `json:"url"`
+	FinalURL        string       `json:"final_url"`
+	Title           string       `json:"title"`
+	Text            string       `json:"text"`
+	Tables          [][][]string `json:"tables,omitempty"`
+	ScreenshotPath  string       `json:"screenshot_path,omitempty"`
+	ScreenshotError string       `json:"screenshot_error,omitempty"`
+	CapturedAt      int64        `json:"captured_at"`
+	ElapsedMS       int64        `json:"elapsed_ms"`
+	BrowserSession  string       `json:"browser_session"`
+	BrowserTargetID string       `json:"browser_target_id,omitempty"`
 }
 
 type agentBrowserTarget struct {
@@ -179,6 +180,7 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		FinalURL:        finalURL,
 		Title:           payload.Title,
 		Text:            text,
+		Tables:          payload.Tables,
 		ScreenshotPath:  screenshotPath,
 		ScreenshotError: screenshotError,
 		CapturedAt:      capturedAt.Unix(),
@@ -578,13 +580,36 @@ func agentBrowserCDPCall(ctx context.Context, conn *websocket.Conn, id int, meth
 }
 
 type agentBrowserTextPayload struct {
-	Title string `json:"title"`
-	URL   string `json:"url"`
-	Text  string `json:"text"`
+	Title  string       `json:"title"`
+	URL    string       `json:"url"`
+	Text   string       `json:"text"`
+	Tables [][][]string `json:"tables,omitempty"`
 }
 
 func evaluateAgentBrowserText(ctx context.Context, conn *websocket.Conn, id int) (agentBrowserTextPayload, error) {
-	expression := `JSON.stringify({title: document.title || "", url: location.href || "", text: document.body ? document.body.innerText : ""})`
+	expression := `JSON.stringify((() => {
+  const clean = value => (value || "").replace(/\\s+/g, " ").trim();
+  const tables = [];
+  const seen = new Set();
+  const roots = Array.from(document.querySelectorAll("table, [role=table], [role=grid]"));
+  for (const root of roots) {
+    let rows = Array.from(root.querySelectorAll("tr")).map(row =>
+      Array.from(row.cells || []).map(cell => clean(cell.innerText))
+    );
+    if (!rows.some(row => row.length > 0)) {
+      rows = Array.from(root.querySelectorAll("[role=row]")).map(row =>
+        Array.from(row.querySelectorAll(":scope > [role=columnheader], :scope > [role=cell], :scope > [role=gridcell]")).map(cell => clean(cell.innerText))
+      );
+    }
+    rows = rows.filter(row => row.some(Boolean));
+    const signature = JSON.stringify(rows);
+    if (rows.length > 1 && !seen.has(signature)) {
+      seen.add(signature);
+      tables.push(rows);
+    }
+  }
+  return {title: document.title || "", url: location.href || "", text: document.body ? document.body.innerText : "", tables};
+})())`
 	raw, err := agentBrowserCDPCall(ctx, conn, id, "Runtime.evaluate", map[string]any{
 		"expression":    expression,
 		"returnByValue": true,
