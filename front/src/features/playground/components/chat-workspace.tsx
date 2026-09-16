@@ -22,10 +22,7 @@ import type {
   ModelOption,
 } from '../types'
 import { ChatSuggestions } from './chat-suggestions'
-import {
-  KnowledgeScopeSelector,
-  type KnowledgeScopeValue,
-} from './knowledge-scope-selector'
+import type { KnowledgeScopeValue } from './knowledge-scope-selector'
 import { PlaygroundChat } from './playground-chat'
 import { PlaygroundInput } from './playground-input'
 
@@ -231,13 +228,6 @@ export function ChatWorkspace({
 
       <div className='bg-background shrink-0 px-3 pt-2 pb-3 md:px-6'>
         <div className='mx-auto w-full max-w-3xl'>
-          <KnowledgeScopeSelector
-            value={knowledgeScope}
-            onChange={setKnowledgeScope}
-            disabled={isGenerating}
-            compact
-            className='mb-2'
-          />
           <PlaygroundInput
             disabled={isGenerating}
             groupValue={config.group}
@@ -250,6 +240,8 @@ export function ChatWorkspace({
             onModelChange={(value) => onConfigChange('model', value)}
             onStop={stopGeneration}
             onSubmit={handleSendMessage}
+            knowledgeScope={knowledgeScope}
+            onKnowledgeScopeChange={setKnowledgeScope}
           />
         </div>
       </div>

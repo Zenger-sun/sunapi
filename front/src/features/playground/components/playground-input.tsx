@@ -16,7 +16,6 @@ import {
   FileIcon,
   ScreenShareIcon,
   CameraIcon,
-  GlobeIcon,
   SendIcon,
   SquareIcon,
   BarChartIcon,
@@ -49,6 +48,10 @@ import { Suggestion, Suggestions } from '@/components/ai-elements/suggestion'
 import { ModelGroupSelector } from '@/components/model-group-selector'
 import { uploadPlaygroundAttachment } from '../api'
 import type { MessageAttachment, ModelOption, GroupOption } from '../types'
+import {
+  KnowledgeScopeSelector,
+  type KnowledgeScopeValue,
+} from './knowledge-scope-selector'
 
 interface PlaygroundInputProps {
   onSubmit: (text: string, attachments: MessageAttachment[]) => void
@@ -62,6 +65,8 @@ interface PlaygroundInputProps {
   groups: GroupOption[]
   groupValue: string
   onGroupChange: (value: string) => void
+  knowledgeScope: KnowledgeScopeValue
+  onKnowledgeScopeChange: (next: KnowledgeScopeValue) => void
 }
 
 type PlaygroundSuggestion = {
@@ -123,6 +128,8 @@ export function PlaygroundInput({
   groups,
   groupValue,
   onGroupChange,
+  knowledgeScope,
+  onKnowledgeScopeChange,
 }: PlaygroundInputProps) {
   const { t } = useTranslation()
   const [text, setText] = useState('')
@@ -244,16 +251,12 @@ export function PlaygroundInput({
               </DropdownMenuContent>
             </DropdownMenu>
 
-            <PromptInputButton
-              className='border font-medium'
+            <KnowledgeScopeSelector
+              value={knowledgeScope}
+              onChange={onKnowledgeScopeChange}
               disabled={disabled || isUploading}
-              onClick={() => toast.info(t('Search feature in development'))}
-              variant='outline'
-            >
-              <GlobeIcon size={16} />
-              <span className='hidden sm:inline'>{t('Search')}</span>
-              <span className='sr-only sm:hidden'>{t('Search')}</span>
-            </PromptInputButton>
+              toolbar
+            />
           </PromptInputTools>
 
           <div className='flex items-center gap-1.5 md:gap-2'>

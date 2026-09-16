@@ -124,6 +124,7 @@ import {
   deleteBlueprint,
   getAgents,
   getBlueprintsByAgent,
+  listXianyuReplyRecords,
   listBlueprintExecutionLogs,
   pauseBlueprint,
   resumeBlueprint,
@@ -135,6 +136,7 @@ import {
   FrequencyType,
   TriggerType,
   type AgentExecutionLog,
+  type AgentXianyuReplyRecord,
   type Blueprint,
   type TriggerConfig,
 } from '@/features/agents/types'
@@ -178,6 +180,8 @@ type AgentNodeKind =
   | 'schedule'
   | 'browser'
   | 'xianyu'
+  | 'xianyu_reply'
+  | 'xianyu_review'
   | 'request'
   | 'transform'
   | 'image'
@@ -269,6 +273,21 @@ type BackendAgentGraphOutput = {
   nodes?: BackendAgentNodeResult[]
   final_output?: unknown
   warnings?: string[]
+}
+
+type BackendAgentProgress = {
+  phase?: string
+  node_id?: string
+  node_kind?: string
+  node_title?: string
+  message?: string
+  current?: number
+  total?: number
+  completed?: number
+  completed_nodes?: number
+  total_nodes?: number
+  concurrency?: number
+  [key: string]: unknown
 }
 
 type ModelChoice = {
@@ -370,6 +389,7 @@ type WorkflowValidationIssue = {
 
 type WorkflowStageState = {
   label: AgentPaletteGroup
+  required: boolean
   present: boolean
   complete: boolean
 }
@@ -446,7 +466,10 @@ const AGENT_SKILLS_STORAGE_KEY = 'sunapi.playground.agent.skills.v1'
 const AGENT_SKILL_STORES_STORAGE_KEY = 'sunapi.playground.skill.stores.v1'
 const MAX_BLUEPRINT_HISTORY = 50
 const AGENT_BACKEND_POLL_INTERVAL_MS = 900
-const AGENT_BACKEND_POLL_TIMEOUT_MS = 10 * 60 * 1000 + 15 * 1000
+// Full-history archive runs can legitimately exceed ten minutes. The backend
+// keeps the run alive for an hour; keep polling for a day so the UI does not
+// silently stop updating while a large knowledge-base sync is still running.
+const AGENT_BACKEND_POLL_TIMEOUT_MS = 24 * 60 * 60 * 1000
 
 const CREATOR_FLOW_ARIA_LABEL_CONFIG: Partial<AriaLabelConfig> = {
   'controls.ariaLabel': '画布控制',
@@ -503,7 +526,7 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.browser-automation',
     description: '处理登录态页面、表单、动态网页、截图证据和 DOM 抽取。',
     source: 'built-in',
-    appliesTo: ['browser', 'xianyu', 'custom'],
+    appliesTo: ['browser', 'xianyu', 'xianyu_reply', 'custom'],
     capabilities: ['页面导航', 'DOM 抽取', '操作安全'],
     instructions: [
       '按节点给出的 URL、登录态和任务描述执行导航、读取、截图和字段抽取。',
@@ -542,7 +565,15 @@ const BUILTIN_SKILL_DEFINITIONS: BuiltinSkillDefinition[] = [
     value: 'skill.rag-file-search',
     description: '知识库、文档检索、片段引用和问答总结的检索增强能力。',
     source: 'built-in',
-    appliesTo: ['browser', 'xianyu', 'request', 'transform', 'report', 'custom'],
+    appliesTo: [
+      'browser',
+      'xianyu',
+      'xianyu_reply',
+      'request',
+      'transform',
+      'report',
+      'custom',
+    ],
     capabilities: ['语义检索', '片段引用', '答案合成'],
     instructions: [
       '围绕问题检索最相关的文档片段，并基于片段回答，不使用未命中的外部背景补全。',
@@ -645,6 +676,8 @@ const DEFAULT_SKILL_BY_NODE_KIND: Partial<Record<AgentNodeKind, string>> = {
   schedule: 'skill.mcp-workflow',
   browser: 'skill.browser-automation',
   xianyu: 'skill.browser-automation',
+  xianyu_reply: 'skill.browser-automation',
+  xianyu_review: 'skill.browser-automation',
   request: 'skill.api-function',
   transform: 'skill.code-interpreter',
   image: 'skill.code-interpreter',
@@ -698,8 +731,18 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   登录等待: ['30s', '60s', '120s', '180s'],
   列表等待: ['3s', '5s', '8s', '12s'],
   单会话等待: ['1s', '2s', '3s'],
+  评价星级: ['5', '4', '3', '2', '1'],
+  消息轮询间隔: ['2s', '3s', '5s', '10s', '15s'],
+  每轮最大会话数: ['10', '20', '30', '50'],
+  启动时处理现有未读: ['是', '否'],
+  最大回复字数: ['100', '200', '300', '500'],
+  默认回复: ['开启', '关闭'],
+  无知识库命中: ['安全澄清回复'],
+  发送方式: ['直接自动发送'],
   历史加载轮数: ['1', '3', '6', '10'],
-  会话数量: ['10', '20', '50', '100'],
+  摘要并发数: ['1', '2'],
+  会话数量: ['全部', '10', '20', '50', '100'],
+  最大会话保护上限: ['500', '1000', '2000', '5000'],
   同步范围: ['仅归档未归档或有新消息的会话', '每次归档当前列表全部会话'],
   权限: ['只读采集', '读写操作需确认', '禁止写入'],
   方法: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
@@ -817,7 +860,7 @@ const NODE_META: Record<
     icon: MessagesSquareIcon,
     accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
     description:
-      '复用浏览器中的闲鱼卖家登录态，只读遍历客服会话，逐条读取对话并将脱敏总结写入当前智能体选择的知识库。',
+      '复用浏览器中的闲鱼卖家登录态，只读遍历客服会话，逐条完整读取历史，再按固定标题生成脱敏知识库内容。',
     inputs: ['闲鱼客服会话', '当前智能体知识库'],
     outputs: ['知识库文档', '会话统计'],
     settings: {
@@ -826,14 +869,80 @@ const NODE_META: Record<
       会话名称: '闲鱼客服',
       登录等待: '180s',
       列表等待: '8s',
-      会话数量: '20',
+      会话数量: '全部',
       同步范围: '仅归档未归档或有新消息的会话',
       单会话等待: '1s',
       历史加载轮数: '6',
+      摘要并发数: '2',
+      最大会话保护上限: '5000',
       对话列表选择器: '',
       消息区域选择器: '',
+      消息滚动容器选择器: '',
+      商品详情选择器: '',
       权限: '只读采集',
-      节点超时: '10m',
+      节点超时: '不限制',
+    },
+  },
+  xianyu_reply: {
+    label: '闲鱼实时智能客服',
+    group: '处理',
+    role: 'reasoning',
+    icon: MessagesSquareIcon,
+    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
+    description:
+      '监听已打开的闲鱼卖家工作台页面，在新买家消息到达时检索知识库并直接自动回复。',
+    inputs: ['闲鱼新消息', '当前智能体知识库'],
+    outputs: ['自动回复统计', '监听状态'],
+    settings: {
+      网址: 'https://seller.goofish.com/?site=COMM',
+      登录态: '持久化登录会话（首次登录后复用）',
+      会话名称: '闲鱼客服',
+      登录等待: '180s',
+      列表等待: '8s',
+      消息轮询间隔: '2s',
+      每轮最大会话数: '20',
+      单会话等待: '1s',
+      启动时处理现有未读: '是',
+      最大回复字数: '300',
+      默认回复: '开启',
+      无知识库命中: '安全澄清回复',
+      发送方式: '直接自动发送',
+      对话列表选择器: '',
+      消息区域选择器: '',
+      消息滚动容器选择器: '',
+      商品详情选择器: '',
+      消息输入框选择器: '',
+      发送按钮选择器: '',
+      节点超时: '不限制',
+    },
+  },
+  xianyu_review: {
+    label: '闲鱼自动评价',
+    group: '处理',
+    role: 'browser',
+    icon: MessagesSquareIcon,
+    accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
+    description:
+      '扫描全部闲鱼会话和订单，仅对明确显示可评价入口的已完成交易提交评价。',
+    inputs: ['闲鱼客服会话', '订单信息'],
+    outputs: ['评价统计', '操作日志'],
+    settings: {
+      网址: 'https://seller.goofish.com/?site=COMM',
+      登录态: '持久化登录会话（首次登录后复用）',
+      会话名称: '闲鱼客服',
+      登录等待: '180s',
+      列表等待: '8s',
+      评价内容: '沟通顺畅，交易愉快。',
+      评价星级: '5',
+      会话数量: '全部',
+      单会话等待: '1s',
+      对话列表选择器: '',
+      订单区域选择器: '',
+      评价入口选择器: '',
+      评价输入框选择器: '',
+      评价提交按钮选择器: '',
+      权限: '读写操作',
+      节点超时: '不限制',
     },
   },
   request: {
@@ -1058,6 +1167,18 @@ const COMPONENT_VISUAL_META: Record<
     icon: FileSpreadsheetIcon,
     accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
   },
+  'component.xianyu-reply': {
+    label: '闲鱼实时智能客服',
+    group: '处理',
+    icon: MessagesSquareIcon,
+    accent: 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300',
+  },
+  'component.xianyu-review': {
+    label: '闲鱼自动评价',
+    group: '处理',
+    icon: MessagesSquareIcon,
+    accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
+  },
 }
 
 function getAgentNodeVisualMeta(kind: AgentNodeKind, componentId?: string) {
@@ -1066,13 +1187,19 @@ function getAgentNodeVisualMeta(kind: AgentNodeKind, componentId?: string) {
     : NODE_META[kind]
 }
 
+const COMPONENT_KIND_ALIASES: Record<string, AgentNodeKind> = {
+  'component.xianyu': 'xianyu',
+  'component.xianyu-reply': 'xianyu_reply',
+  'component.xianyu-review': 'xianyu_review',
+}
+
 const PALETTE_GROUPS: Array<{
   title: AgentPaletteGroup
   kinds: AgentNodeKind[]
 }> = [
   { title: '触发', kinds: ['start', 'schedule'] },
   { title: '采集', kinds: ['browser', 'xianyu', 'request'] },
-  { title: '处理', kinds: ['transform', 'image'] },
+  { title: '处理', kinds: ['xianyu_reply', 'xianyu_review', 'transform', 'image'] },
   { title: '落档', kinds: ['report', 'webpage', 'notify'] },
   { title: '结束', kinds: ['stop'] },
 ]
@@ -1085,16 +1212,50 @@ const WORKFLOW_STAGE_ORDER: AgentPaletteGroup[] = [
   '结束',
 ]
 
+const REQUIRED_WORKFLOW_STAGES: AgentPaletteGroup[] = [
+  '触发',
+  '采集',
+  '落档',
+  '结束',
+]
+
+const COMPOSITE_NODE_STAGE_COVERAGE: Partial<
+  Record<AgentNodeKind, AgentPaletteGroup[]>
+> = {
+  xianyu: ['处理', '落档'],
+  xianyu_reply: ['采集', '落档'],
+  xianyu_review: ['采集', '落档'],
+}
+
+const COMPOSITE_COMPONENT_STAGE_COVERAGE: Record<string, AgentPaletteGroup[]> =
+  {
+    'component.xianyu': ['采集', '处理', '落档'],
+    'component.xianyu-reply': ['采集', '处理', '落档'],
+    'component.xianyu-review': ['采集', '处理', '落档'],
+  }
+
+function workflowStagesForNode(node: AgentFlowNode) {
+  const primaryStage = getAgentNodeVisualMeta(
+    node.data.kind,
+    node.data.componentId
+  ).group
+  return Array.from(
+    new Set([
+      primaryStage,
+      ...(COMPOSITE_NODE_STAGE_COVERAGE[node.data.kind] ?? []),
+      ...(COMPOSITE_COMPONENT_STAGE_COVERAGE[node.data.componentId ?? ''] ??
+        []),
+    ])
+  )
+}
+
 function validateWorkflowStructure(
   nodes: AgentFlowNode[],
   edges: AgentFlowEdge[]
 ): WorkflowReadiness {
   const nodeById = new Map(nodes.map((node) => [node.id, node]))
-  const stageByNodeId = new Map(
-    nodes.map((node) => [
-      node.id,
-      getAgentNodeVisualMeta(node.data.kind, node.data.componentId).group,
-    ])
+  const stagesByNodeId = new Map(
+    nodes.map((node) => [node.id, workflowStagesForNode(node)])
   )
   const validEdges = edges.filter(
     (edge) => nodeById.has(edge.source) && nodeById.has(edge.target)
@@ -1126,17 +1287,17 @@ function validateWorkflowStructure(
   }
 
   const triggerIds = nodes
-    .filter((node) => stageByNodeId.get(node.id) === '触发')
+    .filter((node) => stagesByNodeId.get(node.id)?.includes('触发'))
     .map((node) => node.id)
   const endIds = nodes
-    .filter((node) => stageByNodeId.get(node.id) === '结束')
+    .filter((node) => stagesByNodeId.get(node.id)?.includes('结束'))
     .map((node) => node.id)
   const reachableFromTrigger = walk(triggerIds, outgoing)
   const canReachEnd = walk(endIds, incoming)
   const issues: WorkflowValidationIssue[] = []
 
-  for (const stage of WORKFLOW_STAGE_ORDER) {
-    if (!nodes.some((node) => stageByNodeId.get(node.id) === stage)) {
+  for (const stage of REQUIRED_WORKFLOW_STAGES) {
+    if (!nodes.some((node) => stagesByNodeId.get(node.id)?.includes(stage))) {
       issues.push({ message: `请添加“${stage}”阶段的步骤。` })
     }
   }
@@ -1171,6 +1332,7 @@ function validateWorkflowStructure(
     if (
       (node.data.kind === 'browser' ||
         node.data.kind === 'xianyu' ||
+        node.data.kind === 'xianyu_reply' ||
         node.data.kind === 'request') &&
       !node.data.settings['网址']?.trim()
     ) {
@@ -1195,11 +1357,12 @@ function validateWorkflowStructure(
     issues.flatMap((issue) => (issue.nodeId ? [issue.nodeId] : []))
   )
   const stages = WORKFLOW_STAGE_ORDER.map((label) => {
-    const stageNodes = nodes.filter(
-      (node) => stageByNodeId.get(node.id) === label
+    const stageNodes = nodes.filter((node) =>
+      stagesByNodeId.get(node.id)?.includes(label)
     )
     return {
       label,
+      required: REQUIRED_WORKFLOW_STAGES.includes(label),
       present: stageNodes.length > 0,
       complete: stageNodes.some(
         (node) =>
@@ -1309,6 +1472,9 @@ export function AgentWorkspace({
   const [backendExecutionLogs, setBackendExecutionLogs] = useState<
     AgentExecutionLog[]
   >([])
+  const [replyRecords, setReplyRecords] = useState<AgentXianyuReplyRecord[]>([])
+  const [replyRecordsOpen, setReplyRecordsOpen] = useState(false)
+  const [replyRecordsLoading, setReplyRecordsLoading] = useState(false)
   const [selectedNodeId, setSelectedNodeId] = useState<string>(
     initialBlueprint?.nodes[0]?.id ?? 'collect'
   )
@@ -1324,6 +1490,37 @@ export function AgentWorkspace({
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
     [nodes, selectedNodeId]
   )
+
+  const currentReplyBackendIds = useMemo(() => {
+    const blueprint = blueprints.find((item) => item.id === currentBlueprintId)
+    return {
+      agentId: blueprint?.backendAgentId ?? '',
+      blueprintId: blueprint?.backendBlueprintId ?? '',
+    }
+  }, [blueprints, currentBlueprintId])
+
+  const refreshReplyRecords = useCallback(async () => {
+    const { agentId, blueprintId } = currentReplyBackendIds
+    if (!agentId || !blueprintId) {
+      setReplyRecords([])
+      return
+    }
+    setReplyRecordsLoading(true)
+    try {
+      setReplyRecords(await listXianyuReplyRecords(agentId, blueprintId, 100))
+    } catch {
+      setReplyRecords([])
+    } finally {
+      setReplyRecordsLoading(false)
+    }
+  }, [currentReplyBackendIds])
+
+  useEffect(() => {
+    if (!replyRecordsOpen) return
+    void refreshReplyRecords()
+    const timer = window.setInterval(() => void refreshReplyRecords(), 5000)
+    return () => window.clearInterval(timer)
+  }, [refreshReplyRecords, replyRecordsOpen])
 
   useEffect(() => {
     if (models.length === 0) return
@@ -1415,13 +1612,19 @@ export function AgentWorkspace({
     []
   )
   const pollBackendExecutionLogs = useCallback(
-    async (agentId: string, blueprintId: string, isActive: () => boolean) => {
+    async (
+      agentId: string,
+      blueprintId: string,
+      isActive: () => boolean,
+      onProgress?: (log: AgentExecutionLog) => void
+    ) => {
       const deadline = Date.now() + AGENT_BACKEND_POLL_TIMEOUT_MS
       let logs: AgentExecutionLog[] = []
 
       while (isActive() && Date.now() < deadline) {
         logs = await refreshBackendExecutionLogs(agentId, blueprintId, isActive)
         const latest = logs[0]
+        if (latest) onProgress?.(latest)
         if (
           latest &&
           latest.status !== 'running' &&
@@ -1482,6 +1685,7 @@ export function AgentWorkspace({
                 updatedAt: now,
                 status: statusOverride ?? getBlueprintStatus(nextNodes),
                 executionLog: nextExecutionLog,
+                knowledgeScope,
               }
             : blueprint
         )
@@ -1490,7 +1694,7 @@ export function AgentWorkspace({
         return nextBlueprints
       })
     },
-    [currentBlueprintId]
+    [currentBlueprintId, knowledgeScope]
   )
 
   const applyBackendExecutionLogToPreview = useCallback(
@@ -1499,7 +1703,8 @@ export function AgentWorkspace({
       activeNodes: AgentFlowNode[],
       activeEdges: AgentFlowEdge[],
       statusOverride?: AgentBlueprintStatus,
-      snapshotEdges: AgentFlowEdge[] = activeEdges
+      snapshotEdges: AgentFlowEdge[] = activeEdges,
+      persistSnapshot = true
     ) => {
       const preview = buildBackendExecutionPreview(
         log,
@@ -1522,16 +1727,18 @@ export function AgentWorkspace({
                 }
               : node
           )
-          persistCurrentBlueprintSnapshot(
-            stripTransientNodeSettings(nextNodes),
-            fallbackExecutionLog,
-            statusOverride ??
-              backendBlueprintStatus(
-                log.status,
-                new Map<string, AgentNodeStatus>()
-              ),
-            snapshotEdges
-          )
+          if (persistSnapshot) {
+            persistCurrentBlueprintSnapshot(
+              stripTransientNodeSettings(nextNodes),
+              fallbackExecutionLog,
+              statusOverride ??
+                backendBlueprintStatus(
+                  log.status,
+                  new Map<string, AgentNodeStatus>()
+                ),
+              snapshotEdges
+            )
+          }
           return nextNodes
         })
         return
@@ -1553,12 +1760,14 @@ export function AgentWorkspace({
             },
           }
         })
-        persistCurrentBlueprintSnapshot(
-          stripTransientNodeSettings(nextNodes),
-          preview.executionLog,
-          statusOverride ?? preview.blueprintStatus,
-          snapshotEdges
-        )
+        if (persistSnapshot) {
+          persistCurrentBlueprintSnapshot(
+            stripTransientNodeSettings(nextNodes),
+            preview.executionLog,
+            statusOverride ?? preview.blueprintStatus,
+            snapshotEdges
+          )
+        }
         return nextNodes
       })
     },
@@ -1726,7 +1935,7 @@ export function AgentWorkspace({
       const issue = readiness.issues[0]
       if (issue?.nodeId) setSelectedNodeId(issue.nodeId)
       toast.error('流程尚未闭环', {
-        description: issue?.message ?? '请补全五个阶段后再保存。',
+        description: issue?.message ?? '请补全必需阶段后再保存。',
       })
       return
     }
@@ -2007,8 +2216,18 @@ export function AgentWorkspace({
         const issue = readiness.issues[0]
         if (issue?.nodeId) setSelectedNodeId(issue.nodeId)
         toast.error('流程还不能运行', {
-          description: issue?.message ?? '请补全五个阶段后再运行。',
+          description: issue?.message ?? '请补全必需阶段后再运行。',
         })
+        return
+      }
+      if (
+        nodes.some(
+          (node) =>
+            node.data.kind === 'xianyu' || node.data.kind === 'xianyu_reply'
+        ) &&
+        (knowledgeScope.knowledgeBaseIds?.length ?? 0) === 0
+      ) {
+        toast.error('请先选择至少一个知识库')
         return
       }
       if (
@@ -2069,6 +2288,9 @@ export function AgentWorkspace({
         : { nodes: prepared.nodes, edges: prepared.edges }
       const runExecutionNodes = orderNodes(runGraph.nodes, runGraph.edges)
       if (runExecutionNodes.length === 0) return
+      const realtimeListenerIndex = runExecutionNodes.findIndex(
+        (node) => node.data.kind === 'xianyu_reply'
+      )
 
       cancelPreviewRun()
       setBackendExecutionLogs([])
@@ -2101,6 +2323,7 @@ export function AgentWorkspace({
         backendBlueprintId: blueprints.find(
           (item) => item.id === currentBlueprintId
         )?.backendBlueprintId,
+        knowledgeScope,
       }
       void runSavedBlueprintOnBackend(
         backendBlueprint,
@@ -2132,10 +2355,43 @@ export function AgentWorkspace({
           }
           if (synced.backendAgentId && synced.backendBlueprintId) {
             try {
+              if (realtimeListenerIndex >= 0) {
+                await waitForAgentBackendPoll(1000)
+                const logs = await refreshBackendExecutionLogs(
+                  synced.backendAgentId,
+                  synced.backendBlueprintId,
+                  () => previewRunIdRef.current === runId
+                )
+                const latestLog = logs[0]
+                if (
+                  latestLog?.status === 'failed' &&
+                  previewRunIdRef.current === runId
+                ) {
+                  applyBackendExecutionLogToPreview(
+                    latestLog,
+                    runExecutionNodes,
+                    runGraph.edges,
+                    statusAfterManualPreview,
+                    prepared.edges
+                  )
+                }
+                return
+              }
               const logs = await pollBackendExecutionLogs(
                 synced.backendAgentId,
                 synced.backendBlueprintId,
-                () => previewRunIdRef.current === runId
+                () => previewRunIdRef.current === runId,
+                (progressLog) => {
+                  if (previewRunIdRef.current !== runId) return
+                  applyBackendExecutionLogToPreview(
+                    progressLog,
+                    runExecutionNodes,
+                    runGraph.edges,
+                    statusAfterManualPreview,
+                    prepared.edges,
+                    false
+                  )
+                }
               )
               const latestLog = logs[0]
               if (previewRunIdRef.current !== runId) return
@@ -2204,7 +2460,10 @@ export function AgentWorkspace({
           )
         })
 
-      const initialStatusById = buildPreviewStatusMap(runExecutionNodes, -1)
+      const initialStatusById = buildPreviewStatusMap(
+        runExecutionNodes,
+        realtimeListenerIndex >= 0 ? realtimeListenerIndex - 1 : -1
+      )
       const initialExecutionLog = buildPreviewExecutionLog(
         runExecutionNodes,
         initialStatusById,
@@ -2259,9 +2518,11 @@ export function AgentWorkspace({
       edges,
       executionLog,
       hasScheduledBlueprint,
+      knowledgeScope,
       nodes,
       pollBackendExecutionLogs,
       persistCurrentBlueprintSnapshot,
+      refreshBackendExecutionLogs,
       skillChoices,
       templateByKind,
     ]
@@ -2986,7 +3247,7 @@ function BlueprintWorkspace({
       </div>
 
       <aside className='border-border/70 bg-background hidden w-[333px] min-w-0 shrink-0 flex-col overflow-hidden border-l xl:flex'>
-        <Inspector
+          <Inspector
           blueprintId={currentBlueprintId}
           blueprintChoices={blueprintChoices}
           currentGroup={currentGroup}
@@ -2996,9 +3257,18 @@ function BlueprintWorkspace({
           selectedNode={selectedNode}
           onDeleteNode={onDeleteNode}
           onUpdateNode={onUpdateNode}
-          onUpdateSetting={onUpdateSetting}
-        />
-      </aside>
+            onUpdateSetting={onUpdateSetting}
+          />
+          {selectedNode?.data.kind === 'xianyu_reply' && (
+            <XianyuReplyRecordsPanel
+              loading={replyRecordsLoading}
+              open={replyRecordsOpen}
+              records={replyRecords}
+              onOpenChange={setReplyRecordsOpen}
+              onRefresh={() => void refreshReplyRecords()}
+            />
+          )}
+        </aside>
     </div>
   )
 }
@@ -3029,21 +3299,27 @@ function WorkflowStageStrip({
             title={
               stage.complete
                 ? `${stage.label}阶段已就绪`
-                : stage.present
-                  ? `${stage.label}阶段待完善`
-                  : `缺少${stage.label}阶段`
+                : !stage.required && !stage.present
+                  ? `${stage.label}阶段可跳过`
+                  : stage.present
+                    ? `${stage.label}阶段待完善`
+                    : `缺少${stage.label}阶段`
             }
             className={cn(
               'inline-flex items-center gap-1 rounded-[6px] border px-1.5 py-0.5 text-[10px] font-medium',
               stage.complete
                 ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                : stage.present
-                  ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                  : 'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300'
+                : !stage.required && !stage.present
+                  ? 'border-border/70 bg-muted/40 text-muted-foreground'
+                  : stage.present
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                    : 'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300'
             )}
           >
             {stage.complete && <CheckCircle2Icon className='size-3' />}
-            {!stage.present && <TriangleAlertIcon className='size-3' />}
+            {!stage.present && stage.required && (
+              <TriangleAlertIcon className='size-3' />
+            )}
             {stage.label}
           </span>
         </div>
@@ -3583,6 +3859,7 @@ function PaletteItem({
   const Icon = meta.icon
   const templateKey = template.componentId ?? kind
   const isCustom = template.source === 'custom'
+  const canDelete = isCustom && !template.componentId?.startsWith('component.')
 
   return (
     <button
@@ -3623,7 +3900,7 @@ function PaletteItem({
           {template.description}
         </span>
       </span>
-      {isCustom ? (
+      {canDelete ? (
         <span
           role='button'
           tabIndex={0}
@@ -4758,7 +5035,53 @@ function buildBackendExecutionPreview(
   blueprintStatus: AgentBlueprintStatus
 } | null {
   const graph = parseBackendGraphOutput(log.output)
-  if (!graph || !Array.isArray(graph.nodes)) return null
+  if (!graph || !Array.isArray(graph.nodes)) {
+    const progress = parseBackendProgress(log.output)
+    if (!progress) return null
+
+    const executionLog: AgentExecutionLogMap = {}
+    const statusById = new Map<string, AgentNodeStatus>()
+    const currentNodeId = progress.node_id
+    const currentIndex = currentNodeId
+      ? executionNodes.findIndex((node) => node.id === currentNodeId)
+      : -1
+    const now = Date.now()
+    executionNodes.forEach((node, index) => {
+      let status: AgentNodeStatus = 'waiting'
+      if (currentIndex >= 0 && index < currentIndex) status = 'done'
+      if (node.id === currentNodeId) status = 'running'
+      statusById.set(node.id, status)
+      if (node.id === currentNodeId) {
+        const result: BackendAgentNodeResult = {
+          node_id: node.id,
+          kind: progress.node_kind ?? node.data.kind,
+          title: progress.node_title ?? node.data.title,
+          status: 'running',
+          message:
+            progress.message || '正在执行，实时结果会在完成后写入输出摘要。',
+          output: progress,
+          started_at: log.start_time,
+          duration_ms: Math.max(0, now - log.start_time),
+        }
+        executionLog[node.id] = buildBackendNodeExecutionLog(
+          node,
+          result,
+          {
+            mode: 'node_graph',
+            nodes: [result],
+            warnings: [],
+          },
+          edges,
+          executionLog
+        )
+      }
+    })
+    return {
+      executionLog,
+      statusById,
+      blueprintStatus: 'running',
+    }
+  }
 
   const resultById = new Map(
     graph.nodes
@@ -4805,6 +5128,19 @@ function parseBackendGraphOutput(
   const graph = parsed as BackendAgentGraphOutput
   if (!Array.isArray(graph.nodes)) return null
   return graph
+}
+
+function parseBackendProgress(value: unknown): BackendAgentProgress | null {
+  const parsed =
+    typeof value === 'string'
+      ? parseMaybeJSON(value)
+      : value && typeof value === 'object'
+        ? value
+        : null
+  if (!parsed || typeof parsed !== 'object') return null
+  const envelope = parsed as { mode?: unknown; progress?: unknown }
+  if (envelope.mode !== 'node_graph_progress') return null
+  return asPlainRecord(envelope.progress) as BackendAgentProgress | null
 }
 
 function buildBackendNodeExecutionLog(
@@ -5001,6 +5337,8 @@ function estimateNodeDuration(node: AgentFlowNode, index: number) {
     schedule: 260,
     browser: 1800,
     xianyu: 30000,
+    xianyu_reply: 30000,
+    xianyu_review: 30000,
     request: 1200,
     transform: 980,
     image: 2600,
@@ -5138,6 +5476,12 @@ function buildNodeModelOutput(
 ) {
   if (status === 'pending') {
     return '节点尚未调用模型，等待上游节点完成后生成输出。'
+  }
+  if (status === 'running' && node.data.kind === 'xianyu_reply') {
+    return '页面监听中。收到新的买家消息后，将检索当前知识库并直接自动发送回复。'
+  }
+  if (status === 'running' && node.data.kind === 'xianyu_review') {
+    return '正在扫描闲鱼会话和订单，仅对明确可评价的交易提交评价。'
   }
   if (status === 'running') {
     return '模型调用进行中，输出会在当前节点完成后写入这里。'
@@ -5684,6 +6028,12 @@ function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
     return `${node.data.title} 已完成，输出已进入后续节点上下文。`
   }
   if (status === 'running') {
+    if (node.data.kind === 'xianyu_reply') {
+      return `${node.data.title} 正在监听闲鱼消息页面。`
+    }
+    if (node.data.kind === 'xianyu_review') {
+      return `${node.data.title} 正在扫描闲鱼会话和待评价订单。`
+    }
     return `${node.data.title} 正在执行，实时结果会在完成后写入输出摘要。`
   }
   if (status === 'stopped') {
@@ -5796,7 +6146,7 @@ function ExecutionPolicyConfig({
       key: '节点超时',
       label: '节点超时',
       value: settings['节点超时'] || '不限制',
-      options: ['不限制', '10s', '30s', '60s', '5m', '10m'],
+      options: ['不限制', '10s', '30s', '60s', '5m', '10m', '30m', '1h'],
     },
     {
       key: '失败重试',
@@ -6094,6 +6444,7 @@ function ExecutionPreviewDock({
 }) {
   const logNode = selectedNode ?? executionNodes[0] ?? null
   const latestBackendLog = backendExecutionLogs[0]
+  const latestProgress = parseBackendProgress(latestBackendLog?.output)
   const [clockNow, setClockNow] = useState(() => Date.now())
   const executionSummary = buildExecutionPreviewSummary(
     executionNodes,
@@ -6180,6 +6531,11 @@ function ExecutionPreviewDock({
                 当前：{currentExecutionNode.data.title}
               </span>
             )}
+            {latestProgress?.message && (
+              <span className='max-w-80 min-w-0 truncate text-blue-700 dark:text-blue-300'>
+                {latestProgress.message}
+              </span>
+            )}
             {executionSummary.elapsedMs !== undefined && (
               <span className='shrink-0'>
                 已用时 {formatElapsedTime(executionSummary.elapsedMs)}
@@ -6262,6 +6618,11 @@ function ExecutionPreviewDock({
                   {currentExecutionNode?.data.title ??
                     (executionSummary.status === 'completed' ? '已完成' : '-')}
                 </span>
+                {latestProgress?.message && (
+                  <span className='min-w-0 flex-1 truncate text-blue-700 dark:text-blue-300'>
+                    {latestProgress.message}
+                  </span>
+                )}
                 {executionSummary.elapsedMs !== undefined && (
                   <span className='shrink-0'>
                     已用时 {formatElapsedTime(executionSummary.elapsedMs)}
@@ -6399,6 +6760,7 @@ function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
   const isRunning = log.status === 'running' || log.status === 'pending'
   const isPaused = log.status === 'paused'
   const isCompleted = log.status === 'completed'
+  const progress = parseBackendProgress(log.output)
   return (
     <div
       className={cn(
@@ -6423,6 +6785,16 @@ function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
       <span className='text-muted-foreground'>
         耗时 {formatDuration(log.duration_ms)}
       </span>
+      {progress?.message && (
+        <span className='min-w-0 flex-1 truncate font-medium'>
+          {progress.message}
+        </span>
+      )}
+      {progress && typeof progress.completed === 'number' && typeof progress.total === 'number' && (
+        <span className='text-muted-foreground shrink-0'>
+          总结进度 {progress.completed}/{progress.total}
+        </span>
+      )}
       {log.archive_path && (
         <span className='text-muted-foreground min-w-0 truncate'>
           归档 {log.archive_path}
@@ -6433,6 +6805,156 @@ function BackendExecutionLogBanner({ log }: { log: AgentExecutionLog }) {
       )}
     </div>
   )
+}
+
+function XianyuReplyRecordsPanel({
+  records,
+  loading,
+  open,
+  onOpenChange,
+  onRefresh,
+}: {
+  records: AgentXianyuReplyRecord[]
+  loading: boolean
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onRefresh: () => void
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+
+  return (
+    <section className='border-border/70 bg-background shrink-0 border-t'>
+      <div className='flex h-10 items-center gap-2 px-3'>
+        <button
+          type='button'
+          className='hover:bg-accent/40 flex min-w-0 flex-1 items-center gap-2 text-left text-xs font-semibold'
+          onClick={() => onOpenChange(!open)}
+        >
+          {open ? (
+            <ChevronDownIcon className='text-muted-foreground size-3.5 shrink-0' />
+          ) : (
+            <ChevronUpIcon className='text-muted-foreground size-3.5 shrink-0' />
+          )}
+          <MessagesSquareIcon className='text-muted-foreground size-3.5 shrink-0' />
+          <span className='truncate'>智能客服对话记录</span>
+          <span className='text-muted-foreground shrink-0 font-normal'>
+            {records.length} 条
+          </span>
+        </button>
+        <button
+          type='button'
+          className='text-muted-foreground hover:bg-accent/60 rounded-[5px] p-1.5 transition-colors disabled:opacity-50'
+          aria-label='刷新对话记录'
+          title='刷新对话记录'
+          disabled={loading}
+          onClick={onRefresh}
+        >
+          <RotateCcwIcon className={cn('size-3.5', loading && 'animate-spin')} />
+        </button>
+      </div>
+      {open && (
+        <div className='border-border/70 max-h-80 overflow-y-auto border-t'>
+          {records.length === 0 ? (
+            <div className='text-muted-foreground px-3 py-5 text-center text-[11px]'>
+              {loading ? '正在读取对话记录…' : '暂无自动回复记录'}
+            </div>
+          ) : (
+            records.map((record) => {
+              const expanded = expandedId === record.id
+              const status = formatXianyuReplyRecordStatus(record.status)
+              return (
+                <div key={record.id} className='border-border/60 border-b px-3 py-2 last:border-b-0'>
+                  <button
+                    type='button'
+                    className='flex w-full min-w-0 items-start gap-2 text-left'
+                    onClick={() => setExpandedId(expanded ? null : record.id)}
+                  >
+                    <span
+                      className={cn(
+                        'mt-1 size-1.5 shrink-0 rounded-full',
+                        record.status.startsWith('sent')
+                          ? 'bg-emerald-500'
+                          : record.status.includes('error')
+                            ? 'bg-destructive'
+                            : 'bg-amber-500'
+                      )}
+                    />
+                    <span className='min-w-0 flex-1'>
+                      <span className='flex items-center justify-between gap-2'>
+                        <span className='truncate text-[11px] font-medium'>
+                          {record.conversation_title || '闲鱼会话'}
+                        </span>
+                        <span className='text-muted-foreground shrink-0 text-[10px]'>
+                          {formatLogTime(record.created_at)}
+                        </span>
+                      </span>
+                      <span className='text-muted-foreground mt-0.5 block truncate text-[10px]'>
+                        买家：{record.incoming_message || '未读取到消息'}
+                      </span>
+                    </span>
+                    <span className='text-muted-foreground shrink-0 text-[10px]'>{expanded ? '收起' : status}</span>
+                  </button>
+                  {expanded && (
+                    <div className='mt-2 grid gap-1.5 pl-3.5 text-[10px]'>
+                      <div className='text-muted-foreground'>
+                        知识库命中：
+                        <span className='text-foreground ml-1 font-medium'>
+                          {record.knowledge_match_count}
+                        </span>
+                        {record.fallback && (
+                          <span className='text-amber-700 dark:text-amber-300'>
+                            {' '}· 使用兜底回复
+                          </span>
+                        )}
+                      </div>
+                      {record.product?.title && (
+                        <div className='text-muted-foreground truncate'>
+                          商品：<span className='text-foreground'>{record.product.title}</span>
+                        </div>
+                      )}
+                      <div>
+                        <span className='text-muted-foreground'>最终发送：</span>
+                        <span className='text-foreground'>{record.final_reply || '未发送'}</span>
+                      </div>
+                      {record.model_draft && record.model_draft !== record.final_reply && (
+                        <div className='text-muted-foreground'>模型草稿：{record.model_draft}</div>
+                      )}
+                      <div className='text-muted-foreground'>
+                        总耗时 {formatDuration(record.duration_ms)}
+                        {record.model_duration_ms ? ` · 模型 ${formatDuration(record.model_duration_ms)}` : ''}
+                      </div>
+                      {record.error && <div className='text-destructive break-words'>错误：{record.error}</div>}
+                      {record.recent_messages && record.recent_messages.length > 0 && (
+                        <div className='border-border/60 mt-0.5 grid gap-1 border-t pt-1.5'>
+                          {record.recent_messages.slice(-6).map((message, index) => (
+                            <div key={`${message.key ?? index}-${index}`} className='text-muted-foreground'>
+                              <span className='text-foreground font-medium'>
+                                {message.direction === 'self' ? '客服' : '买家'}：
+                              </span>
+                              {message.text}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function formatXianyuReplyRecordStatus(status: string) {
+  if (status.startsWith('sent')) return status.includes('fallback') ? '已回复·兜底' : '已回复'
+  if (status.includes('model_error')) return '模型失败'
+  if (status.includes('send_error')) return '发送失败'
+  if (status === 'no_knowledge_match') return '待回复'
+  if (status === 'processing') return '处理中'
+  return status || '未知状态'
 }
 
 function formatBackendLogStatus(status: string) {
@@ -8462,6 +8984,8 @@ function readSkillNodeKinds(
     'schedule',
     'browser',
     'xianyu',
+    'xianyu_reply',
+    'xianyu_review',
     'request',
     'transform',
     'image',
@@ -9215,7 +9739,9 @@ function updateNodeSettingValue(
 function normalizeNode(node: AgentFlowNode): AgentFlowNode {
   const data = node.data ?? ({} as Partial<AgentNodeData>)
   const kind =
-    data.kind && NODE_META[data.kind] ? data.kind : ('custom' as AgentNodeKind)
+    data.kind && NODE_META[data.kind]
+      ? data.kind
+      : (COMPONENT_KIND_ALIASES[data.componentId ?? ''] ?? 'custom')
   const meta = NODE_META[kind]
   const outputs = Array.isArray(data.outputs) ? data.outputs : meta.outputs
   const settings = normalizeNodeSettings(kind, data.settings, meta.settings)
@@ -9381,7 +9907,11 @@ function buildTemplates(
   components: AgentComponentItem[] = []
 ) {
   const baseTemplates = (Object.keys(NODE_META) as AgentNodeKind[])
-    .filter((kind) => kind !== 'custom')
+    // Business-specific workflows are cataloged as custom components.
+    .filter(
+      (kind) =>
+        kind !== 'custom' && kind !== 'xianyu' && kind !== 'xianyu_reply' && kind !== 'xianyu_review'
+    )
     .map((kind) => {
       const meta = NODE_META[kind]
       return {
@@ -9634,6 +10164,7 @@ function chooseModelByRole(
         'o3',
         'o4',
         'reason',
+        'terra',
         'gpt-4.1',
         'sonnet',
         'deepseek',
