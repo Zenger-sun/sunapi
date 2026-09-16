@@ -171,12 +171,67 @@ func handleDeleteKnowledgeDocument(store *Store) gin.HandlerFunc {
 	}
 }
 
+func handleListKnowledgeFAQs(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		items, err := store.ListKnowledgeFAQs(c.Request.Context(), strings.TrimSpace(c.Param("id")), playgroundUserID(c))
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		ok(c, items)
+	}
+}
+
+func handleCreateKnowledgeFAQ(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var form KnowledgeFAQFormData
+		if !bindJSON(c, &form) {
+			return
+		}
+		item, err := store.CreateKnowledgeFAQ(c.Request.Context(), strings.TrimSpace(c.Param("id")), playgroundUserID(c), form)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		ok(c, item)
+	}
+}
+
+func handleUpdateKnowledgeFAQ(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var form KnowledgeFAQFormData
+		if !bindJSON(c, &form) {
+			return
+		}
+		item, err := store.UpdateKnowledgeFAQ(c.Request.Context(), strings.TrimSpace(c.Param("id")), strings.TrimSpace(c.Param("faqID")), playgroundUserID(c), form)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		ok(c, item)
+	}
+}
+
+func handleDeleteKnowledgeFAQ(store *Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := store.DeleteKnowledgeFAQ(c.Request.Context(), strings.TrimSpace(c.Param("id")), strings.TrimSpace(c.Param("faqID")), playgroundUserID(c)); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		ok(c, gin.H{"deleted": true})
+	}
+}
+
 func handleSearchKnowledge(store *Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var body struct {
 			Query            string   `json:"query"`
 			Limit            int      `json:"limit"`
 			KnowledgeBaseIDs []string `json:"knowledge_base_ids"`
+			Module           string   `json:"module"`
+			AgentID          string   `json:"agent_id"`
+			BlueprintID      string   `json:"blueprint_id"`
+			ConversationID   int64    `json:"conversation_id"`
 			Disabled         bool     `json:"disabled"`
 		}
 		if !bindJSON(c, &body) {
@@ -188,6 +243,10 @@ func handleSearchKnowledge(store *Store) gin.HandlerFunc {
 		}
 		items, err := store.SearchKnowledgeForScope(c.Request.Context(), playgroundUserID(c), body.Query, body.Limit, KnowledgeSearchScope{
 			KnowledgeBaseIDs: body.KnowledgeBaseIDs,
+			Module:           body.Module,
+			AgentID:          body.AgentID,
+			BlueprintID:      body.BlueprintID,
+			ConversationID:   body.ConversationID,
 			Disabled:         body.Disabled,
 		})
 		if err != nil {

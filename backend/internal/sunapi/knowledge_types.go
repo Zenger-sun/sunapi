@@ -32,6 +32,23 @@ type KnowledgeDocument struct {
 	UpdatedTime     int64  `json:"updated_time"`
 }
 
+type KnowledgeFAQ struct {
+	ID              string   `json:"id"`
+	KnowledgeBaseID string   `json:"knowledge_base_id"`
+	UserID          int64    `json:"user_id"`
+	Question        string   `json:"question"`
+	Answer          string   `json:"answer"`
+	Keywords        []string `json:"keywords,omitempty"`
+	CreatedTime     int64    `json:"created_time"`
+	UpdatedTime     int64    `json:"updated_time"`
+}
+
+type KnowledgeFAQFormData struct {
+	Question string   `json:"question"`
+	Answer   string   `json:"answer"`
+	Keywords []string `json:"keywords,omitempty"`
+}
+
 type KnowledgeSearchMatch struct {
 	KnowledgeBaseID   string  `json:"knowledge_base_id"`
 	KnowledgeBaseName string  `json:"knowledge_base_name"`
