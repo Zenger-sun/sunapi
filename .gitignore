@@ -4,7 +4,12 @@ front/.tanstack/
 .cache/
 .gocache/
 .gomodcache/
+.tmp-go-cache-report-final/
+.tmp-go-cache-report/
+.tmp-go-cache-xianyu/
 backend/.cache/
+backend/.gocache-local/
+backend/.live-agent-data/
 backend/.tmp/
 backend/static/
 backend/sunapi.exe
