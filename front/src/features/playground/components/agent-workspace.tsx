@@ -731,7 +731,7 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   登录等待: ['30s', '60s', '120s', '180s'],
   列表等待: ['3s', '5s', '8s', '12s'],
   单会话等待: ['1s', '2s', '3s'],
-  评价星级: ['5', '4', '3', '2', '1'],
+  评价等级: ['好评'],
   消息轮询间隔: ['2s', '3s', '5s', '10s', '15s'],
   每轮最大会话数: ['10', '20', '30', '50'],
   启动时处理现有未读: ['是', '否'],
@@ -742,6 +742,8 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   历史加载轮数: ['1', '3', '6', '10'],
   摘要并发数: ['1', '2'],
   会话数量: ['全部', '10', '20', '50', '100'],
+  评价数量: ['全部', '10', '20', '50', '100'],
+  最大评价保护上限: ['500', '1000', '2000', '5000'],
   最大会话保护上限: ['500', '1000', '2000', '5000'],
   同步范围: ['仅归档未归档或有新消息的会话', '每次归档当前列表全部会话'],
   权限: ['只读采集', '读写操作需确认', '禁止写入'],
@@ -923,22 +925,25 @@ const NODE_META: Record<
     icon: MessagesSquareIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
     description:
-      '扫描全部闲鱼会话和订单，仅对明确显示可评价入口的已完成交易提交评价。',
-    inputs: ['闲鱼客服会话', '订单信息'],
+      '直接进入闲鱼评价管理的待卖家评价列表，按订单逐条提交好评，不查询聊天列表。',
+    inputs: ['待卖家评价订单'],
     outputs: ['评价统计', '操作日志'],
     settings: {
-      网址: 'https://seller.goofish.com/?site=COMM',
+      网址:
+        'https://seller.goofish.com/?site=COMMONPRO#/seller-trade/evaluation-manage',
       登录态: '持久化登录会话（首次登录后复用）',
-      会话名称: '闲鱼客服',
+      会话名称: '闲鱼卖家工作台',
       登录等待: '180s',
       列表等待: '8s',
-      评价内容: '沟通顺畅，交易愉快。',
-      评价星级: '5',
-      会话数量: '全部',
-      单会话等待: '1s',
-      对话列表选择器: '',
-      订单区域选择器: '',
-      评价入口选择器: '',
+      评价内容: '沟通顺利，交易愉快',
+      评价等级: '好评',
+      评价数量: '全部',
+      最大评价保护上限: '2000',
+      单次评价等待: '1s',
+      订单列表选择器: '',
+      评价按钮选择器: '',
+      评价弹窗选择器: '',
+      好评选项选择器: '',
       评价输入框选择器: '',
       评价提交按钮选择器: '',
       权限: '读写操作',
@@ -5481,7 +5486,7 @@ function buildNodeModelOutput(
     return '页面监听中。收到新的买家消息后，将检索当前知识库并直接自动发送回复。'
   }
   if (status === 'running' && node.data.kind === 'xianyu_review') {
-    return '正在扫描闲鱼会话和订单，仅对明确可评价的交易提交评价。'
+    return '正在读取闲鱼评价管理中的待卖家评价订单并逐条提交好评。'
   }
   if (status === 'running') {
     return '模型调用进行中，输出会在当前节点完成后写入这里。'
@@ -6032,7 +6037,7 @@ function buildNodeLogMessage(node: AgentFlowNode, status: AgentNodeLogStatus) {
       return `${node.data.title} 正在监听闲鱼消息页面。`
     }
     if (node.data.kind === 'xianyu_review') {
-      return `${node.data.title} 正在扫描闲鱼会话和待评价订单。`
+      return `${node.data.title} 正在处理评价管理中的待卖家评价订单。`
     }
     return `${node.data.title} 正在执行，实时结果会在完成后写入输出摘要。`
   }
@@ -7411,6 +7416,21 @@ function SettingControl({
         <div className='text-muted-foreground text-[11px] leading-relaxed'>
           同名浏览器节点共享已登录
           Cookie；需要保持登录态的流程使用“默认”会话即可复用。
+        </div>
+      </LabeledField>
+    )
+  }
+
+  if (nodeKind === 'xianyu_review' && label === '评价内容') {
+    return (
+      <LabeledField label='评价内容'>
+        <Input
+          value='沟通顺利，交易愉快'
+          readOnly
+          className='bg-muted/40 h-8 rounded-[8px] text-sm'
+        />
+        <div className='text-muted-foreground text-[11px] leading-relaxed'>
+          自动评价始终使用此固定内容。
         </div>
       </LabeledField>
     )
@@ -9786,6 +9806,34 @@ function normalizeNodeSettings(
   defaults: Record<string, string>
 ) {
   const normalized = { ...defaults, ...(settings ?? {}) }
+
+  if (kind === 'xianyu_review') {
+    // Existing blueprints may still carry settings from the old chat-list
+    // implementation. Remove them so the editor and payload expose only the
+    // evaluation-management workflow.
+    for (const key of [
+      '评价星级',
+      '评价内容',
+      '会话数量',
+      '最大会话保护上限',
+      '单会话等待',
+      '对话列表选择器',
+      '会话列表选择器',
+      '订单区域选择器',
+      '评价入口选择器',
+    ]) {
+      delete normalized[key]
+    }
+    normalized['评价内容'] = '沟通顺利，交易愉快'
+    if (
+      !normalized['网址'] ||
+      !normalized['网址'].includes('site=COMMONPRO') ||
+      !normalized['网址'].includes('/seller-trade/evaluation-manage')
+    ) {
+      normalized['网址'] =
+        'https://seller.goofish.com/?site=COMMONPRO#/seller-trade/evaluation-manage'
+    }
+  }
 
   if (kind === 'report') {
     delete normalized['模板目录']

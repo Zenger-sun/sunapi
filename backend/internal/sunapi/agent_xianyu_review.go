@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,9 +16,14 @@ import (
 )
 
 const (
-	agentXianyuReviewStateDir     = "agent-xianyu-review-state"
-	agentXianyuReviewDefaultText  = "沟通顺畅，交易愉快。"
-	agentXianyuReviewDefaultStars = 5
+	agentXianyuReviewStateDir         = "agent-xianyu-review-state"
+	agentXianyuReviewDefaultURL       = "https://seller.goofish.com/?site=COMMONPRO#/seller-trade/evaluation-manage"
+	agentXianyuReviewRoute            = "/seller-trade/evaluation-manage"
+	agentXianyuReviewDefaultText      = "沟通顺利，交易愉快"
+	agentXianyuReviewDefaultWait      = 1
+	agentXianyuReviewDefaultMaxOrders = 2000
+	agentXianyuReviewMaxOrders        = 5000
+	agentXianyuReviewConfirmAttempts  = 6
 )
 
 type agentXianyuReviewState struct {
@@ -32,6 +39,38 @@ type agentXianyuReviewStats struct {
 	Failed    int `json:"failed"`
 }
 
+type agentXianyuReviewPendingTabPayload struct {
+	Found   bool   `json:"found"`
+	Clicked bool   `json:"clicked"`
+	Reason  string `json:"reason"`
+}
+
+type agentXianyuReviewCandidatePayload struct {
+	Found             bool     `json:"found"`
+	OrderKey          string   `json:"order_key"`
+	VisibleCount      int      `json:"visible_count"`
+	Signature         string   `json:"signature"`
+	ReviewedOrderKeys []string `json:"reviewed_order_keys"`
+	Reason            string   `json:"reason"`
+}
+
+type agentXianyuReviewActionPayload struct {
+	Submitted bool   `json:"submitted"`
+	Reason    string `json:"reason"`
+}
+
+type agentXianyuReviewConfirmationPayload struct {
+	Confirmed bool   `json:"confirmed"`
+	Failed    bool   `json:"failed"`
+	Reason    string `json:"reason"`
+}
+
+type agentXianyuReviewNextPagePayload struct {
+	Clicked bool   `json:"clicked"`
+	AtEnd   bool   `json:"at_end"`
+	Reason  string `json:"reason"`
+}
+
 func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *AgentBlueprint, node agentBlueprintGraphNode, inputVars map[string]interface{}, result agentBlueprintNodeResult) agentBlueprintNodeResult {
 	if store == nil || strings.TrimSpace(store.DataDir()) == "" {
 		return failAgentXianyuNode(result, "闲鱼自动评价无法执行，数据目录未配置。", "data directory is not configured")
@@ -39,16 +78,28 @@ func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *Ag
 	if bp == nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价缺少当前智能体上下文。", "agent blueprint is required")
 	}
+
 	settings := node.Data.Settings
+	reviewText := normalizeAgentXianyuReviewText(settings["评价内容"])
 	statePath := agentXianyuReviewStatePath(store.DataDir(), bp.ID, node.ID)
 	state, err := loadAgentXianyuReviewState(statePath)
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价状态读取失败。", err.Error())
 	}
-	result.Input = map[string]interface{}{"source": "闲鱼卖家工作台", "mode": "scan_all_conversations", "review_text": firstNonEmpty(settings["评价内容"], agentXianyuReviewDefaultText)}
-	reportAgentExecutionProgress(ctx, map[string]interface{}{"phase": "collecting", "node_id": node.ID, "node_kind": node.Data.Kind, "node_title": node.Data.Title, "message": "正在扫描闲鱼全部会话和订单状态…"})
+	result.Input = map[string]interface{}{
+		"source":      "闲鱼评价管理",
+		"mode":        "pending_seller_reviews",
+		"review_text": reviewText,
+	}
+	reportAgentExecutionProgress(ctx, map[string]interface{}{
+		"phase":      "collecting",
+		"node_id":    node.ID,
+		"node_kind":  node.Data.Kind,
+		"node_title": node.Data.Title,
+		"message":    "正在打开闲鱼评价管理并读取待卖家评价订单…",
+	})
 
-	targetURL, err := normalizeAgentXianyuURL(firstNonEmpty(settings["网址"], settings["URL"], agentXianyuDefaultURL))
+	targetURL, err := normalizeAgentXianyuReviewURL(firstNonEmpty(settings["网址"], settings["URL"], agentXianyuReviewDefaultURL))
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价网址无效。", err.Error())
 	}
@@ -60,7 +111,7 @@ func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *Ag
 	}
 	target, _, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
 	if err != nil {
-		return failAgentXianyuNode(result, "闲鱼自动评价无法打开卖家工作台。", err.Error())
+		return failAgentXianyuNode(result, "闲鱼自动评价无法打开评价管理。", err.Error())
 	}
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
@@ -73,6 +124,11 @@ func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *Ag
 	if _, err = agentBrowserCDPCall(ctx, conn, 2, "Runtime.enable", nil); err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价启用脚本通道失败。", err.Error())
 	}
+	// A reusable seller-console target may currently show the chat page. Always
+	// navigate it to evaluation management before looking for pending reviews.
+	if _, err = agentBrowserCDPCall(ctx, conn, 3, "Page.navigate", map[string]any{"url": targetURL}); err != nil {
+		return failAgentXianyuNode(result, "闲鱼自动评价无法进入评价管理。", err.Error())
+	}
 	loginWait := parseAgentPositiveSetting(firstNonEmpty(settings["登录等待"], "180s"), agentXianyuDefaultLoginWait, 300)
 	if loginWait > 0 && !strings.Contains(settings["登录态"], "无需登录") {
 		if err = waitAgentBrowserLogin(ctx, conn, loginWait); err != nil {
@@ -80,224 +136,421 @@ func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *Ag
 		}
 	}
 	if err = waitAgentXianyu(ctx, settings["列表等待"], agentXianyuDefaultListWait); err != nil {
-		return failAgentXianyuNode(result, "闲鱼自动评价等待页面失败。", err.Error())
+		return failAgentXianyuNode(result, "闲鱼自动评价等待评价管理页面失败。", err.Error())
 	}
 
-	listSelector := firstNonEmpty(settings["对话列表选择器"], settings["会话列表选择器"])
-	orderSelector := settings["订单区域选择器"]
-	entrySelector := settings["评价入口选择器"]
-	inputSelector := settings["评价输入框选择器"]
-	submitSelector := settings["评价提交按钮选择器"]
-	limit, all := parseAgentXianyuConversationLimitWithCeiling(settings["会话数量"], agentXianyuMaxConversations)
-	conversationWait := parseAgentPositiveSetting(firstNonEmpty(settings["单会话等待"], "1s"), agentXianyuDefaultConversationWait, 10)
 	callID := 1000
 	nextID := func() int { callID++; return callID }
-	reset, err := evaluateAgentXianyuConversationListReset(ctx, conn, nextID(), listSelector)
+	pendingTab, err := evaluateAgentXianyuReviewPendingTab(ctx, conn, nextID())
 	if err != nil {
-		return failAgentXianyuNode(result, "闲鱼自动评价无法定位会话列表。", err.Error())
+		return failAgentXianyuNode(result, "闲鱼自动评价无法读取评价管理页签。", err.Error())
 	}
-	batch, err := evaluateAgentXianyuCandidates(ctx, conn, 10, listSelector, agentXianyuMaxConversations)
-	if err != nil || len(batch.Items) == 0 {
-		if err == nil {
-			err = errors.New("未找到闲鱼客服会话")
-		}
-		return failAgentXianyuNode(result, "闲鱼自动评价未找到可扫描的会话。", err.Error())
+	if !pendingTab.Found {
+		return failAgentXianyuNode(result, "闲鱼自动评价未找到“待卖家评价”页签。", firstNonEmpty(pendingTab.Reason, "pending_seller_review_tab_not_found"))
 	}
-	queue := make([]agentXianyuConversationCandidate, 0, len(batch.Items))
-	seen := map[string]struct{}{}
-	appendCandidates := func(items []agentXianyuConversationCandidate) {
-		for _, candidate := range items {
-			candidate.Key = agentXianyuCandidateKey(candidate)
-			if candidate.Key == "" {
-				continue
-			}
-			if _, ok := seen[candidate.Key]; ok {
-				continue
-			}
-			seen[candidate.Key] = struct{}{}
-			queue = append(queue, candidate)
-			if len(queue) >= limit {
-				return
-			}
+	if pendingTab.Clicked {
+		if err = waitAgentXianyuDOM(ctx); err != nil {
+			return failAgentXianyuNode(result, "闲鱼自动评价等待待评价列表失败。", err.Error())
 		}
 	}
-	appendCandidates(batch.Items)
-	listTop := reset.Top
-	listExhausted := false
-	listNoProgress := 0
+
+	listSelector := settings["订单列表选择器"]
+	actionSelector := settings["评价按钮选择器"]
+	dialogSelector := settings["评价弹窗选择器"]
+	inputSelector := settings["评价输入框选择器"]
+	ratingSelector := settings["好评选项选择器"]
+	submitSelector := settings["评价提交按钮选择器"]
+	ceiling := parseAgentPositiveSetting(settings["最大评价保护上限"], agentXianyuReviewDefaultMaxOrders, agentXianyuReviewMaxOrders)
+	limit, _ := parseAgentXianyuReviewLimit(settings["评价数量"], ceiling)
+	reviewWait := parseAgentPositiveSetting(settings["单次评价等待"], agentXianyuReviewDefaultWait, 10)
+
 	stats := agentXianyuReviewStats{}
+	attempted := map[string]struct{}{}
+	seenSkipped := map[string]struct{}{}
+	navigatedSignatures := map[string]struct{}{}
 	report := func(message string) {
-		reportAgentExecutionProgress(ctx, map[string]interface{}{"phase": "reviewing", "node_id": node.ID, "node_kind": node.Data.Kind, "node_title": node.Data.Title, "message": message, "scanned": stats.Scanned, "eligible": stats.Eligible, "submitted": stats.Submitted, "skipped": stats.Skipped, "failed": stats.Failed})
+		reportAgentExecutionProgress(ctx, map[string]interface{}{
+			"phase":      "reviewing",
+			"node_id":    node.ID,
+			"node_kind":  node.Data.Kind,
+			"node_title": node.Data.Title,
+			"message":    message,
+			"scanned":    stats.Scanned,
+			"eligible":   stats.Eligible,
+			"submitted":  stats.Submitted,
+			"skipped":    stats.Skipped,
+			"failed":     stats.Failed,
+		})
 	}
-	for index := 0; all || index < limit; {
+
+	for stats.Scanned < limit {
 		if err := ctx.Err(); err != nil {
 			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价已中断。", err.Error(), stats)
 		}
-		if index >= len(queue) {
-			if listExhausted {
+		candidate, inspectErr := evaluateAgentXianyuReviewOpenNext(ctx, conn, nextID(), listSelector, actionSelector, state.Reviewed, attempted)
+		if inspectErr != nil {
+			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价读取待评价订单失败。", inspectErr.Error(), stats)
+		}
+		for _, orderKey := range candidate.ReviewedOrderKeys {
+			if _, seen := seenSkipped[orderKey]; seen {
+				continue
+			}
+			seenSkipped[orderKey] = struct{}{}
+			stats.Skipped++
+		}
+		if !candidate.Found {
+			signature := strings.TrimSpace(candidate.Signature)
+			if signature == "" {
+				signature = fmt.Sprintf("empty:%d:%d", stats.Scanned, candidate.VisibleCount)
+			}
+			if _, alreadyNavigated := navigatedSignatures[signature]; alreadyNavigated {
 				break
 			}
-			nextBatch, scrollErr := evaluateAgentXianyuCandidates(ctx, conn, nextID(), listSelector, agentXianyuMaxConversations)
-			if scrollErr == nil {
-				before := len(queue)
-				appendCandidates(nextBatch.Items)
-				if len(queue) > before {
-					continue
-				}
+			navigatedSignatures[signature] = struct{}{}
+			nextPage, pageErr := evaluateAgentXianyuReviewNextPage(ctx, conn, nextID())
+			if pageErr != nil {
+				return failAgentXianyuReviewWithStats(result, "闲鱼自动评价翻页失败。", pageErr.Error(), stats)
 			}
-			position, scrollErr := evaluateAgentXianyuConversationListScroll(ctx, conn, nextID(), listSelector)
-			if scrollErr != nil {
-				return failAgentXianyuReviewWithStats(result, "闲鱼自动评价滚动会话列表失败。", scrollErr.Error(), stats)
-			}
-			if position.AtEnd {
-				listNoProgress++
-				if listNoProgress >= agentXianyuConversationListEndConfirmations {
-					listExhausted = true
-					break
-				}
-			} else if position.Moved && position.Top > listTop {
-				listTop = position.Top
-				listNoProgress = 0
-			} else {
-				// A virtualized list may need another render tick before its scrollTop changes.
-				listNoProgress++
-				if listNoProgress >= agentXianyuConversationListStallLimit {
-					return failAgentXianyuReviewWithStats(result, "闲鱼自动评价会话列表连续无法向后滚动。", "conversation list did not advance", stats)
-				}
+			if !nextPage.Clicked || nextPage.AtEnd {
+				break
 			}
 			if err := waitAgentXianyuDOM(ctx); err != nil {
-				return failAgentXianyuReviewWithStats(result, "闲鱼自动评价等待列表更新失败。", err.Error(), stats)
+				return failAgentXianyuReviewWithStats(result, "闲鱼自动评价等待下一页失败。", err.Error(), stats)
 			}
 			continue
 		}
-		candidate := queue[index]
-		index++
-		if _, err := evaluateAgentXianyuConversationListRestore(ctx, conn, nextID(), listSelector, listTop); err != nil {
-			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价恢复列表位置失败。", err.Error(), stats)
-		}
-		if err := clickAgentXianyuConversation(ctx, conn, nextID(), listSelector, candidate); err != nil {
-			stats.Skipped++
-			continue
-		}
-		if err := waitAgentXianyu(ctx, settings["单会话等待"], conversationWait); err != nil {
-			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价等待订单区域失败。", err.Error(), stats)
-		}
+
+		orderKey := strings.TrimSpace(candidate.OrderKey)
 		stats.Scanned++
-		order, inspectErr := evaluateAgentXianyuReview(ctx, conn, nextID(), orderSelector, entrySelector, candidate.Key)
-		if inspectErr != nil {
+		if orderKey == "" {
 			stats.Failed++
-			report(fmt.Sprintf("第 %d 个会话评价检查失败。", stats.Scanned))
-			continue
+			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价无法确认待评价订单编号。", "review_order_key_not_found", stats)
 		}
-		if !order.Eligible || order.OrderKey == "" {
-			stats.Skipped++
-			report(fmt.Sprintf("第 %d 个会话没有明确可评价订单，已跳过。", stats.Scanned))
-			continue
-		}
+		attempted[orderKey] = struct{}{}
 		stats.Eligible++
-		if _, ok := state.Reviewed[order.OrderKey]; ok {
-			stats.Skipped++
-			report(fmt.Sprintf("第 %d 个会话订单已评价，已跳过。", stats.Scanned))
-			continue
+		report(fmt.Sprintf("正在评价订单 %s。", orderKey))
+
+		if err := waitAgentXianyu(ctx, fmt.Sprintf("%ds", reviewWait), reviewWait); err != nil {
+			return failAgentXianyuReviewWithStats(result, "闲鱼自动评价等待评价表单失败。", err.Error(), stats)
 		}
-		text := firstNonEmpty(settings["评价内容"], agentXianyuReviewDefaultText)
-		stars := parseAgentPositiveSetting(settings["评价星级"], agentXianyuReviewDefaultStars, 5)
-		if err := evaluateAgentXianyuReviewSubmit(ctx, conn, nextID(), orderSelector, inputSelector, submitSelector, text, stars); err != nil {
+		submit, submitErr := evaluateAgentXianyuReviewSubmit(ctx, conn, nextID(), dialogSelector, inputSelector, ratingSelector, submitSelector, reviewText)
+		if submitErr != nil || !submit.Submitted {
 			stats.Failed++
-			report(fmt.Sprintf("第 %d 个会话评价提交失败。", stats.Scanned))
+			reason := submit.Reason
+			if submitErr != nil {
+				reason = submitErr.Error()
+			}
+			report(fmt.Sprintf("订单 %s 评价提交失败：%s。", orderKey, firstNonEmpty(reason, "unknown_error")))
 			continue
 		}
-		state.Reviewed[order.OrderKey] = time.Now().UnixMilli()
-		state.UpdatedAt = time.Now().UnixMilli()
-		if err := saveAgentXianyuReviewState(statePath, state); err != nil {
+		confirmation, confirmErr := confirmAgentXianyuReviewSubmission(ctx, conn, nextID, inputSelector, orderKey, reviewWait)
+		if confirmErr != nil || !confirmation.Confirmed {
 			stats.Failed++
-			report(fmt.Sprintf("第 %d 个会话评价状态保存失败。", stats.Scanned))
+			reason := confirmation.Reason
+			if confirmErr != nil {
+				reason = confirmErr.Error()
+			}
+			report(fmt.Sprintf("订单 %s 未确认评价成功：%s。", orderKey, firstNonEmpty(reason, "review_confirmation_timeout")))
 			continue
 		}
+
+		now := time.Now().UnixMilli()
+		state.Reviewed[orderKey] = now
+		state.UpdatedAt = now
+		seenSkipped[orderKey] = struct{}{}
 		stats.Submitted++
-		report(fmt.Sprintf("已完成第 %d 个会话的订单评价。", stats.Scanned))
+		if err := saveAgentXianyuReviewState(statePath, state); err != nil {
+			return failAgentXianyuReviewWithStats(result, "闲鱼评价已提交，但本地防重复状态保存失败。", err.Error(), stats)
+		}
+		report(fmt.Sprintf("订单 %s 已完成评价。", orderKey))
 	}
-	result.Message = fmt.Sprintf("闲鱼自动评价完成，扫描 %d 个会话，找到 %d 个可评价订单，成功评价 %d 个，跳过 %d 个，失败 %d 个。", stats.Scanned, stats.Eligible, stats.Submitted, stats.Skipped, stats.Failed)
-	result.Output = map[string]interface{}{"scanned_conversation_count": stats.Scanned, "eligible_order_count": stats.Eligible, "submitted_review_count": stats.Submitted, "skipped_count": stats.Skipped, "failed_count": stats.Failed, "review_text": firstNonEmpty(settings["评价内容"], agentXianyuReviewDefaultText), "review_stars": parseAgentPositiveSetting(settings["评价星级"], agentXianyuReviewDefaultStars, 5)}
+
+	result.Message = fmt.Sprintf("闲鱼自动评价完成，从评价管理扫描 %d 个待卖家评价订单，成功评价 %d 个，跳过 %d 个，失败 %d 个。", stats.Scanned, stats.Submitted, stats.Skipped, stats.Failed)
+	result.Output = map[string]interface{}{
+		"source":                 "闲鱼评价管理",
+		"scanned_order_count":    stats.Scanned,
+		"eligible_order_count":   stats.Eligible,
+		"submitted_review_count": stats.Submitted,
+		"skipped_count":          stats.Skipped,
+		"failed_count":           stats.Failed,
+		"review_text":            reviewText,
+		"review_rating":          "好评",
+	}
 	return result
 }
 
-type agentXianyuReviewOrder struct {
-	Eligible        bool   `json:"eligible"`
-	AlreadyReviewed bool   `json:"already_reviewed"`
-	OrderKey        string `json:"order_key"`
-}
-
-func evaluateAgentXianyuReview(ctx context.Context, conn *websocket.Conn, id int, orderSelector, entrySelector, fallbackKey string) (agentXianyuReviewOrder, error) {
-	raw, err := agentBrowserCDPCall(ctx, conn, id, "Runtime.evaluate", map[string]any{"expression": buildAgentXianyuReviewInspectExpression(orderSelector, entrySelector), "returnByValue": true})
+func normalizeAgentXianyuReviewURL(raw string) (string, error) {
+	value, err := normalizeAgentXianyuURL(firstNonEmpty(raw, agentXianyuReviewDefaultURL))
 	if err != nil {
-		return agentXianyuReviewOrder{}, err
+		return "", err
 	}
-	var response struct {
-		Result struct {
-			Value string `json:"value"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return agentXianyuReviewOrder{}, err
-	}
-	var result agentXianyuReviewOrder
-	if err := json.Unmarshal([]byte(response.Result.Value), &result); err != nil {
-		return agentXianyuReviewOrder{}, err
-	}
-	if result.OrderKey == "" {
-		result.OrderKey = strings.TrimSpace(fallbackKey)
-	}
-	return result, nil
-}
-
-func evaluateAgentXianyuReviewSubmit(ctx context.Context, conn *websocket.Conn, id int, orderSelector, inputSelector, submitSelector, text string, stars int) error {
-	raw, err := agentBrowserCDPCall(ctx, conn, id, "Runtime.evaluate", map[string]any{"expression": buildAgentXianyuReviewSubmitExpression(orderSelector, inputSelector, submitSelector, text, stars), "returnByValue": true})
+	parsed, err := url.Parse(value)
 	if err != nil {
-		return err
+		return "", err
 	}
-	var response struct {
-		Result struct {
-			Value string `json:"value"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return err
-	}
-	var payload struct {
-		Submitted bool   `json:"submitted"`
-		Reason    string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(response.Result.Value), &payload); err != nil {
-		return err
-	}
-	if !payload.Submitted {
-		return errors.New(firstNonEmpty(payload.Reason, "评价提交按钮未找到"))
-	}
-	return nil
+	query := parsed.Query()
+	query.Set("site", "COMMONPRO")
+	parsed.RawQuery = query.Encode()
+	parsed.Fragment = agentXianyuReviewRoute
+	return parsed.String(), nil
 }
 
-func buildAgentXianyuReviewInspectExpression(orderSelector, entrySelector string) string {
-	orderJSON, entryJSON := quoteAgentXianyuJS(orderSelector), quoteAgentXianyuJS(entrySelector)
-	return fmt.Sprintf(`(() => { const custom=%s,entryCustom=%s; const clean=v=>String(v||'').replace(/\s+/g,' ').trim(); const visible=e=>{if(!e)return false;const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>20&&r.height>12&&r.right>innerWidth*.45&&r.bottom>0&&r.top<innerHeight&&s.display!=='none'&&s.visibility!=='hidden';}; let root=null;if(custom){try{root=document.querySelector(custom)}catch(_){}} if(!root){const all=[...document.querySelectorAll('body *')].filter(visible);root=all.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return (br.left+br.width*br.height)-(ar.left+ar.width*ar.height)})[0]||document.body;} const text=clean(root?.innerText||''); const orderMatch=text.match(/(?:订单编号|订单号)\s*[:：]?\s*([A-Za-z0-9_-]{6,})/); let entries=[];if(entryCustom){try{entries=[...document.querySelectorAll(entryCustom)]}catch(_){} } if(!entries.length){entries=[...document.querySelectorAll('button,[role="button"],a')].filter(visible).filter(e=>/^(去评价|立即评价|待评价|评价商品|评价)$/i.test(clean(e.innerText||e.textContent||e.getAttribute('aria-label'))));} const available=entries.find(e=>/^(去评价|立即评价|待评价|评价商品)$/i.test(clean(e.innerText||e.textContent||e.getAttribute('aria-label')))); const already=/(已评价|评价完成|已追评)/.test(text); return JSON.stringify({eligible:Boolean(available)&&!already,already_reviewed:already,order_key:orderMatch?orderMatch[1]:''}); })()`, orderJSON, entryJSON)
+func parseAgentXianyuReviewLimit(value string, ceiling int) (limit int, all bool) {
+	if ceiling <= 0 {
+		ceiling = agentXianyuReviewDefaultMaxOrders
+	}
+	raw := strings.ToLower(strings.TrimSpace(value))
+	switch raw {
+	case "", "0", "all", "unlimited", "全部", "不限", "所有", "全部评价", "所有评价":
+		return ceiling, true
+	default:
+		return parseAgentPositiveSetting(raw, 20, ceiling), false
+	}
 }
 
-func buildAgentXianyuReviewSubmitExpression(orderSelector, inputSelector, submitSelector, text string, stars int) string {
-	orderJSON, inputJSON, submitJSON, textJSON := quoteAgentXianyuJS(orderSelector), quoteAgentXianyuJS(inputSelector), quoteAgentXianyuJS(submitSelector), quoteAgentXianyuJS(text)
-	return fmt.Sprintf(`(() => { const customRoot=%s,customInput=%s,customSubmit=%s,review=%s,stars=%d; const clean=v=>String(v||'').replace(/\s+/g,' ').trim(); const visible=e=>{if(!e)return false;const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>80&&r.height>18&&r.bottom>0&&r.top<innerHeight&&s.display!=='none'&&s.visibility!=='hidden';}; let root=null;if(customRoot){try{root=document.querySelector(customRoot)}catch(_){}} const scope=root||document; let inputs=[];if(customInput){try{inputs=[...scope.querySelectorAll(customInput)]}catch(_){} }if(!inputs.length)inputs=[...scope.querySelectorAll('textarea,[contenteditable="true"],[placeholder*="评价"],[placeholder*="评论"]')];inputs=inputs.filter(visible);const input=inputs[0];if(!input)return JSON.stringify({submitted:false,reason:'review_input_not_found'});input.focus();if(input.isContentEditable){input.textContent=review;input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:review}));}else{const proto=input.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value');if(setter&&setter.set)setter.set.call(input,review);else input.value=review;input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:review}));input.dispatchEvent(new Event('change',{bubbles:true}));} const starNodes=[...scope.querySelectorAll('[aria-label*="星"],[title*="星"],[data-score],[data-rating],[class*="star"],[class*="Star"]')].filter(visible);if(starNodes.length&&stars>0){const target=starNodes[Math.min(starNodes.length,stars)-1];try{target.click()}catch(_){} }let buttons=[];if(customSubmit){try{buttons=[...scope.querySelectorAll(customSubmit)]}catch(_){} }if(!buttons.length)buttons=[...scope.querySelectorAll('button,[role="button"],a')].filter(visible).filter(e=>/^(提交评价|发布评价|发表评价|提交)$/i.test(clean(e.innerText||e.textContent||e.getAttribute('aria-label'))));const button=buttons[0];if(!button)return JSON.stringify({submitted:false,reason:'review_submit_not_found'});button.click();return JSON.stringify({submitted:true}); })()`, orderJSON, inputJSON, submitJSON, textJSON, stars)
+func normalizeAgentXianyuReviewText(_ string) string {
+	return agentXianyuReviewDefaultText
+}
+
+func evaluateAgentXianyuReviewPendingTab(ctx context.Context, conn *websocket.Conn, id int) (agentXianyuReviewPendingTabPayload, error) {
+	return evaluateAgentXianyuJSON(ctx, conn, id, buildAgentXianyuReviewPendingTabExpression(), agentXianyuReviewPendingTabPayload{})
+}
+
+func evaluateAgentXianyuReviewOpenNext(ctx context.Context, conn *websocket.Conn, id int, listSelector, actionSelector string, reviewed map[string]int64, attempted map[string]struct{}) (agentXianyuReviewCandidatePayload, error) {
+	expression := buildAgentXianyuReviewOpenNextExpression(listSelector, actionSelector, agentXianyuReviewMapKeys(reviewed), agentXianyuReviewSetKeys(attempted))
+	return evaluateAgentXianyuJSON(ctx, conn, id, expression, agentXianyuReviewCandidatePayload{})
+}
+
+func evaluateAgentXianyuReviewSubmit(ctx context.Context, conn *websocket.Conn, id int, dialogSelector, inputSelector, ratingSelector, submitSelector, text string) (agentXianyuReviewActionPayload, error) {
+	expression := buildAgentXianyuReviewSubmitExpression(dialogSelector, inputSelector, ratingSelector, submitSelector, text)
+	return evaluateAgentXianyuJSON(ctx, conn, id, expression, agentXianyuReviewActionPayload{})
+}
+
+func evaluateAgentXianyuReviewConfirmation(ctx context.Context, conn *websocket.Conn, id int, inputSelector, orderKey string) (agentXianyuReviewConfirmationPayload, error) {
+	expression := buildAgentXianyuReviewConfirmationExpression(inputSelector, orderKey)
+	return evaluateAgentXianyuJSON(ctx, conn, id, expression, agentXianyuReviewConfirmationPayload{})
+}
+
+func confirmAgentXianyuReviewSubmission(ctx context.Context, conn *websocket.Conn, nextID func() int, inputSelector, orderKey string, waitSeconds int) (agentXianyuReviewConfirmationPayload, error) {
+	waitDuration := agentXianyuDOMWait
+	if waitSeconds > 0 {
+		waitDuration = time.Duration(waitSeconds) * time.Second
+	}
+	var last agentXianyuReviewConfirmationPayload
+	for attempt := 0; attempt < agentXianyuReviewConfirmAttempts; attempt++ {
+		if err := waitAgentXianyuDuration(ctx, waitDuration); err != nil {
+			return last, err
+		}
+		payload, err := evaluateAgentXianyuReviewConfirmation(ctx, conn, nextID(), inputSelector, orderKey)
+		if err != nil {
+			return last, err
+		}
+		last = payload
+		if payload.Confirmed || payload.Failed {
+			return payload, nil
+		}
+		waitDuration = agentXianyuDOMWait
+	}
+	return last, nil
+}
+
+func evaluateAgentXianyuReviewNextPage(ctx context.Context, conn *websocket.Conn, id int) (agentXianyuReviewNextPagePayload, error) {
+	return evaluateAgentXianyuJSON(ctx, conn, id, buildAgentXianyuReviewNextPageExpression(), agentXianyuReviewNextPagePayload{})
+}
+
+func buildAgentXianyuReviewPendingTabExpression() string {
+	return `(() => {
+ const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+ const displayed = element => { if (!element) return false; const rect = element.getBoundingClientRect(); const style = getComputedStyle(element); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; };
+ const elements = [...document.querySelectorAll('[role="tab"],button,a,[role="button"],div,span')].filter(displayed);
+ const label = elements.find(element => /^待卖家评价\s*\d*$/.test(clean(element.innerText || element.textContent)));
+ if (!label) return JSON.stringify({found:false,clicked:false,reason:'pending_seller_review_tab_not_found'});
+ const target = label.closest('[role="tab"],button,a,[role="button"]') || label;
+ target.scrollIntoView({block:'center',inline:'nearest'});
+ target.click();
+ return JSON.stringify({found:true,clicked:true,reason:''});
+})()`
+}
+
+func buildAgentXianyuReviewOpenNextExpression(listSelector, actionSelector string, reviewedKeys, attemptedKeys []string) string {
+	listJSON := quoteAgentXianyuJS(listSelector)
+	actionJSON := quoteAgentXianyuJS(actionSelector)
+	reviewedJSON, _ := json.Marshal(reviewedKeys)
+	attemptedJSON, _ := json.Marshal(attemptedKeys)
+	return fmt.Sprintf(`(() => {
+ const customList=%s,customAction=%s,reviewed=new Set(%s),attempted=new Set(%s);
+ const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
+ const displayed=element=>{if(!element)return false;const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&style.opacity!=='0';};
+ const disabled=element=>!element||element.disabled||element.getAttribute('aria-disabled')==='true'||/(^|\s)(disabled|is-disabled)(\s|$)/i.test(String(element.className||''));
+ const extractOrder=text=>{const match=clean(text).match(/(?:订单编号|订单号)\s*[:：]?\s*([A-Za-z0-9_-]{8,})/);return match?match[1]:'';};
+ let scope=document;
+ if(customList){try{scope=document.querySelector(customList)||document;}catch(_){return JSON.stringify({found:false,visible_count:0,signature:'',reviewed_order_keys:[],reason:'invalid_order_list_selector'});}}
+ let rawActions=[];
+ if(customAction){try{rawActions=[...scope.querySelectorAll(customAction)];}catch(_){return JSON.stringify({found:false,visible_count:0,signature:'',reviewed_order_keys:[],reason:'invalid_review_action_selector'});}}
+ if(!rawActions.length){
+   rawActions=[...scope.querySelectorAll('button,a,[role="button"]')].filter(element=>/^(去评价|立即评价|评价商品|评价)$/.test(clean(element.innerText||element.textContent||element.getAttribute('aria-label'))));
+   const textActions=[...scope.querySelectorAll('span,div')].filter(element=>element.childElementCount===0&&/^(去评价|立即评价|评价商品|评价)$/.test(clean(element.textContent)));
+   rawActions.push(...textActions.map(element=>element.closest('button,a,[role="button"]')||element));
+ }
+ const actions=[...new Set(rawActions)].filter(element=>displayed(element)&&!disabled(element));
+ const markerCandidates=[...scope.querySelectorAll('div,span,p')].filter(element=>{const text=clean(element.innerText||element.textContent);return displayed(element)&&text.length<160&&/(?:订单编号|订单号)\s*[:：]?\s*[A-Za-z0-9_-]{8,}/.test(text);});
+ const orderForAction=action=>{
+   let current=action;
+   for(let depth=0;current&&depth<12;depth+=1,current=current.parentElement){
+     const text=clean(current.innerText||current.textContent);
+     const matches=[...text.matchAll(/(?:订单编号|订单号)\s*[:：]?\s*([A-Za-z0-9_-]{8,})/g)].map(match=>match[1]);
+     const unique=[...new Set(matches)];
+     if(unique.length===1&&text.length<8000)return unique[0];
+     if(current===scope)break;
+   }
+   const actionRect=action.getBoundingClientRect();
+   const nearby=markerCandidates.map(element=>({key:extractOrder(element.innerText||element.textContent),rect:element.getBoundingClientRect()})).filter(item=>item.key&&item.rect.top<=actionRect.bottom+40).sort((left,right)=>Math.abs(actionRect.top-left.rect.top)-Math.abs(actionRect.top-right.rect.top));
+   return nearby.length?nearby[0].key:'';
+ };
+ const items=[];
+ for(const action of actions){const key=orderForAction(action);if(key&&!items.some(item=>item.key===key))items.push({key,action});}
+ const keys=items.map(item=>item.key);
+ const reviewedOnPage=keys.filter(key=>reviewed.has(key));
+ const candidate=items.find(item=>!reviewed.has(item.key)&&!attempted.has(item.key));
+ const signature=keys.join('|');
+ if(!candidate)return JSON.stringify({found:false,order_key:'',visible_count:items.length,signature,reviewed_order_keys:reviewedOnPage,reason:items.length?'all_visible_orders_already_processed':'no_pending_review_action'});
+ candidate.action.scrollIntoView({block:'center',inline:'nearest'});
+ candidate.action.click();
+ return JSON.stringify({found:true,order_key:candidate.key,visible_count:items.length,signature,reviewed_order_keys:reviewedOnPage,reason:''});
+})()`, listJSON, actionJSON, string(reviewedJSON), string(attemptedJSON))
+}
+
+func buildAgentXianyuReviewSubmitExpression(dialogSelector, inputSelector, ratingSelector, submitSelector, text string) string {
+	dialogJSON := quoteAgentXianyuJS(dialogSelector)
+	inputJSON := quoteAgentXianyuJS(inputSelector)
+	ratingJSON := quoteAgentXianyuJS(ratingSelector)
+	submitJSON := quoteAgentXianyuJS(submitSelector)
+	textJSON := quoteAgentXianyuJS(text)
+	return fmt.Sprintf(`(() => {
+ const customDialog=%s,customInput=%s,customRating=%s,customSubmit=%s,review=%s;
+ const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
+ const displayed=element=>{if(!element)return false;const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&style.opacity!=='0';};
+ const disabled=element=>!element||element.disabled||element.getAttribute('aria-disabled')==='true'||/(^|\s)(disabled|is-disabled)(\s|$)/i.test(String(element.className||''));
+ let root=null;
+ if(customDialog){try{root=[...document.querySelectorAll(customDialog)].filter(displayed).pop()||null;}catch(_){return JSON.stringify({submitted:false,reason:'invalid_review_dialog_selector'});}}
+ if(!root){const dialogs=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[class*="modal" i],[class*="dialog" i],[class*="drawer" i]')].filter(displayed);root=dialogs.pop()||document;}
+ let inputs=[];
+ if(customInput){try{inputs=[...root.querySelectorAll(customInput)];if(!inputs.length)inputs=[...document.querySelectorAll(customInput)];}catch(_){return JSON.stringify({submitted:false,reason:'invalid_review_input_selector'});}}
+ if(!inputs.length)inputs=[...root.querySelectorAll('textarea,[contenteditable="true"],input[placeholder*="评价"],input[placeholder*="感受"],textarea[placeholder*="感受"]')];
+ const input=inputs.find(displayed);
+ if(!input)return JSON.stringify({submitted:false,reason:'review_input_not_found'});
+ let rating=null;
+ if(customRating){try{rating=[...root.querySelectorAll(customRating)].find(displayed)||[...document.querySelectorAll(customRating)].find(displayed)||null;}catch(_){return JSON.stringify({submitted:false,reason:'invalid_positive_rating_selector'});}}
+ if(!rating){
+   const labels=[...root.querySelectorAll('label,button,[role="radio"],[role="button"],span,div')].filter(element=>displayed(element)&&element.childElementCount<4&&/^好评$/.test(clean(element.innerText||element.textContent||element.getAttribute('aria-label'))));
+   rating=labels[0]||root.querySelector('[data-score="5"],[data-rating="5"],[aria-label*="5星"],[title*="5星"]');
+   if(!rating){const stars=[...root.querySelectorAll('[role="radio"],[class*="star" i]')].filter(displayed);if(stars.length>=5)rating=stars[4];}
+ }
+ if(!rating)return JSON.stringify({submitted:false,reason:'positive_rating_not_found'});
+ const ratingTarget=rating.closest('label,button,[role="radio"],[role="button"]')||rating;ratingTarget.click();
+ input.focus();
+ if(input.isContentEditable){
+   input.textContent=review;
+   input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:review}));
+ }else{
+   const proto=input.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+   const descriptor=Object.getOwnPropertyDescriptor(proto,'value');
+   if(descriptor&&descriptor.set)descriptor.set.call(input,review);else input.value=review;
+   input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:review}));
+   input.dispatchEvent(new Event('change',{bubbles:true}));
+ }
+ let buttons=[];
+ if(customSubmit){try{buttons=[...root.querySelectorAll(customSubmit)];if(!buttons.length)buttons=[...document.querySelectorAll(customSubmit)];}catch(_){return JSON.stringify({submitted:false,reason:'invalid_review_submit_selector'});}}
+ if(!buttons.length)buttons=[...root.querySelectorAll('button,a,[role="button"]')].filter(element=>/^(确认评价|提交评价|发布评价|发表评价|确认提交|提交)$/.test(clean(element.innerText||element.textContent||element.getAttribute('aria-label'))));
+ const button=buttons.find(element=>displayed(element)&&!disabled(element));
+ if(!button)return JSON.stringify({submitted:false,reason:'review_submit_button_not_found'});
+ button.scrollIntoView({block:'center',inline:'nearest'});
+ button.click();
+ return JSON.stringify({submitted:true,reason:''});
+})()`, dialogJSON, inputJSON, ratingJSON, submitJSON, textJSON)
+}
+
+func buildAgentXianyuReviewConfirmationExpression(inputSelector, orderKey string) string {
+	inputJSON := quoteAgentXianyuJS(inputSelector)
+	orderJSON := quoteAgentXianyuJS(orderKey)
+	return fmt.Sprintf(`(() => {
+ const customInput=%s,orderKey=%s;
+ const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
+ const displayed=element=>{if(!element)return false;const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&style.opacity!=='0';};
+ const notices=[...document.querySelectorAll('[role="alert"],[class*="message" i],[class*="toast" i],[class*="notification" i]')].filter(element=>displayed(element)&&clean(element.innerText||element.textContent).length<240).map(element=>clean(element.innerText||element.textContent));
+ const failed=notices.find(text=>/(评价失败|提交失败|发布失败|请重试)/.test(text));
+ if(failed)return JSON.stringify({confirmed:false,failed:true,reason:failed});
+ const success=notices.find(text=>/(评价成功|提交成功|发布成功|发表成功)/.test(text));
+ if(success)return JSON.stringify({confirmed:true,failed:false,reason:success});
+ let editors=[];
+ if(customInput){try{editors=[...document.querySelectorAll(customInput)];}catch(_){}}
+ if(!editors.length)editors=[...document.querySelectorAll('[role="dialog"] textarea,[aria-modal="true"] textarea,[role="dialog"] [contenteditable="true"],[aria-modal="true"] [contenteditable="true"]')];
+ const editorOpen=editors.some(displayed);
+ if(!editorOpen)return JSON.stringify({confirmed:true,failed:false,reason:'review_editor_closed'});
+ return JSON.stringify({confirmed:false,failed:false,reason:'review_editor_still_open'});
+})()`, inputJSON, orderJSON)
+}
+
+func buildAgentXianyuReviewNextPageExpression() string {
+	return `(() => {
+ const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
+ const displayed=element=>{if(!element)return false;const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0&&rect.height>0&&style.display!=='none'&&style.visibility!=='hidden';};
+ const disabled=element=>!element||element.disabled||element.getAttribute('aria-disabled')==='true'||/(^|\s)(disabled|is-disabled)(\s|$)/i.test(String(element.className||''));
+ const selectors=['.ant-pagination-next button','.ant-pagination-next','.rc-pagination-next button','.rc-pagination-next','.semi-page-next','.semi-pagination-next','[class*="pagination-next"] button','[class*="pagination-next"]','[class*="page-next"]','[aria-label="下一页"]','[title="下一页"]'];
+ let next=null;
+ for(const selector of selectors){try{const candidate=[...document.querySelectorAll(selector)].find(displayed);if(candidate){next=candidate;break;}}catch(_){}}
+ if(!next)next=[...document.querySelectorAll('button,a,[role="button"],li')].find(element=>displayed(element)&&/^(下一页|下页|next|›|>)$/i.test(clean(element.innerText||element.textContent||element.getAttribute('aria-label')||element.getAttribute('title'))));
+ if(!next)return JSON.stringify({clicked:false,at_end:true,reason:'next_page_not_found'});
+ const target=next.matches('button,a,[role="button"]')?next:(next.querySelector('button,a,[role="button"]')||next);
+ if(disabled(next)||disabled(target))return JSON.stringify({clicked:false,at_end:true,reason:'last_page'});
+ target.scrollIntoView({block:'center',inline:'nearest'});
+ target.click();
+ return JSON.stringify({clicked:true,at_end:false,reason:''});
+})()`
+}
+
+func agentXianyuReviewMapKeys(values map[string]int64) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if key = strings.TrimSpace(key); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func agentXianyuReviewSetKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if key = strings.TrimSpace(key); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func failAgentXianyuReviewWithStats(result agentBlueprintNodeResult, message, errText string, stats agentXianyuReviewStats) agentBlueprintNodeResult {
 	result.Status = "failed"
 	result.Message = message
 	result.Error = errText
-	result.Output = map[string]interface{}{"scanned_conversation_count": stats.Scanned, "eligible_order_count": stats.Eligible, "submitted_review_count": stats.Submitted, "skipped_count": stats.Skipped, "failed_count": stats.Failed, "error": errText}
+	result.Output = map[string]interface{}{
+		"source":                 "闲鱼评价管理",
+		"scanned_order_count":    stats.Scanned,
+		"eligible_order_count":   stats.Eligible,
+		"submitted_review_count": stats.Submitted,
+		"skipped_count":          stats.Skipped,
+		"failed_count":           stats.Failed,
+		"error":                  errText,
+	}
 	return result
 }
 
 func agentXianyuReviewStatePath(dataDir, blueprintID, nodeID string) string {
 	return filepath.Join(dataDir, agentXianyuReviewStateDir, sanitizeAgentBrowserFilenamePart(blueprintID), sanitizeAgentBrowserFilenamePart(nodeID)+".json")
 }
+
 func loadAgentXianyuReviewState(path string) (agentXianyuReviewState, error) {
 	state := agentXianyuReviewState{Reviewed: map[string]int64{}}
 	raw, err := os.ReadFile(path)
@@ -315,6 +568,7 @@ func loadAgentXianyuReviewState(path string) (agentXianyuReviewState, error) {
 	}
 	return state, nil
 }
+
 func saveAgentXianyuReviewState(path string, state agentXianyuReviewState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
