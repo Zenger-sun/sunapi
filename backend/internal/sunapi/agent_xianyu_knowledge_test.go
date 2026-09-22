@@ -124,6 +124,11 @@ func TestWriteAgentXianyuKnowledgeDocumentsCreatesPreviewableDocument(t *testing
 	if strings.Contains(content, "raw message") || strings.Contains(content, "13800138000") {
 		t.Fatalf("knowledge document should contain only a redacted summary: %q", content)
 	}
+	for _, private := range []string{"来源网址", "浏览器会话", "会话归档标识"} {
+		if strings.Contains(content, private) {
+			t.Fatalf("knowledge document should not persist internal metadata %q: %q", private, content)
+		}
+	}
 	documents, err := writeAgentXianyuKnowledgeDocuments(ctx, store, []*KnowledgeBase{first, second}, "闲鱼客服知识.md", content)
 	if err != nil {
 		t.Fatal(err)
@@ -389,10 +394,13 @@ func TestAgentXianyuTranscriptExpressionExtractsOnlyMessageText(t *testing.T) {
 
 func TestAgentXianyuProductContextExpressionStaysInCurrentProductPanel(t *testing.T) {
 	expression := buildAgentXianyuProductContextExpression("")
-	for _, expected := range []string{"[role=\"tab\"]", "当前宝贝", "aria-controls", "NodeFilter.SHOW_TEXT", "found:false"} {
+	for _, expected := range []string{"[role=\"tab\"]", "当前宝贝", "aria-controls", "NodeFilter.SHOW_TEXT", "found:false", "已上架", "出售中", "有货", "privateLine", "publicLines", "本周购买", "成本价"} {
 		if !strings.Contains(expression, expected) {
 			t.Fatalf("product extraction must contain %q: %s", expected, expression)
 		}
+	}
+	if strings.Contains(expression, "status+'\\n'+pageText") {
+		t.Fatalf("product availability must not be inferred from description text: %s", expression)
 	}
 	if strings.Contains(expression, "document.body.innerText") {
 		t.Fatalf("product extraction must not capture the whole page: %s", expression)
@@ -507,9 +515,37 @@ func TestParseAgentXianyuConversationLimitUsesConfiguredCeiling(t *testing.T) {
 }
 
 func TestAgentXianyuDefaultSummaryInstructionIsStructured(t *testing.T) {
-	for _, heading := range []string{"商品/服务信息", "用户问题/场景", "用户意图与约束", "推荐客服回复", "业务规则与例外", "需要确认或转人工", "禁止承诺"} {
+	for _, heading := range []string{"商品/服务信息", "用户问题/场景", "用户意图与约束", "回复口吻与表达习惯", "推荐客服回复", "业务规则与例外", "需要确认或转人工", "禁止承诺"} {
 		if !strings.Contains(agentXianyuDefaultSummaryInstruction, heading) {
 			t.Fatalf("summary instruction is missing heading %q", heading)
+		}
+	}
+	for _, rule := range []string{"只分析卖家已发送消息", "避免通用 AI 客服套话", "曝光", "成本", "不得在任何面向买家的示例中出现"} {
+		if !strings.Contains(agentXianyuDefaultSummaryInstruction, rule) {
+			t.Fatalf("summary instruction is missing privacy/style rule %q", rule)
+		}
+	}
+}
+
+func TestRedactAgentXianyuTextRemovesPrivateSellerData(t *testing.T) {
+	value := strings.Join([]string{
+		"支持自动充值服务",
+		"曝光：1589",
+		"浏览：28",
+		"想要：4",
+		"浏览有 28 人",
+		"有 4 人想要",
+		"本周购买：6次",
+		"订单号：3312858145451060750",
+		"联系方式：138-0013-8000",
+	}, "\n")
+	redacted := redactAgentXianyuText(value)
+	if !strings.Contains(redacted, "支持自动充值服务") {
+		t.Fatalf("public product information should remain: %q", redacted)
+	}
+	for _, private := range []string{"曝光", "1589", "浏览", "28", "想要", "本周购买", "3312858145451060750", "138-0013-8000"} {
+		if strings.Contains(redacted, private) {
+			t.Fatalf("redaction leaked %q: %q", private, redacted)
 		}
 	}
 }

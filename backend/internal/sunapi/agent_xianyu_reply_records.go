@@ -40,6 +40,9 @@ type AgentXianyuReplyRecord struct {
 	KnowledgeQuery      string                    `json:"knowledge_query,omitempty"`
 	ModelDraft          string                    `json:"model_draft,omitempty"`
 	FinalReply          string                    `json:"final_reply,omitempty"`
+	FollowUpAttempted   bool                      `json:"follow_up_attempted,omitempty"`
+	FollowUpReply       string                    `json:"follow_up_reply,omitempty"`
+	FollowUpSentAt      int64                     `json:"follow_up_sent_at,omitempty"`
 	Status              string                    `json:"status"`
 	Fallback            bool                      `json:"fallback,omitempty"`
 	Error               string                    `json:"error,omitempty"`

@@ -59,7 +59,13 @@ export async function deleteAgent(id: string): Promise<void> {
 // ============================================================================
 
 export async function getBlueprintsByAgent(agentId: string): Promise<Blueprint[]> {
-  const resp = await api.get(`/api/agents/${agentId}/blueprints`)
+  const normalizedAgentId = agentId.trim()
+  if (!normalizedAgentId) return []
+  const resp = await api.get(`/api/agents/${normalizedAgentId}/blueprints`, {
+    // This is a read-only panel request. Let the caller render a retry state
+    // instead of showing a global toast (and then retrying the same 500).
+    skipErrorHandler: true,
+  })
   return extractData<Blueprint[]>(resp) ?? []
 }
 
@@ -109,9 +115,16 @@ export async function listBlueprintExecutionLogs(
   id: string,
   limit = 5
 ): Promise<AgentExecutionLog[]> {
-  const resp = await api.get(`/api/agents/${agentId}/blueprints/${id}/logs`, {
-    params: { limit },
-  })
+  const normalizedAgentId = agentId.trim()
+  const normalizedBlueprintId = id.trim()
+  if (!normalizedAgentId || !normalizedBlueprintId) return []
+  const resp = await api.get(
+    `/api/agents/${normalizedAgentId}/blueprints/${normalizedBlueprintId}/logs`,
+    {
+      params: { limit },
+      skipErrorHandler: true,
+    }
+  )
   return extractData<AgentExecutionLog[]>(resp) ?? []
 }
 
@@ -120,9 +133,12 @@ export async function listXianyuReplyRecords(
   blueprintId: string,
   limit = 50
 ): Promise<AgentXianyuReplyRecord[]> {
+  const normalizedAgentId = agentId.trim()
+  const normalizedBlueprintId = blueprintId.trim()
+  if (!normalizedAgentId || !normalizedBlueprintId) return []
   const resp = await api.get(
-    `/api/agents/${agentId}/blueprints/${blueprintId}/reply-records`,
-    { params: { limit } }
+    `/api/agents/${normalizedAgentId}/blueprints/${normalizedBlueprintId}/reply-records`,
+    { params: { limit }, skipErrorHandler: true }
   )
   return extractData<AgentXianyuReplyRecord[]>(resp) ?? []
 }
@@ -168,6 +184,7 @@ export const blueprintsByAgentQueryOptions = (agentId: string) =>
     queryKey: ['blueprints', agentId],
     queryFn: () => getBlueprintsByAgent(agentId),
     enabled: !!agentId,
+    retry: false,
     // A run completes asynchronously. Poll only while it is active so the UI
     // cannot keep showing a completed or failed execution as "running".
     refetchInterval: (query) =>

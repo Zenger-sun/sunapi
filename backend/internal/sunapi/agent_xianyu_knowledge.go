@@ -55,21 +55,29 @@ const (
 	// roughly two minutes. Bound each summary request so one route cannot make
 	// the whole 20-conversation run appear frozen.
 	agentXianyuSummaryRequestTimeout = 150 * time.Second
+	// Include the summary schema in the conversation hash so existing archived
+	// conversations are rebuilt when privacy or style extraction rules change.
+	agentXianyuKnowledgeFormatVersion = "public-reply-style-v2"
 )
 
 const agentXianyuDefaultSummaryInstruction = `逐条阅读已经完整加载的闲鱼客服历史消息，并结合页面明确展示的当前商品信息，仅依据已提供事实整理知识库。输出必须使用以下固定标题，缺少信息时写“未提及”，禁止猜测：
 ### 商品/服务信息
 ### 用户问题/场景
 ### 用户意图与约束
+### 回复口吻与表达习惯
 ### 推荐客服回复
 ### 业务规则与例外
 ### 需要确认或转人工
 ### 禁止承诺
 商品标题、规格、商品描述和页面状态必须与对应会话绑定，不得把其他会话的商品库存或状态混入；商品描述可作为后续客服回答的参考资料，页面状态只代表采集时刻。
-删除姓名、电话、订单号、地址、账号等个人信息，不保存原始对话；同一会话分段总结时保持事实一致。`
+“回复口吻与表达习惯”只分析卖家已发送消息的称呼、句长、语气词、分句方式和常用收尾，归纳可复用风格，不复制整段原话；“推荐客服回复”应沿用这种口吻，简短自然，避免通用 AI 客服套话。
+删除姓名、电话、订单号、地址、账号等个人信息；删除曝光、浏览、想要、收藏、访客、点击、询单、成交、转化、成本、利润、底价、内部备注等卖家侧数据。不得在任何面向买家的示例中出现这些数据，也不保存原始对话；同一会话分段总结时保持事实一致。`
 
-var agentXianyuSensitiveDigits = regexp.MustCompile(`\d{7,20}`)
+var agentXianyuSensitiveDigits = regexp.MustCompile(`(?:\d[\s-]?){7,20}`)
 var agentXianyuEmail = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
+var agentXianyuLabeledPrivateValue = regexp.MustCompile(`(?i)(姓名|收货人|电话|手机号|联系方式|订单号|订单编号|地址|账号)\s*[:：]\s*[^\n，,；;。]+`)
+var agentXianyuPrivateLine = regexp.MustCompile(`(?i)(来源网址|浏览器会话|会话归档标识|本次整理会话数|卖家工作台|内部备注|卖家备注|进货价|成本价|利润|底价|账号余额|提现金额|曝光(?:量|次数|人数|数据|\s*[:：])|浏览(?:量|次数|人数|数据|\s*[:：])|想要(?:数|人数|\s*[:：])|收藏(?:量|数|人数|\s*[:：])|访客(?:量|数|人数|\s*[:：])|点击率|转化率|询单人数|支付人数|支付订单数|成交金额|本周购买|本周消费|均单价|客单价|数据更新)`)
+var agentXianyuSellerMetricValue = regexp.MustCompile(`(?i)(曝光|浏览|想要|收藏|访客|点击|询单|成交|转化|成本|利润|底价)[^\n，,。；;]{0,12}\d|\d[^\n，,。；;]{0,12}(曝光|浏览|人?想要|收藏|访客|点击|询单|成交|转化)`)
 
 type agentXianyuConversation struct {
 	Key        string                    `json:"-"`
@@ -227,6 +235,8 @@ func executeAgentXianyuKnowledgeGraphNode(
 	summaryNode := node
 	if strings.TrimSpace(summaryNode.Data.Description) == "" {
 		summaryNode.Data.Description = agentXianyuDefaultSummaryInstruction
+	} else {
+		summaryNode.Data.Description = agentXianyuDefaultSummaryInstruction + "\n附加整理要求：" + strings.TrimSpace(summaryNode.Data.Description)
 	}
 	documents := make([]agentXianyuKnowledgeDocument, 0, len(changed)*len(bases))
 	archivedConversations := make([]agentXianyuConversation, 0, len(changed))
@@ -1097,6 +1107,11 @@ func evaluateAgentXianyuCandidates(ctx context.Context, conn *websocket.Conn, id
 	return evaluateAgentXianyuJSON(ctx, conn, id, expression, agentXianyuCandidatePayload{})
 }
 
+func evaluateAgentXianyuUnreadCandidates(ctx context.Context, conn *websocket.Conn, id int, selector string, limit int) (agentXianyuCandidatePayload, error) {
+	expression := buildAgentXianyuCandidatesExpressionWithUnread(selector, limit, true)
+	return evaluateAgentXianyuJSON(ctx, conn, id, expression, agentXianyuCandidatePayload{})
+}
+
 func agentXianyuCandidateKey(candidate agentXianyuConversationCandidate) string {
 	key := strings.TrimSpace(candidate.Key)
 	if key != "" {
@@ -1288,10 +1303,15 @@ func evaluateAgentXianyuJSON[T any](ctx context.Context, conn *websocket.Conn, i
 }
 
 func buildAgentXianyuCandidatesExpression(selector string, limit int) string {
+	return buildAgentXianyuCandidatesExpressionWithUnread(selector, limit, false)
+}
+
+func buildAgentXianyuCandidatesExpressionWithUnread(selector string, limit int, unreadOnly bool) string {
 	selectorJSON := quoteAgentXianyuJS(selector)
 	return fmt.Sprintf(`(() => {
  const custom = %s;
  const max = %d;
+ const unreadOnly = %t;
  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
  const linesOf = value => String(value || '').replace(/\r/g, '').split(/\n/).map(line => line.replace(/[ \t]+/g, ' ').trim()).filter(Boolean);
 	const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 80 && r.height > 24 && r.width < innerWidth * .82 && (custom || r.right < innerWidth * .45) && r.left < innerWidth * .72 && r.bottom > 0 && r.top < innerHeight && s.display !== 'none' && s.visibility !== 'hidden'; };
@@ -1313,16 +1333,24 @@ func buildAgentXianyuCandidatesExpression(selector string, limit int) string {
 	   const value = clean(item.getAttribute('data-unread-count') || item.getAttribute('data-unread') || item.textContent);
 	   return value !== '0' && value !== 'false';
 	 });
-	 const unread = unreadClass || unreadChild || /(^|\D)[1-9]\d*\s*(条)?新消息/.test(unreadValue);
+	 const unreadVisual = [...el.querySelectorAll('span,div,i,b')].some(item => {
+	   const rect=item.getBoundingClientRect(),style=getComputedStyle(item),value=clean(item.textContent);
+	   if(rect.width<3||rect.height<3||rect.width>34||rect.height>34||(!/^\d{1,2}$/.test(value)&&value!==''))return false;
+	   const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
+	   for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<130&&b<130)return true;}
+	   return false;
+	 });
+	 const unread = unreadClass || unreadChild || unreadVisual || /(^|\D)[1-9]\d*\s*(条)?新消息/.test(unreadValue);
    // Preview text changes when a new message arrives; never use it as the
    // conversation identity when the page does not expose a stable id.
+   if (unreadOnly && !unread) return;
    const key = stableID || firstLine;
    if (!key || seen.has(key)) return; seen.add(key);
    el.setAttribute('data-sunapi-xianyu-key', key);
 	 items.push({ key, title: firstLine.slice(0, 120), preview: text.slice(0, 240), unread, index });
  });
 	return JSON.stringify({ url: location.href || '', title: document.title || '', items: items.slice(0, max).map(({key,title,preview,unread}) => ({key,title,preview,unread})) });
-})()`, selectorJSON, limit)
+})()`, selectorJSON, limit, unreadOnly)
 }
 
 func buildAgentXianyuClickExpression(selector string, candidate agentXianyuConversationCandidate) string {
@@ -1399,17 +1427,18 @@ func buildAgentXianyuProductContextExpression(selector string) string {
  }
  if(!visible(root))return JSON.stringify({found:false,title:'',status:'',text:''});
  const lines=linesOf(root).slice(0,40);
- const status=lines.find(line=>/^(已删除|已下架|已失效|售罄|无货|在售|在线|可拍|已上架|出售中|有货|立即购买)$/.test(line))||'';
- const titleCandidates=lines.filter(line=>{
+ const status=lines.find(line=>/^(已删除|已下架|已失效|售罄|无货|不可拍|交易关闭|在售|在线|可拍|已上架|出售中|有货|立即购买|马上购买|加入购物车|去购买)$/.test(line))||'';
+ const privateLine=line=>/(来源网址|浏览器会话|会话归档标识|卖家工作台|内部备注|卖家备注|进货价|成本价|利润|底价|账号余额|提现金额|曝光(?:量|次数|人数|数据|\s*[:：])|浏览(?:量|次数|人数|数据|\s*[:：])|想要(?:数|人数|\s*[:：])|收藏(?:量|数|人数|\s*[:：])|访客(?:量|数|人数|\s*[:：])|点击率|转化率|询单人数|支付人数|支付订单数|成交金额|本周购买|本周消费|均单价|客单价|数据更新)/i.test(line);
+ const publicLines=lines.filter(line=>!privateLine(line)&&line!=='描述不符');
+ const titleCandidates=publicLines.filter(line=>{
   if(line===status||line.length<4)return false;
   if(/^(描述不符|曝光[:：]|浏览[:：]|想要[:：]|¥|￥|\d+(\.\d+)?元?$)/.test(line))return false;
   return !/^(全部|待付款|待发货|已发货|退款中|交易关闭|交易成功)$/.test(line);
  });
  titleCandidates.sort((a,b)=>b.length-a.length);
- const pageText=lines.join('\n').slice(0,1600);
- const normalized=(status+'\n'+pageText).toLowerCase();
- const unavailable=/(已下架|已删除|已失效|售罄|无货|不可拍|交易关闭)/.test(normalized);
- const available=/(在售|在线|可拍|立即购买|马上购买|加入购物车|去购买)/.test(normalized);
+ const pageText=publicLines.join('\n').slice(0,1600);
+ const unavailable=/^(已下架|已删除|已失效|售罄|无货|不可拍|交易关闭)$/.test(status);
+ const available=!unavailable&&/^(在售|在线|可拍|已上架|出售中|有货|立即购买|马上购买|加入购物车|去购买)$/.test(status);
  return JSON.stringify({found:true,title:(titleCandidates[0]||'').slice(0,300),status:status.slice(0,80),availability:unavailable?'unavailable':available?'available':'unknown',description:pageText,text:pageText});
 })()`, selectorJSON)
 }
@@ -1557,7 +1586,7 @@ func agentXianyuConversationIdentity(key string) string {
 }
 
 func agentXianyuConversationHash(item agentXianyuConversation) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{item.Key, item.Transcript, item.URL, item.Product.Title, item.Product.Status, item.Product.Availability, item.Product.Description, item.Product.Text}, "\n")))
+	sum := sha256.Sum256([]byte(strings.Join([]string{agentXianyuKnowledgeFormatVersion, item.Key, item.Transcript, item.URL, item.Product.Title, item.Product.Status, item.Product.Availability, item.Product.Description, item.Product.Text}, "\n")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -1665,15 +1694,7 @@ func commitAgentXianyuConversationKnowledge(
 func buildAgentXianyuKnowledgeDocument(sourceURL, browserSession string, conversations []agentXianyuConversation, summary string) string {
 	var builder strings.Builder
 	builder.WriteString("# 闲鱼客服知识摘要\n\n")
-	builder.WriteString("本文件由只读浏览器会话生成，仅保留脱敏后的归纳结论，不包含原始客服对话。\n\n")
-	builder.WriteString("- 来源：闲鱼客服后台\n")
-	builder.WriteString("- 来源网址：" + sourceURL + "\n")
-	builder.WriteString("- 浏览器会话：" + browserSession + "\n")
-	builder.WriteString(fmt.Sprintf("- 本次整理会话数：%d\n", len(conversations)))
-	if len(conversations) == 1 {
-		builder.WriteString("- 会话归档标识：" + agentXianyuShortIdentity(agentXianyuConversationIdentity(conversations[0].Key)) + "\n")
-	}
-	builder.WriteString("\n")
+	builder.WriteString("仅保留可用于对外客服的脱敏结论和表达风格，不包含原始对话、内部标识或卖家侧经营数据。\n\n")
 	if len(conversations) == 1 && conversations[0].Product.Found {
 		product := redactAgentXianyuProductContext(conversations[0].Product)
 		builder.WriteString("### 当前商品信息（采集时页面展示）\n")
@@ -1716,9 +1737,19 @@ func writeAgentXianyuKnowledgeDocuments(ctx context.Context, store *Store, bases
 }
 
 func redactAgentXianyuText(value string) string {
-	value = agentXianyuEmail.ReplaceAllString(value, "[邮箱已脱敏]")
-	value = agentXianyuSensitiveDigits.ReplaceAllString(value, "[数字信息已脱敏]")
-	return strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	lines := strings.Split(value, "\n")
+	redacted := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if agentXianyuPrivateLine.MatchString(line) || agentXianyuSellerMetricValue.MatchString(line) {
+			continue
+		}
+		line = agentXianyuLabeledPrivateValue.ReplaceAllString(line, "$1：[已脱敏]")
+		line = agentXianyuEmail.ReplaceAllString(line, "[邮箱已脱敏]")
+		line = agentXianyuSensitiveDigits.ReplaceAllString(line, "[数字信息已脱敏]")
+		redacted = append(redacted, line)
+	}
+	return strings.TrimSpace(strings.Join(redacted, "\n"))
 }
 
 func redactAgentXianyuProductContext(product agentXianyuProductContext) agentXianyuProductContext {

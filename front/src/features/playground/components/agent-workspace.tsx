@@ -733,7 +733,9 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   单会话等待: ['1s', '2s', '3s'],
   评价等级: ['好评'],
   消息轮询间隔: ['2s', '3s', '5s', '10s', '15s'],
+  监听范围: ['仅未读消息'],
   每轮最大会话数: ['10', '20', '30', '50'],
+  单次未清楚补答: ['最多1次'],
   启动时处理现有未读: ['是', '否'],
   最大回复字数: ['100', '200', '300', '500'],
   默认回复: ['开启', '关闭'],
@@ -902,7 +904,9 @@ const NODE_META: Record<
       登录等待: '180s',
       列表等待: '8s',
       消息轮询间隔: '2s',
+      监听范围: '仅未读消息',
       每轮最大会话数: '20',
+      单次未清楚补答: '最多1次',
       单会话等待: '1s',
       启动时处理现有未读: '是',
       最大回复字数: '300',
@@ -925,7 +929,7 @@ const NODE_META: Record<
     icon: MessagesSquareIcon,
     accent: 'bg-amber-500/12 text-amber-700 dark:text-amber-300',
     description:
-      '直接进入闲鱼评价管理的待卖家评价列表，按订单逐条提交好评，不查询聊天列表。',
+      '先进入闲鱼评价管理的待卖家评价列表，逐页全选并批量提交好评，确认当前页完成后再翻页直到没有待评价商品。',
     inputs: ['待卖家评价订单'],
     outputs: ['评价统计', '操作日志'],
     settings: {
@@ -935,11 +939,11 @@ const NODE_META: Record<
       会话名称: '闲鱼卖家工作台',
       登录等待: '180s',
       列表等待: '8s',
-      评价内容: '沟通顺利，交易愉快',
+      评价内容: '沟通顺畅，交易愉快',
       评价等级: '好评',
       评价数量: '全部',
       最大评价保护上限: '2000',
-      单次评价等待: '1s',
+      单次评价等待: '3s',
       订单列表选择器: '',
       评价按钮选择器: '',
       评价弹窗选择器: '',
@@ -2040,7 +2044,9 @@ export function AgentWorkspace({
       )
       setNodes(normalizedNodes)
       setEdges(blueprint.edges)
-      setExecutionLog(blueprint.executionLog ?? {})
+      setExecutionLog(
+        executionLogForBlueprintStatus(blueprint.executionLog, blueprint.status)
+      )
       setBackendExecutionLogs([])
       if (blueprint.backendAgentId && blueprint.backendBlueprintId) {
         const requestId = previewRunIdRef.current
@@ -2833,6 +2839,9 @@ export function AgentWorkspace({
         blueprintTitle={blueprintTitle}
         knowledgeScope={knowledgeScope}
         backendExecutionLogs={backendExecutionLogs}
+        replyRecords={replyRecords}
+        replyRecordsOpen={replyRecordsOpen}
+        replyRecordsLoading={replyRecordsLoading}
         canRedo={canRedoBlueprint}
         canUndo={canUndoBlueprint}
         currentBlueprintStatus={currentBlueprintStatus}
@@ -2863,6 +2872,8 @@ export function AgentWorkspace({
         onRedo={handleRedoBlueprint}
         onReset={handleReset}
         onRunPreview={handleRunPreview}
+        onRefreshReplyRecords={() => void refreshReplyRecords()}
+        onReplyRecordsOpenChange={setReplyRecordsOpen}
         onStopPreview={handleStopPreview}
         onSaveBlueprint={handleSaveBlueprint}
         onKnowledgeScopeChange={setKnowledgeScope}
@@ -2901,6 +2912,9 @@ type BlueprintWorkspaceProps = {
   blueprintTitle: string
   knowledgeScope: KnowledgeScopeValue
   backendExecutionLogs: AgentExecutionLog[]
+  replyRecords: AgentXianyuReplyRecord[]
+  replyRecordsOpen: boolean
+  replyRecordsLoading: boolean
   canRedo: boolean
   canUndo: boolean
   currentBlueprintStatus: AgentBlueprintStatus
@@ -2934,6 +2948,8 @@ type BlueprintWorkspaceProps = {
   onRedo: () => void
   onReset: () => void
   onRunPreview: (mode?: AgentPreviewRunMode) => void
+  onRefreshReplyRecords: () => void
+  onReplyRecordsOpenChange: (open: boolean) => void
   onStopPreview: () => void
   onUndo: () => void
 }
@@ -2956,6 +2972,9 @@ function BlueprintWorkspace({
   blueprintTitle,
   knowledgeScope,
   backendExecutionLogs,
+  replyRecords,
+  replyRecordsOpen,
+  replyRecordsLoading,
   canRedo,
   canUndo,
   currentBlueprintStatus,
@@ -2986,6 +3005,8 @@ function BlueprintWorkspace({
   onRedo,
   onReset,
   onRunPreview,
+  onRefreshReplyRecords,
+  onReplyRecordsOpenChange,
   onStopPreview,
   onUndo,
 }: BlueprintWorkspaceProps) {
@@ -3238,6 +3259,7 @@ function BlueprintWorkspace({
           <div className='pointer-events-auto'>
             <ExecutionPreviewDock
               backendExecutionLogs={backendExecutionLogs}
+              blueprintStatus={currentBlueprintStatus}
               executionLog={executionLog}
               executionNodes={executionNodes}
               isOpen={isPreviewOpen}
@@ -3269,8 +3291,8 @@ function BlueprintWorkspace({
               loading={replyRecordsLoading}
               open={replyRecordsOpen}
               records={replyRecords}
-              onOpenChange={setReplyRecordsOpen}
-              onRefresh={() => void refreshReplyRecords()}
+              onOpenChange={onReplyRecordsOpenChange}
+              onRefresh={onRefreshReplyRecords}
             />
           )}
         </aside>
@@ -4753,13 +4775,26 @@ function buildExecutionPreviewSummary(
   executionNodes: AgentFlowNode[],
   executionLog: AgentExecutionLogMap,
   latestBackendLog: AgentExecutionLog | undefined,
-  now: number
+  now: number,
+  blueprintStatus?: AgentBlueprintStatus
 ): ExecutionPreviewSummary {
   const loggedNodeIds = new Set(Object.keys(executionLog))
   const loggedNodes = executionNodes.filter((node) =>
     loggedNodeIds.has(node.id)
   )
-  const progressNodes = loggedNodes.length > 0 ? loggedNodes : executionNodes
+  const hasUnreconciledPersistedStatus =
+    !latestBackendLog &&
+    (blueprintStatus === 'failed' || blueprintStatus === 'paused')
+  const progressNodes =
+    loggedNodes.length > 0
+      ? loggedNodes
+      : hasUnreconciledPersistedStatus
+        ? []
+        : executionNodes
+  const backendStatus = latestBackendLog?.status
+  const backendGraph = latestBackendLog
+    ? parseBackendGraphOutput(latestBackendLog.output)
+    : null
   const nodeStatuses = progressNodes.map(
     (node) =>
       executionLog[node.id]?.status ?? statusToLogStatus(node.data.status)
@@ -4772,14 +4807,17 @@ function buildExecutionPreviewSummary(
   const hasLocalRunningNode = nodeStatuses.includes('running')
   const hasLocalStoppedNode = nodeStatuses.includes('stopped')
   const hasLocalFailedNode = nodeStatuses.includes('failed')
-  const backendStatus = latestBackendLog?.status
   const hasBackendRunningLog =
     backendStatus === 'running' || backendStatus === 'pending'
+  const hasPersistedTerminalFailure =
+    !latestBackendLog && blueprintStatus === 'failed'
+  const hasPersistedPausedStatus =
+    !latestBackendLog && blueprintStatus === 'paused'
 
   let status: ExecutionPreviewSummaryStatus = 'idle'
-  if (backendStatus === 'failed') {
+  if (backendStatus === 'failed' || hasPersistedTerminalFailure) {
     status = 'failed'
-  } else if (backendStatus === 'paused') {
+  } else if (backendStatus === 'paused' || hasPersistedPausedStatus) {
     status = 'paused'
   } else if (backendStatus === 'completed') {
     status = 'completed'
@@ -4794,13 +4832,20 @@ function buildExecutionPreviewSummary(
   }
 
   const hasNodeProgress =
-    loggedNodes.length > 0 ||
+    progressNodes.length > 0 ||
     nodeStatuses.some((nodeStatus) => nodeStatus !== 'pending')
-  const hasExecution = Boolean(latestBackendLog) || hasNodeProgress
+  const hasExecution =
+    Boolean(latestBackendLog) ||
+    hasNodeProgress ||
+    hasPersistedTerminalFailure ||
+    hasPersistedPausedStatus
   const totalNodes = progressNodes.length
-  const completedNodeCount = nodeStatuses.filter(
-    (nodeStatus) => nodeStatus === 'completed'
-  ).length
+  const completedNodeCount = backendGraph?.nodes
+    ? backendGraph.nodes.filter((node) => node.status === 'completed').length
+    : latestBackendLog?.status === 'failed' ||
+        latestBackendLog?.status === 'paused'
+      ? 0
+      : nodeStatuses.filter((nodeStatus) => nodeStatus === 'completed').length
   const completedNodes =
     hasNodeProgress && status === 'completed' && backendStatus === 'completed'
       ? totalNodes
@@ -5486,7 +5531,7 @@ function buildNodeModelOutput(
     return '页面监听中。收到新的买家消息后，将检索当前知识库并直接自动发送回复。'
   }
   if (status === 'running' && node.data.kind === 'xianyu_review') {
-    return '正在读取闲鱼评价管理中的待卖家评价订单并逐条提交好评。'
+    return '正在读取闲鱼评价管理中的待卖家评价订单并逐页批量提交好评。'
   }
   if (status === 'running') {
     return '模型调用进行中，输出会在当前节点完成后写入这里。'
@@ -6428,6 +6473,7 @@ function CompactField({
 
 function ExecutionPreviewDock({
   backendExecutionLogs,
+  blueprintStatus,
   executionLog,
   executionNodes,
   skillChoices,
@@ -6438,6 +6484,7 @@ function ExecutionPreviewDock({
   onOpenChange,
 }: {
   backendExecutionLogs: AgentExecutionLog[]
+  blueprintStatus: AgentBlueprintStatus
   executionLog: AgentExecutionLogMap
   executionNodes: AgentFlowNode[]
   skillChoices: SkillChoice[]
@@ -6455,7 +6502,8 @@ function ExecutionPreviewDock({
     executionNodes,
     executionLog,
     latestBackendLog,
-    clockNow
+    clockNow,
+    blueprintStatus
   )
   const currentExecutionNode = executionSummary.currentNodeId
     ? executionNodes.find((node) => node.id === executionSummary.currentNodeId)
@@ -7425,7 +7473,7 @@ function SettingControl({
     return (
       <LabeledField label='评价内容'>
         <Input
-          value='沟通顺利，交易愉快'
+          value='沟通顺畅，交易愉快'
           readOnly
           className='bg-muted/40 h-8 rounded-[8px] text-sm'
         />
@@ -9317,6 +9365,24 @@ function isLocalBlueprintDraft(blueprint: SavedAgentBlueprint) {
   return blueprint.syncState === 'draft' || !blueprint.backendBlueprintId
 }
 
+function executionLogForBlueprintStatus(
+  executionLog: AgentExecutionLogMap | undefined,
+  status?: AgentBlueprintStatus
+): AgentExecutionLogMap {
+  const normalized = normalizeExecutionLog(executionLog)
+  if (status === 'failed') {
+    return Object.values(normalized).some((log) => log.status === 'failed')
+      ? normalized
+      : {}
+  }
+  if (status === 'paused') {
+    return Object.values(normalized).some((log) => log.status === 'stopped')
+      ? normalized
+      : {}
+  }
+  return normalized
+}
+
 function savedBlueprintFromBackend(
   backendBlueprint: Blueprint,
   agentId: string,
@@ -9346,7 +9412,7 @@ function savedBlueprintFromBackend(
     createdAt: backendBlueprint.created_time,
     updatedAt: backendBlueprint.updated_time,
     status,
-    executionLog: local?.executionLog ?? {},
+    executionLog: executionLogForBlueprintStatus(local?.executionLog, status),
     backendAgentId: agentId,
     backendBlueprintId: backendBlueprint.id,
     syncState: 'synced',
@@ -9634,10 +9700,13 @@ function getCurrentBlueprintStatus(
   nodes: AgentFlowNode[],
   savedStatus?: AgentBlueprintStatus
 ): AgentBlueprintStatus {
-  if (nodes.some((node) => node.data.status === 'failed')) return 'failed'
-  if (nodes.some((node) => node.data.status === 'running')) return 'running'
+  // A persisted terminal state is authoritative when the node snapshot is
+  // from an earlier run. Otherwise stale running/done nodes can mask a
+  // backend failure or pause in the header and execution preview.
   if (savedStatus === 'paused') return 'paused'
   if (savedStatus === 'failed') return 'failed'
+  if (nodes.some((node) => node.data.status === 'failed')) return 'failed'
+  if (nodes.some((node) => node.data.status === 'running')) return 'running'
   if (hasScheduleNode(nodes)) return 'running'
   return getBlueprintStatus(nodes)
 }
@@ -9824,7 +9893,7 @@ function normalizeNodeSettings(
     ]) {
       delete normalized[key]
     }
-    normalized['评价内容'] = '沟通顺利，交易愉快'
+    normalized['评价内容'] = '沟通顺畅，交易愉快'
     if (
       !normalized['网址'] ||
       !normalized['网址'].includes('site=COMMONPRO') ||

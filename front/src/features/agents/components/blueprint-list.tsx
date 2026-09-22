@@ -285,7 +285,12 @@ export function BlueprintList({
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [search, setSearch] = useState('')
 
-  const { data: blueprints = [], isLoading } = useQuery(
+  const {
+    data: blueprints = [],
+    isError,
+    isLoading,
+    refetch,
+  } = useQuery(
     blueprintsByAgentQueryOptions(agentId)
   )
 
@@ -356,6 +361,20 @@ export function BlueprintList({
               className='bg-muted/40 h-[72px] animate-pulse rounded-lg'
             />
           ))}
+        </div>
+      ) : isError ? (
+        <div className='border-destructive/30 bg-destructive/5 text-destructive flex flex-col items-center justify-center gap-2 rounded-lg border py-8 text-center text-sm'>
+          <AlertTriangle className='h-5 w-5' aria-hidden='true' />
+          <p>蓝图加载失败，服务端暂时无法返回该智能体的数据。</p>
+          <Button
+            size='sm'
+            variant='outline'
+            className='h-7 text-xs'
+            onClick={() => void refetch()}
+          >
+            <RefreshCw className='mr-1.5 h-3 w-3' aria-hidden='true' />
+            重试
+          </Button>
         </div>
       ) : filtered.length === 0 ? (
         <div className='text-muted-foreground flex flex-col items-center justify-center py-10 text-sm'>
