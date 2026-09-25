@@ -733,6 +733,7 @@ const SETTING_SELECT_OPTIONS: Record<string, string[]> = {
   单会话等待: ['1s', '2s', '3s'],
   评价等级: ['好评'],
   消息轮询间隔: ['2s', '3s', '5s', '10s', '15s'],
+  消息合并等待: ['5s', '10s', '15s', '30s'],
   监听范围: ['仅未读消息'],
   每轮最大会话数: ['10', '20', '30', '50'],
   单次未清楚补答: ['最多1次'],
@@ -904,6 +905,7 @@ const NODE_META: Record<
       登录等待: '180s',
       列表等待: '8s',
       消息轮询间隔: '2s',
+      消息合并等待: '10s',
       监听范围: '仅未读消息',
       每轮最大会话数: '20',
       单次未清楚补答: '最多1次',
@@ -6603,7 +6605,7 @@ function ExecutionPreviewDock({
       </button>
 
       {isOpen && (
-        <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-hidden border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
+        <div className='border-border/70 grid max-h-72 min-h-0 gap-2 overflow-x-hidden overflow-y-auto border-t p-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(20rem,0.9fr)]'>
           {!readiness.ready && (
             <div className='min-w-0 rounded-[8px] border border-amber-500/35 bg-amber-500/5 px-3 py-2 xl:col-span-2'>
               <div className='flex items-center gap-1.5 text-[11px] font-semibold text-amber-700 dark:text-amber-300'>
@@ -9875,6 +9877,10 @@ function normalizeNodeSettings(
   defaults: Record<string, string>
 ) {
   const normalized = { ...defaults, ...(settings ?? {}) }
+
+  if (kind === 'xianyu_reply') {
+    normalized['监听范围'] = '仅未读消息'
+  }
 
   if (kind === 'xianyu_review') {
     // Existing blueprints may still carry settings from the old chat-list

@@ -19,6 +19,13 @@ import (
 
 const agentXianyuReplyRecordDir = "agent-xianyu-reply-records"
 
+const (
+	maxAgentXianyuReplyAuditPreviewRunes = 300
+	maxAgentXianyuReplyAuditMessageRunes = 500
+	maxAgentXianyuReplyAuditQueryRunes   = 1200
+	maxAgentXianyuReplyAuditDraftRunes   = 2000
+)
+
 var agentXianyuReplyRecordMu sync.Mutex
 
 // AgentXianyuReplyRecord is the operator-facing audit record for one incoming
@@ -67,6 +74,38 @@ func newAgentXianyuReplyRecordID(record AgentXianyuReplyRecord) string {
 	return "reply-" + hex.EncodeToString(sum[:12])
 }
 
+func sanitizeAgentXianyuReplyRecord(record AgentXianyuReplyRecord) AgentXianyuReplyRecord {
+	if strings.TrimSpace(record.ConversationKey) != "" {
+		record.ConversationKey = agentXianyuConversationIdentity(record.ConversationKey)
+	}
+	record.ConversationTitle = truncateRunes(redactAgentXianyuText(record.ConversationTitle), maxAgentXianyuReplyAuditPreviewRunes)
+	record.ConversationPreview = truncateRunes(redactAgentXianyuText(record.ConversationPreview), maxAgentXianyuReplyAuditPreviewRunes)
+	record.IncomingMessage = truncateRunes(redactAgentXianyuText(record.IncomingMessage), maxAgentXianyuReplyAuditMessageRunes)
+	record.RecentMessages = sanitizeAgentXianyuReplyMessages(record.RecentMessages)
+	record.Product = redactAgentXianyuProductContext(record.Product)
+	record.KnowledgeQuery = truncateRunes(redactAgentXianyuText(record.KnowledgeQuery), maxAgentXianyuReplyAuditQueryRunes)
+	record.ModelDraft = truncateRunes(redactAgentXianyuText(record.ModelDraft), maxAgentXianyuReplyAuditDraftRunes)
+	record.FinalReply = truncateRunes(redactAgentXianyuText(record.FinalReply), maxAgentXianyuReplyAuditDraftRunes)
+	record.FollowUpReply = truncateRunes(redactAgentXianyuText(record.FollowUpReply), maxAgentXianyuReplyAuditDraftRunes)
+	record.Error = truncateRunes(redactAgentXianyuText(record.Error), maxAgentXianyuReplyAuditMessageRunes)
+	return record
+}
+
+func sanitizeAgentXianyuReplyMessages(messages []agentXianyuReplyMessage) []agentXianyuReplyMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	safe := make([]agentXianyuReplyMessage, 0, len(messages))
+	for _, message := range messages {
+		message.Text = truncateRunes(redactAgentXianyuText(message.Text), maxAgentXianyuReplyAuditMessageRunes)
+		message.Direction = firstNonEmpty(strings.TrimSpace(message.Direction), "unknown")
+		if message.Text != "" {
+			safe = append(safe, message)
+		}
+	}
+	return safe
+}
+
 // AppendAgentXianyuReplyRecord appends one compact audit record atomically.
 // JSONL keeps writes cheap for the long-running page listener and avoids
 // adding another database table to the browser automation path.
@@ -90,6 +129,7 @@ func (s *Store) AppendAgentXianyuReplyRecord(ctx context.Context, record AgentXi
 	if record.DurationMs <= 0 && record.CompletedAt >= record.StartedAt {
 		record.DurationMs = record.CompletedAt - record.StartedAt
 	}
+	record = sanitizeAgentXianyuReplyRecord(record)
 	if strings.TrimSpace(record.ID) == "" {
 		record.ID = newAgentXianyuReplyRecordID(record)
 	}

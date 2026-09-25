@@ -111,11 +111,51 @@ type agentXianyuCandidatePayload struct {
 }
 
 type agentXianyuTranscriptPayload struct {
-	URL            string `json:"url"`
-	Title          string `json:"title"`
-	Text           string `json:"text"`
-	MessageCount   int    `json:"message_count"`
-	ContainerFound bool   `json:"container_found"`
+	URL            string                         `json:"url"`
+	Title          string                         `json:"title"`
+	Text           string                         `json:"text"`
+	Messages       []agentXianyuTranscriptMessage `json:"messages,omitempty"`
+	MessageCount   int                            `json:"message_count"`
+	ContainerFound bool                           `json:"container_found"`
+}
+
+type agentXianyuTranscriptMessage struct {
+	Key       string `json:"key,omitempty"`
+	Text      string `json:"text"`
+	Direction string `json:"direction"`
+}
+
+func normalizeAgentXianyuMessageDirection(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "seller", "merchant", "shop", "self", "outgoing", "sent", "客服", "卖家", "商家", "我方":
+		return "seller"
+	case "customer", "buyer", "incoming", "received", "买家", "用户", "对方":
+		return "customer"
+	default:
+		return "unknown"
+	}
+}
+
+func formatAgentXianyuTranscriptPayload(payload agentXianyuTranscriptPayload) string {
+	if len(payload.Messages) == 0 {
+		return strings.TrimSpace(payload.Text)
+	}
+	lines := make([]string, 0, len(payload.Messages))
+	for _, message := range payload.Messages {
+		text := strings.TrimSpace(message.Text)
+		if text == "" {
+			continue
+		}
+		label := "未知发言者"
+		switch normalizeAgentXianyuMessageDirection(message.Direction) {
+		case "seller":
+			label = "卖家"
+		case "customer":
+			label = "买家"
+		}
+		lines = append(lines, label+"："+text)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 type agentXianyuScrollPayload struct {
@@ -1213,7 +1253,7 @@ func readAgentXianyuConversationHistory(ctx context.Context, conn *websocket.Con
 		if strings.TrimSpace(payload.URL) != "" {
 			conversationURL = strings.TrimSpace(payload.URL)
 		}
-		text := strings.TrimSpace(payload.Text)
+		text := formatAgentXianyuTranscriptPayload(payload)
 		if !payload.ContainerFound || text == "" {
 			return "", conversationURL, errors.New("闲鱼客服消息区域未找到有效内容")
 		}
@@ -1263,8 +1303,9 @@ func readAgentXianyuConversationHistory(ctx context.Context, conn *websocket.Con
 	if strings.TrimSpace(latest.URL) != "" {
 		conversationURL = strings.TrimSpace(latest.URL)
 	}
-	if latest.ContainerFound && strings.TrimSpace(latest.Text) != "" {
-		snapshots = append(snapshots, strings.TrimSpace(latest.Text))
+	latestText := formatAgentXianyuTranscriptPayload(latest)
+	if latest.ContainerFound && latestText != "" {
+		snapshots = append(snapshots, latestText)
 	}
 	text := mergeAgentXianyuTranscriptSnapshots(snapshots)
 	if text == "" {
@@ -1314,11 +1355,38 @@ func buildAgentXianyuCandidatesExpressionWithUnread(selector string, limit int, 
  const unreadOnly = %t;
  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
  const linesOf = value => String(value || '').replace(/\r/g, '').split(/\n/).map(line => line.replace(/[ \t]+/g, ' ').trim()).filter(Boolean);
-	const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 80 && r.height > 24 && r.width < innerWidth * .82 && (custom || r.right < innerWidth * .45) && r.left < innerWidth * .72 && r.bottom > 0 && r.top < innerHeight && s.display !== 'none' && s.visibility !== 'hidden'; };
- const selectors = custom ? [custom] : ['[data-conversation-id]','[data-session-id]','[data-testid*="conversation"]','[class*="conversation-item"]','[class*="session-item"]','[class*="chat-item"]','[class*="contact-item"]','[role="listitem"]','[role="option"]'];
+	const visible = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 80 && r.height > 24 && r.width < innerWidth * .82 && (custom || r.right < innerWidth * .55) && r.left < innerWidth * .78 && r.bottom > 0 && r.top < innerHeight && s.display !== 'none' && s.visibility !== 'hidden'; };
+	const scope = custom ? (() => { try { return document.querySelector(custom) || document; } catch (_) { return document; } })() : document;
+	// The configured selector names the conversation-list container. Keep row
+	// discovery inside that container; also include the container itself so a
+	// site-specific selector that points directly at a row remains compatible.
+	const selectors = ['[data-conversation-id]','[data-session-id]','[data-testid*="conversation"]','[class*="conversation-item"]','[class*="session-item"]','[class*="chat-item"]','[class*="contact-item"]','[class*="list-item"]','[class*="listItem"]','[class*="message-item"]','[class*="item-row"]','[class*="itemRow"]','[role="listitem"]','[role="option"]'];
 	let nodes = [];
-	for (const query of selectors) { try { nodes.push(...document.querySelectorAll(query)); } catch (_) {} }
-	if (nodes.length < 2 && !custom) nodes = [...document.querySelectorAll('li,button,[role="listitem"],[role="option"]')];
+	for (const query of selectors) { try { nodes.push(...scope.querySelectorAll(query)); } catch (_) {} }
+	try { nodes.push(...scope.querySelectorAll('li,button,[role="listitem"],[role="option"],[data-id],[class*="item"],[class*="Item"]')); } catch (_) {}
+	if (custom && scope !== document) nodes.push(scope);
+	const badgeNodes = [...scope.querySelectorAll('span,div,i,b,em,label,strong,small,mark,[class*="badge"],[class*="Badge"],[class*="count"],[class*="Count"],[class*="dot"],[class*="Dot"],[class*="unread"],[class*="Unread"]')];
+	 const isUnreadBadge = item => {
+		 const rect=item.getBoundingClientRect(),value=clean(item.textContent);
+		 for(const pseudo of ['', '::before', '::after']){
+		  const style=getComputedStyle(item,pseudo),content=String(style.content||'').replace(/[\"']/g,'').trim();
+		  const width=pseudo?(parseFloat(style.width)||0):rect.width,height=pseudo?(parseFloat(style.height)||0):rect.height;
+		  if(width<3||height<3||width>34||height>34)continue;
+		  if(value!==''&&!/^\d{1,2}$/.test(value)&&(!pseudo||!/^\d{1,2}$/.test(content)))continue;
+			if(pseudo&&(content==='none'||content==='normal'))continue;
+		  const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
+		  for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<150&&b<150)return true;}
+		 }
+		 return false;
+	 };
+	for(const badge of badgeNodes){
+	 if(!isUnreadBadge(badge))continue;
+	 let row=badge;
+		 for(let depth=0;row&&depth<12;depth++,row=row.parentElement){
+	  const rect=row.getBoundingClientRect(),text=clean(row.innerText||row.textContent),lines=linesOf(row.innerText||row.textContent);
+	  if(rect.width>80&&rect.height>24&&rect.width<innerWidth*.82&&rect.right<innerWidth*.55&&rect.left<innerWidth*.78&&text.length>=2&&text.length<=360&&lines.length>=1){nodes.push(row);break;}
+	 }
+	}
 	nodes = [...new Set(nodes)].sort((a,b) => { const position = a.compareDocumentPosition(b); return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : position & Node.DOCUMENT_POSITION_PRECEDING ? 1 : 0; });
 	const seen = new Set(); const items = [];
 	nodes.forEach((el, index) => {
@@ -1333,13 +1401,14 @@ func buildAgentXianyuCandidatesExpressionWithUnread(selector string, limit int, 
 	   const value = clean(item.getAttribute('data-unread-count') || item.getAttribute('data-unread') || item.textContent);
 	   return value !== '0' && value !== 'false';
 	 });
-	 const unreadVisual = [...el.querySelectorAll('span,div,i,b')].some(item => {
-	   const rect=item.getBoundingClientRect(),style=getComputedStyle(item),value=clean(item.textContent);
-	   if(rect.width<3||rect.height<3||rect.width>34||rect.height>34||(!/^\d{1,2}$/.test(value)&&value!==''))return false;
+	 const badgeIsRed = (item,pseudo='') => {
+	   const rect=item.getBoundingClientRect(),style=getComputedStyle(item,pseudo),value=clean(item.textContent),content=String(style.content||'').replace(/[\"']/g,'').trim();
+	   if(rect.width<3||rect.height<3||rect.width>34||rect.height>34||(!/^\d{1,2}$/.test(value)&&value!==''&&!/^\d{1,2}$/.test(content)&&content!==''&&content!=='none'&&content!=='normal'))return false;
 	   const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
-	   for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<130&&b<130)return true;}
+	   for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<150&&b<150)return true;}
 	   return false;
-	 });
+	 };
+	 const unreadVisual = badgeNodes.some(item => (item===el||el.contains(item))&&isUnreadBadge(item));
 	 const unread = unreadClass || unreadChild || unreadVisual || /(^|\D)[1-9]\d*\s*(条)?新消息/.test(unreadValue);
    // Preview text changes when a new message arrives; never use it as the
    // conversation identity when the page does not expose a stable id.
@@ -1362,9 +1431,9 @@ func buildAgentXianyuClickExpression(selector string, candidate agentXianyuConve
  const key = %s, title = %s, preview = %s, custom = %s;
  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
 	const linesOf = value => String(value || '').replace(/\r/g, '').split(/\n/).map(line => line.replace(/[ \t]+/g, ' ').trim()).filter(Boolean);
-	const visible = item => { const box = item.getBoundingClientRect(); const style = getComputedStyle(item); return box.width > 80 && box.height > 24 && box.width < innerWidth * .82 && (custom || box.right < innerWidth * .45) && box.left < innerWidth * .72 && box.bottom > 0 && box.top < innerHeight && style.display !== 'none' && style.visibility !== 'hidden'; };
+	 const visible = item => { const box = item.getBoundingClientRect(); const style = getComputedStyle(item); return box.width > 80 && box.height > 24 && box.width < innerWidth * .82 && (custom || box.right < innerWidth * .55) && box.left < innerWidth * .78 && box.bottom > 0 && box.top < innerHeight && style.display !== 'none' && style.visibility !== 'hidden'; };
  let el = [...document.querySelectorAll('[data-sunapi-xianyu-key]')].find(item => visible(item) && clean(item.getAttribute('data-sunapi-xianyu-key')) === key);
-	if (!el) { const selectors = custom ? [custom] : ['[data-conversation-id]','[data-session-id]','[data-testid*="conversation"]','[class*="conversation-item"]','[class*="session-item"]','[class*="chat-item"]','[class*="contact-item"]','[role="listitem"]','[role="option"]']; let nodes=[]; for (const query of selectors) { try { nodes.push(...document.querySelectorAll(query)); } catch (_) {} } if (nodes.length < 2 && !custom) nodes = [...document.querySelectorAll('li,button,[role="listitem"],[role="option"]')]; nodes = [...new Set(nodes)].filter(visible); const matches = item => { const lines = linesOf(item.innerText || item.textContent); const itemTitle = lines[0] || ''; const text = lines.join(' '); return itemTitle === title && (!preview || text.includes(preview.slice(0, 80))); }; el = nodes.find(matches) || nodes.find(item => linesOf(item.innerText || item.textContent).join(' ').includes(title)); }
+	 if (!el) { let scope = document; if (custom) { try { scope = document.querySelector(custom) || document; } catch (_) {} } const selectors = ['[data-conversation-id]','[data-session-id]','[data-testid*="conversation"]','[class*="conversation-item"]','[class*="session-item"]','[class*="chat-item"]','[class*="contact-item"]','[class*="list-item"]','[class*="listItem"]','[class*="message-item"]','[class*="item-row"]','[class*="itemRow"]','[role="listitem"]','[role="option"]']; let nodes=[]; for (const query of selectors) { try { nodes.push(...scope.querySelectorAll(query)); } catch (_) {} } try { nodes.push(...scope.querySelectorAll('li,button,[role="listitem"],[role="option"],[data-id],[class*="item"],[class*="Item"]')); } catch (_) {} if (custom && scope !== document) nodes.push(scope); nodes = [...new Set(nodes)].filter(visible); const matches = item => { const lines = linesOf(item.innerText || item.textContent); const itemTitle = lines[0] || ''; const text = lines.join(' '); return itemTitle === title && (!preview || text.includes(preview.slice(0, 80))); }; el = nodes.find(matches) || nodes.find(item => linesOf(item.innerText || item.textContent).join(' ').includes(title)); }
  if (!el) return JSON.stringify(false);
  el.scrollIntoView({block:'center',inline:'nearest'});
  const clickable = el.matches('button,a,[role="button"]') ? el : el.querySelector('button,a,[role="button"]') || el;
@@ -1404,9 +1473,26 @@ func buildAgentXianyuTranscriptExpression(selector string) string {
  let rowNodes = []; for (const query of rowQueries) { try { rowNodes.push(...best.querySelectorAll(query)); } catch (_) {} }
  const rawRows = [...new Set(rowNodes)].filter(visibleRow);
  const rows = rawRows.filter(node => !rawRows.some(child => child !== node && node.contains(child)));
- const messages = rows.map(textOnly).filter(Boolean);
- const text = messages.length > 0 ? clean(messages.join('\n')) : textOnly(best);
- return JSON.stringify({url: location.href || '', title: document.title || '', text, message_count: messages.length, container_found: true});
+ const directionOf = row => {
+  const parts = [];
+  let current = row;
+  for (let depth = 0; current && depth < 3; depth++, current = current.parentElement) {
+   for (const name of ['data-direction','data-sender','data-role','data-message-direction','aria-label','class']) {
+    const value = current.getAttribute && current.getAttribute(name); if (value) parts.push(String(value).toLowerCase());
+   }
+  }
+  const value = parts.join(' ');
+  if (/(seller|merchant|shop|客服|卖家|商家|self|mine|outgoing|sent|from[-_ ]?me)/i.test(value)) return 'seller';
+  if (/(buyer|customer|买家|用户|incoming|received|from[-_ ]?other)/i.test(value)) return 'customer';
+  return 'unknown';
+ };
+ const messages = rows.map((row,index) => {
+  const text = textOnly(row); if (!text) return null;
+  const key = row.getAttribute('data-message-id') || row.getAttribute('data-msg-id') || String(index);
+  return {key, text, direction: directionOf(row)};
+ }).filter(Boolean);
+ const text = messages.length > 0 ? clean(messages.map(item => item.text).join('\n')) : textOnly(best);
+ return JSON.stringify({url: location.href || '', title: document.title || '', text, messages, message_count: messages.length, container_found: true});
 })()`, selectorJSON)
 }
 

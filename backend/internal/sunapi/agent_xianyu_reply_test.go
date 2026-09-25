@@ -21,7 +21,7 @@ func TestXianyuReplyComponentDefaultsToRealtimeDirectSend(t *testing.T) {
 		if err := json.Unmarshal(component.Config, &config); err != nil {
 			t.Fatal(err)
 		}
-		if config.Settings["消息轮询间隔"] != "2s" || config.Settings["监听范围"] != "仅未读消息" || config.Settings["单次未清楚补答"] != "最多1次" || config.Settings["发送方式"] != "检测到买家消息立即自动发送" || config.Settings["默认回复"] != "开启" || config.Settings["无知识库命中"] != "安全澄清回复" || config.Settings["节点超时"] != "不限制" {
+		if config.Settings["消息轮询间隔"] != "2s" || config.Settings["消息合并等待"] != "10s" || config.Settings["监听范围"] != "未读列表 + 当前已打开会话" || config.Settings["单次未清楚补答"] != "最多1次" || config.Settings["发送方式"] != "检测到买家消息静默后自动发送" || config.Settings["默认回复"] != "开启" || config.Settings["无知识库命中"] != "安全澄清回复" || config.Settings["节点超时"] != "不限制" {
 			t.Fatalf("unexpected realtime defaults: %#v", config.Settings)
 		}
 		return
@@ -55,13 +55,21 @@ func TestXianyuReplyExpressionsStayMessageScoped(t *testing.T) {
 		}
 	}
 	unreadCandidates := buildAgentXianyuCandidatesExpressionWithUnread(".conversation-list", 20, true)
-	if !strings.Contains(unreadCandidates, "const unreadOnly = true") || !strings.Contains(unreadCandidates, "if (unreadOnly && !unread) return") {
-		t.Fatalf("candidate expression must filter non-unread rows: %s", unreadCandidates)
+	for _, required := range []string{"const unreadOnly = true", "if (unreadOnly && !unread) return", "const scope = custom", "const selectors = ['[data-conversation-id]'", "[class*=\"Item\"]", "isUnreadBadge", "::after"} {
+		if !strings.Contains(unreadCandidates, required) {
+			t.Fatalf("candidate expression is missing unread robustness marker %q: %s", required, unreadCandidates)
+		}
 	}
 	latest := buildAgentXianyuReplyLatestMessageExpression(".message-list")
-	for _, required := range []string{"data-message-id", "direction", "messages.slice(-12)", "container_found"} {
+	for _, required := range []string{"data-message-id", "direction", "messages.slice(-50)", "container_found"} {
 		if !strings.Contains(latest, required) {
 			t.Fatalf("latest-message expression is missing %q", required)
+		}
+	}
+	current := buildAgentXianyuCurrentConversationExpression(".conversation-list")
+	for _, required := range []string{"activeSignal", "aria-current", "aria-selected", "data-conversation-id", "JSON.stringify({key:"} {
+		if !strings.Contains(current, required) {
+			t.Fatalf("current-conversation expression is missing %q", required)
 		}
 	}
 	product := buildAgentXianyuProductContextExpression(".current-product")
@@ -75,6 +83,67 @@ func TestXianyuReplyExpressionsStayMessageScoped(t *testing.T) {
 		if !strings.Contains(send, required) {
 			t.Fatalf("send expression is missing %q", required)
 		}
+	}
+}
+
+func TestAgentXianyuReplyUsesAllUnansweredBuyerMessages(t *testing.T) {
+	messages := []agentXianyuReplyMessage{
+		{Key: "1", Text: "之前的问题", Direction: "customer"},
+		{Key: "2", Text: "卖家已回复", Direction: "self"},
+		{Key: "3", Text: "现在多少钱", Direction: "customer"},
+		{Key: "4", Text: "还在吗", Direction: "customer"},
+	}
+	got := agentXianyuReplyUnansweredCustomerMessages(messages, false)
+	if len(got) != 2 || got[0].Text != "现在多少钱" || got[1].Text != "还在吗" {
+		t.Fatalf("unexpected pending buyer batch: %#v", got)
+	}
+	if got := agentXianyuReplyUnansweredCustomerMessages(messages[:2], false); len(got) != 0 {
+		t.Fatalf("seller reply should close the previous buyer batch: %#v", got)
+	}
+}
+
+func TestAgentXianyuReplyBatchHashChangesWhenBuyerAddsMessage(t *testing.T) {
+	one := []agentXianyuReplyMessage{{Key: "1", Text: "多少钱", Direction: "customer"}}
+	two := append(one, agentXianyuReplyMessage{Key: "2", Text: "还在吗", Direction: "customer"})
+	if agentXianyuReplyBatchHash("conversation", one) == agentXianyuReplyBatchHash("conversation", two) {
+		t.Fatal("buyer message batch hash must change when a new message arrives")
+	}
+}
+
+func TestAgentXianyuReplyDetectsHumanSellerMessage(t *testing.T) {
+	baseline := agentXianyuReplyMessagePayload{Messages: []agentXianyuReplyMessage{
+		{Key: "buyer-1", Text: "还有吗", Direction: "customer"},
+	}}
+	if agentXianyuReplyHumanMessageAppeared(baseline, baseline) {
+		t.Fatal("unchanged conversation must not look like a human takeover")
+	}
+	human := agentXianyuReplyMessagePayload{Messages: append(append([]agentXianyuReplyMessage{}, baseline.Messages...), agentXianyuReplyMessage{
+		Key: "seller-1", Text: "在的，可以拍", Direction: "self",
+	})}
+	if !agentXianyuReplyHumanMessageAppeared(baseline, human) {
+		t.Fatal("new seller message must interrupt the auto reply")
+	}
+	buyerFollowUp := agentXianyuReplyMessagePayload{Messages: append(append([]agentXianyuReplyMessage{}, baseline.Messages...), agentXianyuReplyMessage{
+		Key: "buyer-2", Text: "那我拍了", Direction: "customer",
+	})}
+	if agentXianyuReplyHumanMessageAppeared(baseline, buyerFollowUp) {
+		t.Fatal("a buyer follow-up alone must not be classified as a human takeover")
+	}
+}
+
+func TestAgentXianyuReplyProcessesNewOrChangedConversationPreview(t *testing.T) {
+	baseline := agentXianyuReplyConversationState{PreviewHash: "same", Status: "baseline"}
+	if shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, baseline, true, "same", true) {
+		t.Fatal("unchanged baseline conversation should not reopen just because it remains unread")
+	}
+	if !shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{}, baseline, true, "changed", true) {
+		t.Fatal("changed preview should process a follow-up even when the unread badge is gone")
+	}
+	if shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{}, agentXianyuReplyConversationState{}, false, "new", true) {
+		t.Fatal("new read conversation should not be opened during inbox scanning")
+	}
+	if !shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, agentXianyuReplyConversationState{}, false, "new", true) {
+		t.Fatal("new unread conversation should be processed")
 	}
 }
 
