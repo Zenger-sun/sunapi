@@ -195,7 +195,7 @@ func TestFindAgentBrowserTargetRequiresMatchingURLFamily(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	target, found, err := findAgentBrowserTarget(t.Context(), server.URL, "https://seller.goofish.com/data")
+	target, found, err := findAgentBrowserTarget(t.Context(), server.URL, "https://seller.goofish.com/home")
 	if err != nil {
 		t.Fatalf("findAgentBrowserTarget error = %v", err)
 	}
@@ -211,11 +211,11 @@ func TestAgentBrowserTargetURLMatchesSellerSiteVariants(t *testing.T) {
 	) {
 		t.Fatal("expected seller console site variants to reuse the current page")
 	}
-	if !agentBrowserTargetURLMatches(
+	if agentBrowserTargetURLMatches(
 		"https://seller.goofish.com/messages?site=COMMONPRO",
 		"https://seller.goofish.com/?site=COMM",
 	) {
-		t.Fatal("expected different seller console routes to reuse the current page")
+		t.Fatal("did not expect different seller console routes to reuse the current page")
 	}
 	if agentBrowserTargetURLMatches(
 		"https://seller.example.com/messages?site=COMMONPRO",

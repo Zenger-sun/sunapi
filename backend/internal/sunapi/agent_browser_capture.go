@@ -448,6 +448,11 @@ func findAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (ag
 		if target.Type != "page" || target.WebSocketDebuggerURL == "" {
 			continue
 		}
+		// Reply workers reserve their targets for the lifetime of the session.
+		// Generic capture/knowledge jobs must never navigate one of those pages.
+		if isAgentXianyuReplyTargetReserved(endpoint, target) {
+			continue
+		}
 		if agentBrowserTargetURLMatches(target.URL, targetURL) {
 			return target, true, nil
 		}
@@ -469,12 +474,24 @@ func agentBrowserTargetURLMatches(actualURL, expectedURL string) bool {
 	if !strings.EqualFold(actualParsed.Scheme, expectedParsed.Scheme) || !strings.EqualFold(actualParsed.Host, expectedParsed.Host) {
 		return false
 	}
-	// The seller console is a single-page application. Its pathname can change
-	// while the same authenticated workbench remains open, so route changes on
-	// seller.goofish.com must not create another visible tab.
+	// The seller console is a single-page application, but its pathname still
+	// identifies different tools (/im, product management, etc.). Treating all
+	// seller.goofish.com routes as interchangeable lets a knowledge or capture
+	// node navigate an active reply page and lose the conversation context.
 	sellerConsole := strings.EqualFold(actualParsed.Hostname(), "seller.goofish.com") &&
 		strings.EqualFold(expectedParsed.Hostname(), "seller.goofish.com")
-	if !sellerConsole && actualParsed.Path != expectedParsed.Path {
+	actualPath := strings.TrimRight(actualParsed.Path, "/")
+	expectedPath := strings.TrimRight(expectedParsed.Path, "/")
+	if actualPath == "" {
+		actualPath = "/"
+	}
+	if expectedPath == "" {
+		expectedPath = "/"
+	}
+	if !sellerConsole && actualPath != expectedPath {
+		return false
+	}
+	if sellerConsole && actualPath != expectedPath {
 		return false
 	}
 	if actualParsed.Query().Encode() == expectedParsed.Query().Encode() {

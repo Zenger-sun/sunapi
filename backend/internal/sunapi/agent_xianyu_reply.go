@@ -18,12 +18,14 @@ import (
 )
 
 const (
-	agentXianyuReplyStateDir       = "agent-xianyu-reply-state"
-	agentXianyuReplyPollInterval   = 2 * time.Second
-	agentXianyuReplyEventCheck     = 500 * time.Millisecond
-	agentXianyuReplyCDPHeartbeat   = 15 * time.Second
-	agentXianyuReplyRetryDelay     = 30 * time.Second
-	agentXianyuReplyReconnectDelay = 5 * time.Second
+	agentXianyuReplyStateDir              = "agent-xianyu-reply-state"
+	agentXianyuReplyPollInterval          = 2 * time.Second
+	agentXianyuReplyEventCheck            = 500 * time.Millisecond
+	agentXianyuReplyCDPHeartbeat          = 15 * time.Second
+	agentXianyuReplyRetryDelay            = 30 * time.Second
+	agentXianyuReplyUnverifiedMaxAttempts = 3
+	agentXianyuReplyUnverifiedRetryDelay  = 30 * time.Second
+	agentXianyuReplyReconnectDelay        = 5 * time.Second
 	// A realtime reply should not hold the buyer for a full minute. When the
 	// knowledge base has no match, the safe fallback is sent immediately below;
 	// matched requests get a bounded model window before falling back.
@@ -108,6 +110,21 @@ func releaseAgentXianyuReplyTarget(endpoint string, target agentBrowserTarget) {
 	agentXianyuReplyTargetReservations.Lock()
 	delete(agentXianyuReplyTargetReservations.ids, key)
 	agentXianyuReplyTargetReservations.Unlock()
+}
+
+// isAgentXianyuReplyTargetReserved lets generic browser nodes observe the
+// reply-session lease. Without this check a knowledge/capture node can select
+// the same seller page and navigate it while a reply worker is reading or
+// sending a message.
+func isAgentXianyuReplyTargetReserved(endpoint string, target agentBrowserTarget) bool {
+	key := agentXianyuReplyTargetReservationKey(endpoint, target)
+	if strings.HasSuffix(key, "\x00") {
+		return false
+	}
+	agentXianyuReplyTargetReservations.Lock()
+	_, reserved := agentXianyuReplyTargetReservations.ids[key]
+	agentXianyuReplyTargetReservations.Unlock()
+	return reserved
 }
 
 func openAgentXianyuReplyTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, bool, error) {
@@ -207,13 +224,15 @@ type agentXianyuReplySendPayload struct {
 }
 
 type agentXianyuReplyConversationState struct {
-	PreviewHash      string `json:"preview_hash,omitempty"`
-	LastIncomingHash string `json:"last_incoming_hash,omitempty"`
-	LastReplyHash    string `json:"last_reply_hash,omitempty"`
-	FollowUpUsed     bool   `json:"follow_up_used,omitempty"`
-	Status           string `json:"status,omitempty"`
-	RetryAfter       int64  `json:"retry_after,omitempty"`
-	UpdatedAt        int64  `json:"updated_at"`
+	PreviewHash        string `json:"preview_hash,omitempty"`
+	LastIncomingHash   string `json:"last_incoming_hash,omitempty"`
+	LastReplyHash      string `json:"last_reply_hash,omitempty"`
+	UnverifiedHash     string `json:"unverified_hash,omitempty"`
+	UnverifiedAttempts int    `json:"unverified_attempts,omitempty"`
+	FollowUpUsed       bool   `json:"follow_up_used,omitempty"`
+	Status             string `json:"status,omitempty"`
+	RetryAfter         int64  `json:"retry_after,omitempty"`
+	UpdatedAt          int64  `json:"updated_at"`
 }
 
 type agentXianyuReplyState struct {
@@ -379,6 +398,8 @@ func runAgentXianyuReplySession(
 	workerConns := make([]*websocket.Conn, 0, agentXianyuReplyWorkerCount)
 	workerCleanups := make([]func(), 0, agentXianyuReplyWorkerCount)
 	workerHeartbeatStops := make([]func(), 0, agentXianyuReplyWorkerCount)
+	// Kept as an empty compatibility channel for the listener select below.
+	// Worker failures are logged locally and must not tear down the listener.
 	workerHeartbeatErrors := make(chan error, 1)
 	closeWorkers := func() {
 		for i := range workerConns {
@@ -400,10 +421,10 @@ func runAgentXianyuReplySession(
 		workerConns = append(workerConns, workerConn)
 		workerCleanups = append(workerCleanups, cleanup)
 		workerHeartbeatStops = append(workerHeartbeatStops, startAgentXianyuCDPHeartbeat(ctx, workerConn, func(heartbeatErr error) {
-			select {
-			case workerHeartbeatErrors <- heartbeatErr:
-			default:
-			}
+			log.WithError(heartbeatErr).WithFields(log.Fields{
+				"blueprint_id": bp.ID,
+				"node_id":      node.ID,
+			}).Warn("agent xianyu reply worker heartbeat failed; keeping listener alive")
 		}))
 	}
 
@@ -483,7 +504,8 @@ func runAgentXianyuReplySession(
 			}
 		}
 	}
-	for _, workerConn := range workerConns {
+	for workerIndex, workerConn := range workerConns {
+		workerIndex := workerIndex
 		workerConn := workerConn
 		workers.Add(1)
 		go func() {
@@ -503,17 +525,19 @@ func runAgentXianyuReplySession(
 					// Idle workers are usually background tabs. Keep the renderer
 					// active and run the page watchdog without waiting for a job.
 					if err := activateAgentXianyuPage(workerCtx, workerConn, workerNextID()); err != nil {
-						select {
-						case workerHeartbeatErrors <- err:
-						default:
-						}
+						log.WithError(err).WithFields(log.Fields{
+							"blueprint_id": bp.ID,
+							"node_id":      node.ID,
+							"worker_index": workerIndex,
+						}).Warn("agent xianyu reply worker keepalive failed")
 						continue
 					}
 					if _, err := evaluateAgentXianyuJSON(workerCtx, workerConn, workerNextID(), buildAgentXianyuConnectionKeepaliveExpression(), agentXianyuReplyConnectionPayload{}); err != nil {
-						select {
-						case workerHeartbeatErrors <- err:
-						default:
-						}
+						log.WithError(err).WithFields(log.Fields{
+							"blueprint_id": bp.ID,
+							"node_id":      node.ID,
+							"worker_index": workerIndex,
+						}).Warn("agent xianyu reply worker connection check failed")
 					}
 				case job, ok := <-jobs:
 					if !ok {
@@ -544,11 +568,11 @@ func runAgentXianyuReplySession(
 					<-agentXianyuReplyGlobalSlots
 					schedulerMu.Lock()
 					delete(inFlight, identity)
-					if jobErr != nil && !errors.Is(jobErr, errAgentXianyuReplyBatchChanged) {
+					if jobErr != nil && !errors.Is(jobErr, errAgentXianyuReplyBatchChanged) && !errors.Is(jobErr, errAgentXianyuReplyInterruptedByHuman) {
 						retryUntil[identity] = time.Now().Add(agentXianyuReplyRetryDelay)
 					}
 					schedulerMu.Unlock()
-					if jobErr != nil && !errors.Is(jobErr, errAgentXianyuReplyBatchChanged) {
+					if jobErr != nil && !errors.Is(jobErr, errAgentXianyuReplyBatchChanged) && !errors.Is(jobErr, errAgentXianyuReplyInterruptedByHuman) {
 						log.WithError(jobErr).WithFields(log.Fields{
 							"blueprint_id":          bp.ID,
 							"node_id":               node.ID,
@@ -713,7 +737,7 @@ func runAgentXianyuReplySession(
 					stateChanged = true
 					continue
 				}
-				if entry.RetryAfter > time.Now().UnixMilli() {
+				if entry.RetryAfter > time.Now().UnixMilli() && !(entry.Status == "send_unverified_exhausted" && entry.PreviewHash != previewHash) {
 					continue
 				}
 				if !shouldProcessAgentXianyuCandidate(candidate, entry, exists, previewHash, defaultReplyEnabled) {
@@ -793,6 +817,19 @@ func processAgentXianyuReplyCandidate(
 		return saveErr
 	}
 	incomingHash := agentXianyuReplyBatchHash(candidate.Key, pendingMessages)
+	if entry.Status == "send_unverified_exhausted" && entry.UnverifiedHash == incomingHash {
+		// The browser accepted the send but never exposed a seller row after the
+		// bounded verification retries. Do not send the same answer forever; a
+		// genuinely changed buyer batch has a different hash and can proceed.
+		stateMu.Lock()
+		entry.PreviewHash = previewHash
+		entry.RetryAfter = time.Now().Add(24 * time.Hour).UnixMilli()
+		entry.UpdatedAt = time.Now().UnixMilli()
+		state.Conversations[identity] = entry
+		saveErr := saveAgentXianyuReplyState(statePath, *state)
+		stateMu.Unlock()
+		return saveErr
+	}
 	if entry.LastIncomingHash == incomingHash && !(defaultReplyEnabled && shouldResumeAgentXianyuReply(entry.Status)) {
 		stateMu.Lock()
 		entry.PreviewHash = previewHash
@@ -1017,6 +1054,19 @@ func processAgentXianyuReplyCandidate(
 		// so an outdated draft is never sent after human handling.
 		record.Status = "interrupted_by_human"
 		record.Error = "human seller reply appeared before automatic reply was sent"
+		stateMu.Lock()
+		entry.PreviewHash = previewHash
+		entry.LastIncomingHash = incomingHash
+		entry.Status = "interrupted_by_human"
+		entry.RetryAfter = 0
+		entry.UpdatedAt = time.Now().UnixMilli()
+		state.Conversations[identity] = entry
+		state.UpdatedAt = entry.UpdatedAt
+		saveErr := saveAgentXianyuReplyState(statePath, *state)
+		stateMu.Unlock()
+		if saveErr != nil {
+			return saveErr
+		}
 		return errAgentXianyuReplyInterruptedByHuman
 	}
 	if agentXianyuReplyBatchHash(candidate.Key, currentBatch) != incomingHash {
@@ -1054,6 +1104,12 @@ func processAgentXianyuReplyCandidate(
 	if waitAgentXianyuDuration(ctx, agentXianyuHistoryQuietPeriod) == nil {
 		confirmation, confirmErr = evaluateAgentXianyuJSON(ctx, conn, nextID(), buildAgentXianyuReplyLatestMessageExpression(messageSelector), agentXianyuReplyMessagePayload{})
 		verified = confirmErr == nil && normalizeAgentXianyuMessageDirection(confirmation.Latest.Direction) == "seller" && strings.TrimSpace(confirmation.Latest.Text) == strings.TrimSpace(reply)
+	}
+	if !verified {
+		record.Status = "send_unverified"
+		record.Error = firstNonEmpty(record.Error, "seller reply was not confirmed after send")
+		stats.add(&stats.SendErrors, 1)
+		return scheduleAgentXianyuReplyUnverifiedRetry(stateMu, statePath, state, identity, entry, previewHash, incomingHash)
 	}
 
 	// A knowledge-backed answer gets one bounded quality check after it is sent.
@@ -1120,6 +1176,8 @@ func processAgentXianyuReplyCandidate(
 	entry.PreviewHash = previewHash
 	entry.LastIncomingHash = handledIncomingHash
 	entry.LastReplyHash = agentXianyuReplyHash(reply)
+	entry.UnverifiedHash = ""
+	entry.UnverifiedAttempts = 0
 	if record.FollowUpAttempted {
 		entry.LastReplyHash = agentXianyuReplyHash(record.FollowUpReply)
 	}
@@ -1134,18 +1192,6 @@ func processAgentXianyuReplyCandidate(
 		if len(matches) == 0 {
 			record.Status = "sent_no_match_fallback"
 		}
-	}
-	if !verified {
-		entry.Status = "sent_unverified"
-		record.Status = "sent_unverified"
-		if usedFallback {
-			entry.Status = "sent_fallback_unverified"
-			record.Status = "sent_fallback_unverified"
-			if len(matches) == 0 {
-				record.Status = "sent_no_match_fallback_unverified"
-			}
-		}
-		stats.add(&stats.SendErrors, 1)
 	}
 	if record.FollowUpAttempted && verified {
 		entry.Status = "sent_with_follow_up"
@@ -1342,11 +1388,27 @@ func buildAgentXianyuConnectionKeepaliveExpression() string {
  const run = () => {
    const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
    const visible = el => { const r=el.getBoundingClientRect(),s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };
-   const body = clean(document.body && (document.body.innerText || document.body.textContent));
    const interruptionPattern = /(\u8fde\u63a5\u4e2d\u65ad|\u8fde\u63a5\u65ad\u5f00|\u8bf7\u91cd\u8fde|connection\s+lost|connection\s+interrupted|disconnected)/i;
    const dialogCandidates = [...document.querySelectorAll('[role="dialog"],[role="alert"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"]')].filter(visible);
-   const dialog = dialogCandidates.find(el => interruptionPattern.test(clean(el.innerText || el.textContent)));
-   const interrupted = Boolean(dialog) || interruptionPattern.test(body);
+   const buttons = [...document.querySelectorAll('button,[role="button"],a,[tabindex]')].filter(visible);
+   const reconnectPattern = /(\u91cd\u8fde|\u91cd\u65b0\u8fde\u63a5|retry|reconnect)/i;
+   const dialog = dialogCandidates.find(el => {
+     const text = clean(el.innerText || el.textContent);
+     if (!interruptionPattern.test(text)) return false;
+     return [...el.querySelectorAll('button,[role="button"],a,[tabindex]')].some(item => visible(item) && reconnectPattern.test(clean(item.innerText || item.textContent || item.getAttribute('aria-label')))) || el.getAttribute('role') === 'dialog' || el.getAttribute('role') === 'alert';
+   });
+   const reconnect = buttons.find(el => reconnectPattern.test(clean(el.innerText || el.textContent || el.getAttribute('aria-label'))));
+   let reconnectContext = false;
+   if (reconnect) {
+     let parent = reconnect;
+     for (let depth=0; parent && depth<6; depth++, parent=parent.parentElement) {
+       if (interruptionPattern.test(clean(parent.innerText || parent.textContent))) { reconnectContext = true; break; }
+     }
+   }
+   // Only a visible connection dialog, or a reconnect control inside a
+   // matching status container, proves the transport is interrupted. Never
+   // scan the full chat history: buyers can legitimately write these words.
+   const interrupted = Boolean(dialog || reconnectContext);
    if (!interrupted) {
      window.__sunapiXianyuReconnectAt = 0;
      window.__sunapiXianyuReconnectAttempts = 0;
@@ -1369,8 +1431,6 @@ func buildAgentXianyuConnectionKeepaliveExpression() string {
      try { window.location.reload(); } catch (_) {}
      return {interrupted:true,reconnected:false,reconnecting:true,reloaded:true};
    }
-   const buttons = [...document.querySelectorAll('button,[role="button"],a,[tabindex]')].filter(visible);
-   const reconnect = buttons.find(el => /(\u91cd\u8fde|\u91cd\u65b0\u8fde\u63a5|retry|reconnect)/i.test(clean(el.innerText || el.textContent || el.getAttribute('aria-label'))));
    if (reconnect) try {
      window.__sunapiXianyuReconnectAt = now;
      window.__sunapiXianyuReconnectAttempts = lastReconnect && now-lastReconnect < 30000 ? reconnectAttempts + 1 : 1;
@@ -1496,6 +1556,25 @@ func buildAgentXianyuCurrentConversationExpression(selector string) string {
    return /(^|[\\s_-])(active|selected|current|focused)([\\s_-]|$)/i.test(attrs) || /^(true|page|step|location)$/i.test(String(el.getAttribute && el.getAttribute('aria-current') || ''));
  };
  let active = rows.find(activeSignal);
+ // Some seller-console builds do not expose an active/selected attribute.
+ // Match the visible chat header back to a list row before giving up; this
+ // keeps the already-open conversation under monitoring without clicking a
+ // different row. Never fall back to the first row when no identity matches.
+ if (!active) {
+   const headerQueries = ['h1','h2','h3','[class*="chat-header"]','[class*="conversation-header"]','[class*="header-title"]','[data-testid*="header"]'];
+   let headers = [];
+   for (const query of headerQueries) { try { headers.push(...document.querySelectorAll(query)); } catch (_) {} }
+   const header = [...new Set(headers)].map(el => ({el, rect: el.getBoundingClientRect(), text: linesOf(el.innerText || el.textContent).join(' ')})).find(item => {
+     const r=item.rect; return item.text && r.width>80 && r.height>18 && r.left>innerWidth*.22 && r.left<innerWidth*.9 && r.top<innerHeight*.3 && r.bottom>0;
+   });
+   if (header) {
+     const headerText = clean(header.text).slice(0, 120);
+     active = rows.find(row => {
+       const rowText = clean(row.innerText || row.textContent);
+       return rowText && (rowText.includes(headerText) || headerText.includes(rowText.split(/\\s+/)[0] || '\\u0000'));
+     });
+   }
+ }
  if (!active) return JSON.stringify({});
  let row = active;
  for (let depth = 0; row && depth < 8 && !row.matches(rowSelector); depth++) row = row.parentElement;
@@ -1657,8 +1736,14 @@ func shouldProcessAgentXianyuCandidate(candidate agentXianyuConversationCandidat
 	if !defaultReplyEnabled {
 		return false
 	}
+	// An unread badge is only a candidate hint. Always let the worker read the
+	// actual conversation and compare its message-batch hash; preview text can
+	// remain unchanged while a new unread message was appended.
+	if candidate.Unread {
+		return true
+	}
 	if !exists {
-		return candidate.Unread
+		return false
 	}
 	if entry.PreviewHash != previewHash {
 		return true
@@ -1700,8 +1785,22 @@ func agentXianyuReplyUnansweredCustomerMessages(messages []agentXianyuReplyMessa
 	// rows after that boundary are part of the same buyer burst. Keeping all of
 	// them preserves context for consecutive messages even when a row's CSS
 	// alignment or direction attribute is temporarily unavailable. With no
-	// seller boundary, only the latest unknown row is safe to consider inbound;
-	// older unknown rows may be historical seller messages.
+	// seller boundary, keep the contiguous unknown tail rather than dropping
+	// every message except the last one. A known-direction row still bounds the
+	// tail, so historical unknown seller rows are not pulled into the reply.
+	unknownTailStart := lastMessage + 1
+	if allowUnknownLatest && lastSellerMessage < 0 {
+		for i := lastMessage; i >= 0; i-- {
+			message := messages[i]
+			if strings.TrimSpace(message.Text) == "" || isAgentXianyuSystemMessage(message.Text) {
+				continue
+			}
+			if normalizeAgentXianyuMessageDirection(message.Direction) != "unknown" {
+				break
+			}
+			unknownTailStart = i
+		}
+	}
 	includeUnknownBatch := allowUnknownLatest && lastSellerMessage >= 0
 	pending := make([]agentXianyuReplyMessage, 0, len(messages))
 	for i := lastSellerMessage + 1; i <= lastMessage; i++ {
@@ -1710,7 +1809,7 @@ func agentXianyuReplyUnansweredCustomerMessages(messages []agentXianyuReplyMessa
 			continue
 		}
 		direction := normalizeAgentXianyuMessageDirection(message.Direction)
-		if direction == "customer" || (allowUnknownLatest && direction == "unknown" && (includeUnknownBatch || i == lastMessage)) {
+		if direction == "customer" || (allowUnknownLatest && direction == "unknown" && (includeUnknownBatch || i >= unknownTailStart)) {
 			message.Direction = "customer"
 			pending = append(pending, message)
 		}
@@ -2022,6 +2121,9 @@ func agentXianyuReplyContainsPrivateData(value string) bool {
 
 func shouldResumeAgentXianyuReply(status string) bool {
 	status = strings.TrimSpace(status)
+	if status == "send_unverified_exhausted" {
+		return false
+	}
 	if status == "model_declined" || status == "no_knowledge_match" || status == "send_error" {
 		return true
 	}
@@ -2063,6 +2165,28 @@ func scheduleAgentXianyuReplyRetry(stateMu *sync.Mutex, path string, state *agen
 	defer stateMu.Unlock()
 	entry.Status = status
 	entry.RetryAfter = time.Now().Add(agentXianyuReplyRetryDelay).UnixMilli()
+	entry.UpdatedAt = time.Now().UnixMilli()
+	state.Conversations[identity] = entry
+	state.UpdatedAt = entry.UpdatedAt
+	return saveAgentXianyuReplyState(path, *state)
+}
+
+func scheduleAgentXianyuReplyUnverifiedRetry(stateMu *sync.Mutex, path string, state *agentXianyuReplyState, identity string, entry agentXianyuReplyConversationState, previewHash, incomingHash string) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if entry.UnverifiedHash != incomingHash {
+		entry.UnverifiedHash = incomingHash
+		entry.UnverifiedAttempts = 0
+	}
+	entry.UnverifiedAttempts++
+	entry.PreviewHash = previewHash
+	if entry.UnverifiedAttempts >= agentXianyuReplyUnverifiedMaxAttempts {
+		entry.Status = "send_unverified_exhausted"
+		entry.RetryAfter = time.Now().Add(24 * time.Hour).UnixMilli()
+	} else {
+		entry.Status = "send_unverified"
+		entry.RetryAfter = time.Now().Add(agentXianyuReplyUnverifiedRetryDelay).UnixMilli()
+	}
 	entry.UpdatedAt = time.Now().UnixMilli()
 	state.Conversations[identity] = entry
 	state.UpdatedAt = entry.UpdatedAt

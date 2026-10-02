@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -150,6 +151,18 @@ func TestXianyuReplyTargetReservationsPreventDuplicateWorkers(t *testing.T) {
 	releaseAgentXianyuReplyTarget(endpoint, target)
 }
 
+func TestGenericBrowserTargetSkipsReplyReservation(t *testing.T) {
+	endpoint := "http://127.0.0.1:12346"
+	target := agentBrowserTarget{ID: "reply-page", Type: "page", WebSocketDebuggerURL: "ws://reply"}
+	if !reserveAgentXianyuReplyTarget(endpoint, target) {
+		t.Fatal("reply target reservation should succeed")
+	}
+	defer releaseAgentXianyuReplyTarget(endpoint, target)
+	if !isAgentXianyuReplyTargetReserved(endpoint, target) {
+		t.Fatal("generic browser nodes must observe the reply target reservation")
+	}
+}
+
 func TestXianyuReplyDoesNotCreateTabWhenExistingTargetProbeFails(t *testing.T) {
 	newCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +252,19 @@ func TestAgentXianyuReplyKeepsUnknownRowsAfterSellerBoundary(t *testing.T) {
 	}
 }
 
+func TestAgentXianyuReplyAggregatesUnknownTailWithoutSellerBoundary(t *testing.T) {
+	messages := []agentXianyuReplyMessage{
+		{Key: "old", Text: "historical row", Direction: "unknown"},
+		{Key: "known", Text: "buyer context", Direction: "customer"},
+		{Key: "new-1", Text: "first new row", Direction: "unknown"},
+		{Key: "new-2", Text: "second new row", Direction: "unknown"},
+	}
+	got := agentXianyuReplyUnansweredCustomerMessages(messages, true)
+	if len(got) != 3 || got[0].Key != "known" || got[1].Key != "new-1" || got[2].Key != "new-2" {
+		t.Fatalf("unknown tail should be aggregated without including earlier unknown history: %#v", got)
+	}
+}
+
 func TestAgentXianyuReplyBatchHashChangesWhenBuyerAddsMessage(t *testing.T) {
 	one := []agentXianyuReplyMessage{{Key: "1", Text: "多少钱", Direction: "customer"}}
 	two := append(one, agentXianyuReplyMessage{Key: "2", Text: "还在吗", Direction: "customer"})
@@ -278,8 +304,8 @@ func TestAgentXianyuReplyDetectsHumanSellerMessage(t *testing.T) {
 
 func TestAgentXianyuReplyProcessesNewOrChangedConversationPreview(t *testing.T) {
 	baseline := agentXianyuReplyConversationState{PreviewHash: "same", Status: "baseline"}
-	if shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, baseline, true, "same", true) {
-		t.Fatal("unchanged baseline conversation should not reopen just because it remains unread")
+	if !shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, baseline, true, "same", true) {
+		t.Fatal("unread candidate must reach the worker even when its preview hash is unchanged")
 	}
 	if !shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{}, baseline, true, "changed", true) {
 		t.Fatal("changed preview should process a follow-up even when the unread badge is gone")
@@ -437,7 +463,7 @@ func TestShouldResumeAgentXianyuReplyMigratesSilentTerminalStates(t *testing.T) 
 			t.Fatalf("legacy silent status %q must be retried when default reply is enabled", status)
 		}
 	}
-	for _, status := range []string{"sent", "sent_fallback", "skipped_self", "model_error", "interrupted_by_human"} {
+	for _, status := range []string{"sent", "sent_fallback", "skipped_self", "model_error", "interrupted_by_human", "send_unverified_exhausted"} {
 		if shouldResumeAgentXianyuReply(status) {
 			t.Fatalf("status %q must not be replayed", status)
 		}
@@ -446,6 +472,34 @@ func TestShouldResumeAgentXianyuReplyMigratesSilentTerminalStates(t *testing.T) 
 		if !shouldResumeAgentXianyuReply(status) {
 			t.Fatalf("transient send status %q must be replayed after its retry delay", status)
 		}
+	}
+}
+
+func TestScheduleAgentXianyuReplyUnverifiedRetryIsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := agentXianyuReplyState{Conversations: map[string]agentXianyuReplyConversationState{}}
+	var mu sync.Mutex
+	entry := agentXianyuReplyConversationState{}
+	for attempt := 1; attempt <= agentXianyuReplyUnverifiedMaxAttempts; attempt++ {
+		if err := scheduleAgentXianyuReplyUnverifiedRetry(&mu, path, &state, "conversation", entry, "preview", "incoming"); err != nil {
+			t.Fatal(err)
+		}
+		entry = state.Conversations["conversation"]
+		if entry.UnverifiedAttempts != attempt {
+			t.Fatalf("attempt %d was not persisted: %#v", attempt, entry)
+		}
+	}
+	if entry.Status != "send_unverified_exhausted" {
+		t.Fatalf("expected exhausted status after bounded retries, got %q", entry.Status)
+	}
+	if entry.LastIncomingHash != "" {
+		t.Fatalf("unverified send must not mark incoming hash handled: %#v", entry)
+	}
+	if err := scheduleAgentXianyuReplyUnverifiedRetry(&mu, path, &state, "conversation", entry, "preview", "new-incoming"); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Conversations["conversation"].UnverifiedAttempts; got != 1 {
+		t.Fatalf("new incoming batch should reset verification attempts, got %d", got)
 	}
 }
 
