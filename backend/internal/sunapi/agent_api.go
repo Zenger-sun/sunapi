@@ -1,6 +1,8 @@
 package sunapi
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -268,12 +270,25 @@ func handleRetryBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
 			return
 		}
+		runID := newAgentRunID()
+		acquired, err := store.acquireAgentRunLease(c.Request.Context(), bp.ID, runID, "retry")
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		if !acquired {
+			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
+			return
+		}
 		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, "running", ""); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = store.releaseAgentRunLease(cleanupCtx, agentRunLease{BlueprintID: bp.ID, RunID: runID})
+			cancel()
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
 		// 异步执行蓝图
-		go runBlueprintTask(store, bp)
+		go runBlueprintTaskWithLease(context.Background(), store, bp, runID, "retry")
 		bp.Status = "running"
 		ok(c, bp)
 	}
@@ -288,15 +303,31 @@ func handleRunBlueprint(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusNotFound, errNotFound("blueprint"))
 			return
 		}
-		if bp.Status == "running" || store.isAgentScheduledRunActive(bp.ID) || store.isAgentRunActive(bp.ID) {
+		if bp.Status != "paused" && (store.isAgentScheduledRunActive(bp.ID) || store.isAgentRunActive(bp.ID)) {
+			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
+			return
+		}
+		runID := newAgentRunID()
+		acquired, err := store.acquireAgentRunLease(c.Request.Context(), bp.ID, runID, "manual")
+		if err == nil && !acquired && bp.Status == "paused" {
+			acquired, err = store.acquireAgentRunLeaseAfterPause(c.Request.Context(), bp.ID, runID, "manual")
+		}
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		if !acquired {
 			fail(c, http.StatusConflict, errConflict("blueprint is already running"))
 			return
 		}
 		if err := store.UpdateBlueprintStatus(c.Request.Context(), bpID, "running", ""); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = store.releaseAgentRunLease(cleanupCtx, agentRunLease{BlueprintID: bp.ID, RunID: runID})
+			cancel()
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		go runBlueprintTask(store, bp)
+		go runBlueprintTaskWithLease(context.Background(), store, bp, runID, "manual")
 		bp.Status = "running"
 		ok(c, bp)
 	}
@@ -326,7 +357,7 @@ func handleAgentWebhookTrigger(store *Store) gin.HandlerFunc {
 			fail(c, http.StatusUnauthorized, err)
 			return
 		}
-		if blueprintHasXianyuReplyNode(bp) && (bp.Status == "running" || store.isAgentRunActive(bp.ID)) {
+		if blueprintHasXianyuReplyNode(bp) && store.isAgentRunActive(bp.ID) {
 			ok(c, gin.H{
 				"accepted":        true,
 				"already_running": true,
@@ -359,12 +390,31 @@ func handleAgentWebhookTrigger(store *Store) gin.HandlerFunc {
 		}
 		runBP := *bp
 		runBP.InputVariables = inputVars
-
-		if err := store.UpdateBlueprintStatus(c.Request.Context(), bp.ID, "running", ""); err != nil {
+		runID := newAgentRunID()
+		acquired, err := store.acquireAgentRunLease(c.Request.Context(), bp.ID, runID, "webhook")
+		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		go runBlueprintTask(store, &runBP)
+		if !acquired {
+			ok(c, gin.H{
+				"accepted":        true,
+				"already_running": true,
+				"blueprint_id":    bp.ID,
+				"agent_id":        bp.AgentID,
+				"status":          "running",
+			})
+			return
+		}
+
+		if err := store.UpdateBlueprintStatus(c.Request.Context(), bp.ID, "running", ""); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = store.releaseAgentRunLease(cleanupCtx, agentRunLease{BlueprintID: bp.ID, RunID: runID})
+			cancel()
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		go runBlueprintTaskWithLease(context.Background(), store, &runBP, runID, "webhook")
 		ok(c, gin.H{
 			"accepted":     true,
 			"blueprint_id": bp.ID,
@@ -391,9 +441,13 @@ func mergeAgentWebhookInput(vars map[string]interface{}, payload map[string]inte
 }
 
 func buildAgentWebhookInput(c *gin.Context) (map[string]interface{}, error) {
-	bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, 2*1024*1024))
+	const maxWebhookBodyBytes = 2 * 1024 * 1024
+	bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, maxWebhookBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(bodyBytes) > maxWebhookBodyBytes {
+		return nil, errBadRequest("webhook body exceeds 2 MiB")
 	}
 	var body interface{} = string(bodyBytes)
 	if len(strings.TrimSpace(string(bodyBytes))) > 0 {
@@ -404,13 +458,13 @@ func buildAgentWebhookInput(c *gin.Context) (map[string]interface{}, error) {
 	}
 	headers := map[string]string{}
 	for key, values := range c.Request.Header {
-		if len(values) > 0 {
+		if len(values) > 0 && isSafeAgentWebhookHeader(key) {
 			headers[key] = values[0]
 		}
 	}
 	query := map[string]string{}
 	for key, values := range c.Request.URL.Query() {
-		if len(values) > 0 {
+		if len(values) > 0 && !isSensitiveAgentWebhookField(key) {
 			query[key] = values[0]
 		}
 	}
@@ -428,17 +482,39 @@ func buildAgentWebhookInput(c *gin.Context) (map[string]interface{}, error) {
 func validateAgentWebhookSecret(c *gin.Context, bp *AgentBlueprint) error {
 	secret := strings.TrimSpace(agentWebhookSecret(bp))
 	if secret == "" {
-		return nil
+		return errUnauthorized("webhook secret is not configured")
 	}
-	provided := firstNonEmpty(
+	provided := strings.TrimSpace(firstNonEmpty(
 		c.GetHeader("X-SunAPI-Webhook-Secret"),
 		c.GetHeader("X-Webhook-Secret"),
-		c.Query("secret"),
-	)
-	if provided != secret {
+	))
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(secret)) != 1 {
 		return errUnauthorized("invalid webhook secret")
 	}
 	return nil
+}
+
+func isSafeAgentWebhookHeader(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	switch lower {
+	case "accept", "content-type", "user-agent", "x-request-id", "x-webhook-event", "x-event-type", "x-source":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSensitiveAgentWebhookField(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{"authorization", "authenticate", "credential", "password", "secret", "signature", "token", "api-key", "api_key", "apikey", "phone", "mobile", "email", "address", "realname", "real_name", "username", "user_name", "openid", "unionid"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func blueprintHasWebhookTrigger(bp *AgentBlueprint) bool {

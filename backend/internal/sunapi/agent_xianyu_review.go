@@ -140,10 +140,11 @@ func executeAgentXianyuReviewGraphNode(ctx context.Context, store *Store, bp *Ag
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价无法连接浏览器。", err.Error())
 	}
-	target, _, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
+	target, reusedTarget, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价无法打开评价管理。", err.Error())
 	}
+	defer makeAgentBrowserTargetCleanup(endpoint, target, !reusedTarget)()
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼自动评价无法连接浏览器调试通道。", err.Error())

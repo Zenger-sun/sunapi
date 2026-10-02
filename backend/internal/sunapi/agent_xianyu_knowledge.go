@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,8 @@ const (
 	// Include the summary schema in the conversation hash so existing archived
 	// conversations are rebuilt when privacy or style extraction rules change.
 	agentXianyuKnowledgeFormatVersion = "public-reply-style-v2"
+	agentXianyuStyleDocumentFilename  = "闲鱼账号回复口吻.md"
+	agentXianyuProductFilenamePrefix  = "闲鱼商品知识-"
 )
 
 const agentXianyuDefaultSummaryInstruction = `逐条阅读已经完整加载的闲鱼客服历史消息，并结合页面明确展示的当前商品信息，仅依据已提供事实整理知识库。输出必须使用以下固定标题，缺少信息时写“未提及”，禁止猜测：
@@ -89,12 +92,23 @@ type agentXianyuConversation struct {
 }
 
 type agentXianyuProductContext struct {
+	Key          string `json:"key,omitempty"`
 	Found        bool   `json:"found"`
 	Title        string `json:"title,omitempty"`
 	Status       string `json:"status,omitempty"`
 	Availability string `json:"availability,omitempty"`
 	Description  string `json:"description,omitempty"`
 	Text         string `json:"text,omitempty"`
+}
+
+type agentXianyuProduct struct {
+	agentXianyuProductContext
+	URL string `json:"url,omitempty"`
+}
+
+type agentXianyuProductCatalogPayload struct {
+	URL      string               `json:"url"`
+	Products []agentXianyuProduct `json:"products"`
 }
 
 type agentXianyuConversationCandidate struct {
@@ -169,8 +183,12 @@ type agentXianyuScrollPayload struct {
 }
 
 type agentXianyuSyncState struct {
-	Conversations map[string]string `json:"conversations"`
-	UpdatedAt     int64             `json:"updated_at"`
+	Conversations          map[string]string `json:"conversations"`
+	Products               map[string]string `json:"products,omitempty"`
+	StyleHash              string            `json:"style_hash,omitempty"`
+	KnowledgeBaseIDs       []string          `json:"knowledge_base_ids,omitempty"`
+	ActiveKnowledgeBaseIDs []string          `json:"active_knowledge_base_ids,omitempty"`
+	UpdatedAt              int64             `json:"updated_at"`
 }
 
 type agentXianyuKnowledgeDocument struct {
@@ -221,7 +239,7 @@ func executeAgentXianyuKnowledgeGraphNode(
 		"node_title": node.Data.Title,
 		"message":    "正在读取闲鱼会话列表和历史消息，请稍候…",
 	})
-	conversations, browserSession, sourceURL, err := collectAgentXianyuConversations(ctx, store.DataDir(), node.Data.Settings)
+	conversations, products, browserSession, sourceURL, collectionComplete, collectionSkipped, err := collectAgentXianyuConversations(ctx, store.DataDir(), node.Data.Settings)
 	if err != nil {
 		return failAgentXianyuNodeWithOutput(result, "闲鱼客服对话采集失败。", err.Error(), map[string]interface{}{
 			"error":           err.Error(),
@@ -235,8 +253,47 @@ func executeAgentXianyuKnowledgeGraphNode(
 	if err != nil {
 		return failAgentXianyuNode(result, "闲鱼客服增量状态读取失败。", err.Error())
 	}
+	if state.Products == nil {
+		state.Products = map[string]string{}
+	}
+	previousKnowledgeBaseIDs := append([]string(nil), state.KnowledgeBaseIDs...)
+	previousActiveKnowledgeBaseIDs := append([]string(nil), state.ActiveKnowledgeBaseIDs...)
+	if len(previousActiveKnowledgeBaseIDs) == 0 {
+		previousActiveKnowledgeBaseIDs = append(previousActiveKnowledgeBaseIDs, previousKnowledgeBaseIDs...)
+	}
+	productDocuments, changedProducts, err := syncAgentXianyuProducts(ctx, store, bases, bp.ID, node.ID, &state, products)
+	if err != nil {
+		return failAgentXianyuNodeWithOutput(result, "闲鱼商品知识写入失败", err.Error(), map[string]interface{}{
+			"error": err.Error(), "source_url": sourceURL, "browser_session": browserSession,
+		})
+	}
+	styleDocuments := make([]agentXianyuKnowledgeDocument, 0)
+	styleUpdated := false
+	if collectionComplete && !collectionSkipped {
+		styleDocuments, styleUpdated, err = syncAgentXianyuStyle(ctx, store, bases, bp, node, &state, conversations, sourceURL)
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"blueprint_id": bp.ID,
+				"node_id":      node.ID,
+			}).Warn("agent xianyu style sync skipped")
+			styleDocuments = nil
+			styleUpdated = false
+		}
+	}
+	currentKnowledgeBaseIDs := mergeAgentXianyuKnowledgeBaseIDs(nil, bases)
 	syncAll := strings.Contains(firstNonEmpty(node.Data.Settings["同步范围"], "仅归档未归档或有新消息的会话"), "全部")
-	changed, nextHashes := filterAgentXianyuChangedConversations(conversations, state, syncAll)
+	changed, nextHashes, removedIdentities := filterAgentXianyuChangedConversations(conversations, state, syncAll)
+	baseBindingsChanged := agentXianyuKnowledgeBaseBindingsChanged(previousActiveKnowledgeBaseIDs, bases)
+	if baseBindingsChanged {
+		// A new binding needs documents for every visible conversation, even if
+		// the transcript hash itself did not change.
+		changed = append([]agentXianyuConversation(nil), conversations...)
+	}
+	cleanupIdentities := append([]string(nil), removedIdentities...)
+	if baseBindingsChanged {
+		cleanupIdentities = agentXianyuConversationStateIdentities(state)
+	}
+	removedCount := 0
 	unchanged := len(conversations) - len(changed)
 	reportAgentExecutionProgress(ctx, map[string]interface{}{
 		"phase":      "collected",
@@ -250,13 +307,49 @@ func executeAgentXianyuKnowledgeGraphNode(
 		"unchanged":  unchanged,
 	})
 	if len(changed) == 0 {
+		if syncAll && collectionComplete && !collectionSkipped && len(cleanupIdentities) > 0 {
+			cleanupBases, cleanupErr := resolveAgentXianyuKnowledgeCleanupBases(ctx, store, bases, previousKnowledgeBaseIDs, bp.UserID)
+			if cleanupErr != nil {
+				return failAgentXianyuNodeWithOutput(result, "xianyu stale knowledge cleanup failed", cleanupErr.Error(), map[string]interface{}{
+					"error": cleanupErr.Error(),
+				})
+			}
+			if err := deleteAgentXianyuConversationKnowledge(ctx, store, cleanupBases, bp.ID, node.ID, cleanupIdentities); err != nil {
+				return failAgentXianyuNodeWithOutput(result, "xianyu stale knowledge cleanup failed", err.Error(), map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+			state.Conversations = nextHashes
+			state.KnowledgeBaseIDs = mergeAgentXianyuKnowledgeBaseIDs(previousKnowledgeBaseIDs, bases)
+			state.ActiveKnowledgeBaseIDs = currentKnowledgeBaseIDs
+			state.UpdatedAt = time.Now().UnixMilli()
+			if err := saveAgentXianyuSyncState(statePath, state); err != nil {
+				return failAgentXianyuNodeWithOutput(result, "xianyu sync state save failed", err.Error(), map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+			removedCount = len(removedIdentities)
+		} else {
+			state.KnowledgeBaseIDs = mergeAgentXianyuKnowledgeBaseIDs(previousKnowledgeBaseIDs, bases)
+			state.ActiveKnowledgeBaseIDs = currentKnowledgeBaseIDs
+			state.UpdatedAt = time.Now().UnixMilli()
+			if err := saveAgentXianyuSyncState(statePath, state); err != nil {
+				return failAgentXianyuNodeWithOutput(result, "xianyu sync state save failed", err.Error(), map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+		}
 		result.Message = fmt.Sprintf("闲鱼客服同步完成，扫描 %d 个会话，暂无新增或更新内容。", len(conversations))
 		result.Output = map[string]interface{}{
 			"source_url":                   sourceURL,
 			"browser_session":              browserSession,
 			"scanned_conversation_count":   len(conversations),
+			"product_count":                len(products),
+			"updated_product_count":        changedProducts,
+			"style_updated":                styleUpdated,
 			"archived_conversation_count":  0,
 			"unchanged_conversation_count": unchanged,
+			"removed_conversation_count":   removedCount,
 			"knowledge_base_count":         len(bases),
 			"sync_mode":                    firstNonEmpty(node.Data.Settings["同步范围"], "仅归档未归档或有新消息的会话"),
 		}
@@ -278,7 +371,9 @@ func executeAgentXianyuKnowledgeGraphNode(
 	} else {
 		summaryNode.Data.Description = agentXianyuDefaultSummaryInstruction + "\n附加整理要求：" + strings.TrimSpace(summaryNode.Data.Description)
 	}
-	documents := make([]agentXianyuKnowledgeDocument, 0, len(changed)*len(bases))
+	documents := make([]agentXianyuKnowledgeDocument, 0, len(changed)*len(bases)+len(productDocuments)+len(styleDocuments))
+	documents = append(documents, productDocuments...)
+	documents = append(documents, styleDocuments...)
 	archivedConversations := make([]agentXianyuConversation, 0, len(changed))
 	skippedCount := 0
 	var firstSummaryError error
@@ -422,13 +517,51 @@ func executeAgentXianyuKnowledgeGraphNode(
 	if skippedCount > 0 {
 		result.Message = fmt.Sprintf("闲鱼客服归档部分完成，已归档 %d 个会话，%d 个未完成会话保留待重试。", len(archivedConversations), skippedCount)
 	}
+	if syncAll && collectionComplete && !collectionSkipped && skippedCount == 0 && firstSummaryError == nil {
+		cleanupBases, cleanupErr := resolveAgentXianyuKnowledgeCleanupBases(ctx, store, bases, previousKnowledgeBaseIDs, bp.UserID)
+		if cleanupErr != nil {
+			return failAgentXianyuNodeWithOutput(result, "xianyu stale knowledge cleanup failed", cleanupErr.Error(), map[string]interface{}{
+				"error": cleanupErr.Error(),
+			})
+		}
+		if err := deleteAgentXianyuConversationKnowledge(ctx, store, cleanupBases, bp.ID, node.ID, cleanupIdentities); err != nil {
+			return failAgentXianyuNodeWithOutput(result, "xianyu stale knowledge cleanup failed", err.Error(), map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+		state.Conversations = nextHashes
+		state.KnowledgeBaseIDs = mergeAgentXianyuKnowledgeBaseIDs(previousKnowledgeBaseIDs, bases)
+		state.ActiveKnowledgeBaseIDs = currentKnowledgeBaseIDs
+		state.UpdatedAt = time.Now().UnixMilli()
+		if err := saveAgentXianyuSyncState(statePath, state); err != nil {
+			return failAgentXianyuNodeWithOutput(result, "xianyu sync state save failed", err.Error(), map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+		removedCount = len(removedIdentities)
+	} else if firstSummaryError == nil && skippedCount == 0 {
+		// Advance the active binding snapshot only after every selected
+		// conversation was written successfully. Historical IDs remain intact
+		// for a later full-sync cleanup.
+		state.ActiveKnowledgeBaseIDs = currentKnowledgeBaseIDs
+		state.UpdatedAt = time.Now().UnixMilli()
+		if err := saveAgentXianyuSyncState(statePath, state); err != nil {
+			return failAgentXianyuNodeWithOutput(result, "xianyu sync state save failed", err.Error(), map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	}
 	result.Output = map[string]interface{}{
 		"source_url":                   sourceURL,
 		"browser_session":              browserSession,
 		"scanned_conversation_count":   len(conversations),
+		"product_count":                len(products),
+		"updated_product_count":        changedProducts,
+		"style_updated":                styleUpdated,
 		"archived_conversation_count":  len(archivedConversations),
 		"skipped_conversation_count":   skippedCount,
 		"unchanged_conversation_count": unchanged,
+		"removed_conversation_count":   removedCount,
 		"knowledge_base_count":         len(bases),
 		"documents":                    documents,
 		"sync_mode":                    firstNonEmpty(node.Data.Settings["同步范围"], "仅归档未归档或有新消息的会话"),
@@ -696,67 +829,131 @@ func resolveAgentXianyuKnowledgeBases(ctx context.Context, store *Store, bp *Age
 	return bases, ids, nil
 }
 
-func collectAgentXianyuConversations(ctx context.Context, dataDir string, settings map[string]string) ([]agentXianyuConversation, string, string, error) {
+func collectAgentXianyuConversations(ctx context.Context, dataDir string, settings map[string]string) ([]agentXianyuConversation, []agentXianyuProduct, string, string, bool, bool, error) {
 	targetURL, err := normalizeAgentXianyuURL(firstNonEmpty(settings["网址"], settings["URL"], agentXianyuDefaultURL))
 	if err != nil {
-		return nil, "", "", err
+		return nil, nil, "", "", false, false, err
+	}
+	productListURL := strings.TrimSpace(firstNonEmpty(settings["商品列表网址"], settings["商品目录网址"]))
+	if productListURL != "" {
+		productListURL, err = normalizeAgentXianyuURL(productListURL)
+		if err != nil {
+			return nil, nil, "", "", false, false, fmt.Errorf("商品列表网址无效: %w", err)
+		}
 	}
 	session := firstNonEmpty(settings["会话名称"], agentXianyuDefaultSession)
 	paths := resolveAgentBrowserSessionPaths(dataDir, session)
 	endpoint, err := ensureAgentBrowserDevtoolsForSession(ctx, paths)
 	if err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
-	target, _, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
+	target, reusedTarget, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
 	if err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
+	defer makeAgentBrowserTargetCleanup(endpoint, target, !reusedTarget)()
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
-		return nil, paths.Name, targetURL, fmt.Errorf("连接浏览器调试通道失败: %w", err)
+		return nil, nil, paths.Name, targetURL, false, false, fmt.Errorf("连接浏览器调试通道失败: %w", err)
 	}
 	defer conn.Close()
 	if _, err := agentBrowserCDPCall(ctx, conn, 1, "Page.enable", nil); err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	if _, err := agentBrowserCDPCall(ctx, conn, 2, "Runtime.enable", nil); err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	if _, err := agentBrowserCDPCall(ctx, conn, 3, "Page.navigate", map[string]any{"url": targetURL}); err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	loginWait := parseAgentPositiveSetting(firstNonEmpty(settings["登录等待"], "180s"), agentXianyuDefaultLoginWait, 300)
 	if loginWait > 0 && !strings.Contains(settings["登录态"], "无需登录") {
 		if err := waitAgentBrowserLogin(ctx, conn, loginWait); err != nil {
-			return nil, paths.Name, targetURL, err
+			return nil, nil, paths.Name, targetURL, false, false, err
 		}
 	}
 	if err := waitAgentXianyu(ctx, settings["列表等待"], agentXianyuDefaultListWait); err != nil {
-		return nil, paths.Name, targetURL, err
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	listSelector := firstNonEmpty(settings["对话列表选择器"], settings["会话列表选择器"])
 	messageSelector := settings["消息区域选择器"]
 	productSelector := settings["商品详情选择器"]
+	productListSelector := settings["商品列表选择器"]
 	// Reading and scrolling do not necessarily target the same DOM node on a
 	// virtualized chat page. Keep them independently configurable and fall back
 	// to the content selector for backwards compatibility.
 	messageScrollSelector := firstNonEmpty(settings["消息滚动容器选择器"], messageSelector)
+	products := make([]agentXianyuProduct, 0)
+	productPageNavigated := false
+	restoreProductPage := func(restoreCtx context.Context) error {
+		if !productPageNavigated {
+			return nil
+		}
+		if _, restoreErr := agentBrowserCDPCall(restoreCtx, conn, 8, "Page.navigate", map[string]any{"url": targetURL}); restoreErr != nil {
+			return fmt.Errorf("返回闲鱼客服页失败: %w", restoreErr)
+		}
+		if restoreErr := waitAgentXianyu(restoreCtx, settings["列表等待"], agentXianyuDefaultListWait); restoreErr != nil {
+			return restoreErr
+		}
+		productPageNavigated = false
+		return nil
+	}
+	defer func() {
+		if !productPageNavigated {
+			return
+		}
+		// Navigation errors must not leave a reused seller tab on the product
+		// page. Best-effort recovery uses a fresh timeout because the original
+		// context may already be cancelled while the browser is still usable.
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if restoreErr := restoreProductPage(restoreCtx); restoreErr != nil {
+			log.WithError(restoreErr).Warn("agent xianyu could not restore seller chat page after product catalog navigation")
+		}
+	}()
+	if productListURL != "" && productListURL != targetURL {
+		if _, err := agentBrowserCDPCall(ctx, conn, 6, "Page.navigate", map[string]any{"url": productListURL}); err != nil {
+			return nil, nil, paths.Name, targetURL, false, false, fmt.Errorf("打开商品列表页失败: %w", err)
+		}
+		productPageNavigated = true
+		if err := waitAgentXianyu(ctx, settings["列表等待"], agentXianyuDefaultListWait); err != nil {
+			return nil, nil, paths.Name, targetURL, false, false, err
+		}
+	}
+	productCatalog, productCatalogErr := evaluateAgentXianyuProductCatalog(ctx, conn, 7, productListSelector)
+	if restoreErr := restoreProductPage(ctx); restoreErr != nil {
+		return nil, nil, paths.Name, targetURL, false, false, restoreErr
+	}
+	if productCatalogErr != nil {
+		log.WithError(productCatalogErr).Warn("agent xianyu product catalog could not be read")
+	} else {
+		products = append(products, productCatalog.Products...)
+	}
 	reset, err := evaluateAgentXianyuConversationListReset(ctx, conn, 4, listSelector)
 	if err != nil {
-		return nil, paths.Name, targetURL, err
+		if len(products) > 0 {
+			return nil, products, paths.Name, targetURL, true, false, nil
+		}
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	if reset.Moved {
 		if err := waitAgentXianyuDOM(ctx); err != nil {
-			return nil, paths.Name, targetURL, err
+			return nil, nil, paths.Name, targetURL, false, false, err
 		}
 	}
 	conversationCeiling := parseAgentPositiveSetting(settings["最大会话保护上限"], agentXianyuMaxConversations, agentXianyuMaxConversations)
 	candidates, err := evaluateAgentXianyuCandidates(ctx, conn, 10, listSelector, conversationCeiling)
 	if err != nil {
-		return nil, paths.Name, targetURL, err
+		if len(products) > 0 {
+			return nil, products, paths.Name, targetURL, true, false, nil
+		}
+		return nil, nil, paths.Name, targetURL, false, false, err
 	}
 	if len(candidates.Items) == 0 {
-		return nil, paths.Name, targetURL, errors.New("未找到闲鱼客服会话，请确认已登录并打开客服消息列表；必要时填写对话列表选择器")
+		if len(products) > 0 {
+			return nil, products, paths.Name, targetURL, true, false, nil
+		}
+		return nil, nil, paths.Name, targetURL, false, false, errors.New("未找到闲鱼客服会话，请确认已登录并打开客服消息列表；必要时填写对话列表选择器")
 	}
 
 	limit, allConversations := parseAgentXianyuConversationLimitWithCeiling(settings["会话数量"], conversationCeiling)
@@ -796,7 +993,10 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 	}
 	appendCandidates(candidates.Items)
 	if len(queue) == 0 {
-		return nil, paths.Name, targetURL, errors.New("已打开闲鱼客服列表，但没有读取到对话内容；请确认会话列表选择器和消息区域选择器")
+		if len(products) > 0 {
+			return nil, products, paths.Name, targetURL, true, false, nil
+		}
+		return nil, nil, paths.Name, targetURL, false, false, errors.New("已打开闲鱼客服列表，但没有读取到对话内容；请确认会话列表选择器和消息区域选择器")
 	}
 	conversations := make([]agentXianyuConversation, 0, len(queue))
 	queueIndex := 0
@@ -806,6 +1006,7 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 	listExhausted := false
 	listNoProgress := 0
 	listEndStreak := 0
+	collectionSkipped := false
 	restoreList := func(baseID int) error {
 		position, err := evaluateAgentXianyuConversationListRestore(ctx, conn, baseID, listSelector, listTop)
 		if err != nil {
@@ -997,7 +1198,7 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 	for allConversations || queueIndex < limit {
 		if queueIndex >= len(queue) {
 			if err := advanceList(60 + queueIndex*10); err != nil {
-				return nil, paths.Name, targetURL, err
+				return nil, nil, paths.Name, targetURL, false, false, err
 			}
 			if queueIndex >= len(queue) {
 				break
@@ -1009,9 +1210,10 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 		queueIndex++
 		found, err := clickQueuedConversation(candidate, 100+queueIndex*20)
 		if err != nil {
-			return nil, paths.Name, targetURL, err
+			return nil, nil, paths.Name, targetURL, false, false, err
 		}
 		if !found {
+			collectionSkipped = true
 			// A new inquiry can move or remove a queued row. Skip only that row;
 			// preserve listTop and continue with the next queued conversation.
 			log.WithFields(log.Fields{
@@ -1022,7 +1224,7 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 			continue
 		}
 		if err := waitAgentXianyu(ctx, settings["单会话等待"], conversationWait); err != nil {
-			return nil, paths.Name, targetURL, err
+			return nil, nil, paths.Name, targetURL, false, false, err
 		}
 
 		// Always start at the oldest visible message and wait for a stable oldest
@@ -1031,9 +1233,10 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 		// could exhaust the blueprint's global timeout.
 		text, conversationURL, historyErr := readAgentXianyuConversationHistory(ctx, conn, messageSelector, messageScrollSelector, historyRounds, 600+queueIndex*100)
 		if historyErr != nil && ctx.Err() != nil {
-			return nil, paths.Name, targetURL, fmt.Errorf("第 %d 个会话历史读取失败: %w", queueIndex, historyErr)
+			return nil, nil, paths.Name, targetURL, false, false, fmt.Errorf("第 %d 个会话历史读取失败: %w", queueIndex, historyErr)
 		}
 		if historyErr != nil {
+			collectionSkipped = true
 			// Never archive a partial transcript. A single malformed or stale row
 			// should not prevent the cursor from continuing with later conversations.
 			log.WithFields(log.Fields{
@@ -1043,7 +1246,7 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 			continue
 		}
 		if text == "" {
-			return nil, paths.Name, targetURL, fmt.Errorf("第 %d 个会话历史读取为空", queueIndex)
+			return nil, nil, paths.Name, targetURL, false, false, fmt.Errorf("第 %d 个会话历史读取为空", queueIndex)
 		}
 		product, productErr := evaluateAgentXianyuProductContext(ctx, conn, 1000000+queueIndex, productSelector)
 		if productErr != nil {
@@ -1066,11 +1269,17 @@ func collectAgentXianyuConversations(ctx context.Context, dataDir string, settin
 			URL:        conversationURL,
 			Product:    product,
 		})
+		if product.Found && strings.TrimSpace(product.Title) != "" {
+			products = append(products, agentXianyuProduct{agentXianyuProductContext: product, URL: conversationURL})
+		}
 	}
 	if len(conversations) == 0 {
-		return nil, paths.Name, targetURL, errors.New("已打开闲鱼客服列表，但没有读取到对话内容；请确认会话列表选择器和消息区域选择器")
+		if len(products) > 0 {
+			return nil, products, paths.Name, targetURL, allConversations && listExhausted, collectionSkipped, nil
+		}
+		return nil, nil, paths.Name, targetURL, false, false, errors.New("已打开闲鱼客服列表，但没有读取到对话内容；请确认会话列表选择器和消息区域选择器")
 	}
-	return conversations, paths.Name, targetURL, nil
+	return conversations, products, paths.Name, targetURL, allConversations && listExhausted && queueIndex >= len(queue), collectionSkipped, nil
 }
 
 func waitAgentXianyu(ctx context.Context, raw string, fallback int) error {
@@ -1192,6 +1401,10 @@ func evaluateAgentXianyuTranscript(ctx context.Context, conn *websocket.Conn, id
 
 func evaluateAgentXianyuProductContext(ctx context.Context, conn *websocket.Conn, id int, selector string) (agentXianyuProductContext, error) {
 	return evaluateAgentXianyuJSON(ctx, conn, id, buildAgentXianyuProductContextExpression(selector), agentXianyuProductContext{})
+}
+
+func evaluateAgentXianyuProductCatalog(ctx context.Context, conn *websocket.Conn, id int, selector string) (agentXianyuProductCatalogPayload, error) {
+	return evaluateAgentXianyuJSON(ctx, conn, id, buildAgentXianyuProductCatalogExpression(selector), agentXianyuProductCatalogPayload{})
 }
 
 func evaluateAgentXianyuScroll(ctx context.Context, conn *websocket.Conn, id int, selector string) (agentXianyuScrollPayload, error) {
@@ -1372,7 +1585,9 @@ func buildAgentXianyuCandidatesExpressionWithUnread(selector string, limit int, 
 		  const style=getComputedStyle(item,pseudo),content=String(style.content||'').replace(/[\"']/g,'').trim();
 		  const width=pseudo?(parseFloat(style.width)||0):rect.width,height=pseudo?(parseFloat(style.height)||0):rect.height;
 		  if(width<3||height<3||width>34||height>34)continue;
-		  if(value!==''&&!/^\d{1,2}$/.test(value)&&(!pseudo||!/^\d{1,2}$/.test(content)))continue;
+		  const numeric=/^\d{1,2}$/.test(value)||(pseudo&&/^\d{1,2}$/.test(content));
+		  const hint=/(unread|un-read|new-message|newMessage|badge|count|dot)/i.test(String(item.className||'')+' '+String(item.getAttribute&&item.getAttribute('aria-label')||''));
+		  if(!numeric&&!hint)continue;
 			if(pseudo&&(content==='none'||content==='normal'))continue;
 		  const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
 		  for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<150&&b<150)return true;}
@@ -1395,15 +1610,23 @@ func buildAgentXianyuCandidatesExpressionWithUnread(selector string, limit int, 
    if (/^(首页|工作台|消息|设置|帮助|客服中心)$/.test(text)) return;
    const firstLine = lines[0] || '';
    const stableID = clean(el.getAttribute('data-conversation-id') || el.getAttribute('data-session-id') || el.getAttribute('href'));
+   // Platform notices can carry red badges too, but they are not buyer
+   // conversations and must never drive an inbox click.
+   const systemTitle = /^(?:\u901a\u77e5\u6d88\u606f|\u7cfb\u7edf\u6d88\u606f|\u5e73\u53f0\u6d88\u606f|\u516c\u544a|\u6d3b\u52a8\u901a\u77e5|\u7269\u6d41\u901a\u77e5|\u8ba2\u5355\u901a\u77e5|\u6d88\u606f\u901a\u77e5|\u95f2\u9c7c\u5b98\u65b9\u5c0f\u4e8c)(?:\s*\d+)?$/i.test(firstLine) || /(?:notification|system message|notice|\u5b98\u65b9\u5c0f\u4e8c)/i.test(firstLine);
+   if (systemTitle) return;
 	 const unreadValue = clean(el.getAttribute('data-unread-count') || el.getAttribute('data-unread') || el.getAttribute('aria-label'));
 	 const unreadClass = /(unread|un-read|new-message|newMessage)/i.test(String(el.className || ''));
 	 const unreadChild = [...el.querySelectorAll('[data-unread-count],[data-unread],[class*="unread"],[class*="Unread"]')].some(item => {
 	   const value = clean(item.getAttribute('data-unread-count') || item.getAttribute('data-unread') || item.textContent);
-	   return value !== '0' && value !== 'false';
+	   return value !== '' && value !== '0' && value !== 'false';
 	 });
 	 const badgeIsRed = (item,pseudo='') => {
 	   const rect=item.getBoundingClientRect(),style=getComputedStyle(item,pseudo),value=clean(item.textContent),content=String(style.content||'').replace(/[\"']/g,'').trim();
-	   if(rect.width<3||rect.height<3||rect.width>34||rect.height>34||(!/^\d{1,2}$/.test(value)&&value!==''&&!/^\d{1,2}$/.test(content)&&content!==''&&content!=='none'&&content!=='normal'))return false;
+	   if(rect.width<3||rect.height<3||rect.width>34||rect.height>34)return false;
+	   const numeric=/^\d{1,2}$/.test(value)||(pseudo&&/^\d{1,2}$/.test(content));
+	   const hint=/(unread|un-read|new-message|newMessage|badge|count|dot)/i.test(String(item.className||'')+' '+String(item.getAttribute&&item.getAttribute('aria-label')||''));
+	   if(!numeric&&!hint)return false;
+	   if(pseudo&&(content==='none'||content==='normal'))return false;
 	   const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
 	   for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<150&&b<150)return true;}
 	   return false;
@@ -1529,6 +1752,30 @@ func buildAgentXianyuProductContextExpression(selector string) string {
 })()`, selectorJSON)
 }
 
+func buildAgentXianyuProductCatalogExpression(selector string) string {
+	selectorJSON := quoteAgentXianyuJS(selector)
+	return fmt.Sprintf(`(() => {
+ const custom=%s;
+ const clean=value=>String(value||'').replace(/\r/g,'').split(/\n+/).map(v=>v.replace(/[ \t]+/g,' ').trim()).filter(Boolean).join('\n');
+ const visible=el=>{if(!el)return false;const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>40&&r.height>20&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0';};
+ const textOf=root=>{const out=[],seen=new Set(),walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);while(walker.nextNode()){const p=walker.currentNode.parentElement;if(!p||!visible(p)||p.closest('button,input,textarea,select,script,style,[aria-hidden="true"]'))continue;const v=clean(walker.currentNode.nodeValue);if(v&&!seen.has(v)){seen.add(v);out.push(v);}}return out;};
+ let root=null;if(custom){try{root=document.querySelector(custom);}catch(_){} }
+ let cards=[];
+ if(root&&visible(root)){cards=[...root.querySelectorAll('[data-product-id],[data-item-id],[data-goods-id],[data-id],a[href*="item"],a[href*="id"]')];if(cards.length===0)cards=[...root.children];if(cards.length===0)cards=[root];}
+ else {
+  cards=[...document.querySelectorAll('[data-product-id],[data-item-id],[data-goods-id],[data-id]')];
+  // Some seller pages expose only product links or class-based cards. Keep a
+  // conservative fallback so a catalog without data-* attributes is still
+  // learned, while avoiding generic navigation links.
+  if(cards.length===0) cards=[...document.querySelectorAll('a[href*="item"],a[href*="goods"],a[href*="product"]')];
+  if(cards.length===0) cards=[...document.querySelectorAll('[class*="product-card"],[class*="productCard"],[class*="goods-card"],[class*="goodsCard"],[class*="item-card"],[class*="itemCard"]')];
+ }
+ const result=[],seen=new Set();
+ for(const card of cards){if(!visible(card))continue;const lines=textOf(card);if(lines.length===0)continue;const link=card.closest('a')||card.querySelector('a[href]');const url=link?String(link.href||''):'';const attr=card.getAttribute('data-product-id')||card.getAttribute('data-item-id')||card.getAttribute('data-goods-id')||card.getAttribute('data-id')||'';const title=(lines.find(v=>v.length>=4)||lines[0]||'').slice(0,300);const text=lines.slice(0,30).join('\n').slice(0,1800);const key=String(attr||url||title).trim();if(!key||seen.has(key))continue;seen.add(key);result.push({key:key,title:title,description:text,text:text,url:url,found:true});if(result.length>=500)break;}
+ return JSON.stringify({url:location.href||'',products:result});
+})()`, selectorJSON)
+}
+
 func buildAgentXianyuScrollExpression(selector string) string {
 	selectorJSON := quoteAgentXianyuJS(selector)
 	return fmt.Sprintf(`(() => {
@@ -1646,24 +1893,37 @@ func agentXianyuConversationRunes(items []agentXianyuConversation) int {
 	return total
 }
 
-func filterAgentXianyuChangedConversations(items []agentXianyuConversation, state agentXianyuSyncState, syncAll bool) ([]agentXianyuConversation, map[string]string) {
+func filterAgentXianyuChangedConversations(items []agentXianyuConversation, state agentXianyuSyncState, syncAll bool) ([]agentXianyuConversation, map[string]string, []string) {
 	if state.Conversations == nil {
 		state.Conversations = map[string]string{}
 	}
 	next := make(map[string]string, len(state.Conversations)+len(items))
-	for key, value := range state.Conversations {
-		next[key] = value
+	if !syncAll {
+		for key, value := range state.Conversations {
+			next[key] = value
+		}
 	}
 	changed := make([]agentXianyuConversation, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		identity := agentXianyuConversationIdentity(item.Key)
 		hash := agentXianyuConversationHash(item)
+		seen[identity] = struct{}{}
 		if syncAll || state.Conversations[identity] != hash {
 			changed = append(changed, item)
 		}
 		next[identity] = hash
 	}
-	return changed, next
+	removed := make([]string, 0)
+	if syncAll {
+		for identity := range state.Conversations {
+			if _, ok := seen[identity]; !ok {
+				removed = append(removed, identity)
+			}
+		}
+		sort.Strings(removed)
+	}
+	return changed, next, removed
 }
 
 func agentXianyuConversationIdentity(key string) string {
@@ -1676,12 +1936,253 @@ func agentXianyuConversationHash(item agentXianyuConversation) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func agentXianyuProductIdentity(product agentXianyuProduct) string {
+	key := strings.TrimSpace(product.Key)
+	if key == "" {
+		key = strings.TrimSpace(product.URL)
+	}
+	if key == "" {
+		key = strings.TrimSpace(product.Title)
+	}
+	if key == "" {
+		key = strings.TrimSpace(firstNonEmpty(product.Description, product.Text))
+	}
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func agentXianyuProductHash(product agentXianyuProduct) string {
+	identity := agentXianyuProductIdentity(product)
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		agentXianyuKnowledgeFormatVersion,
+		identity,
+		product.Title,
+		product.Status,
+		product.Availability,
+		product.Description,
+		product.Text,
+		product.URL,
+	}, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+func agentXianyuProductKnowledgeDocumentID(blueprintID, nodeID, baseID, identity string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{blueprintID, nodeID, baseID, identity}, "\n")))
+	return "doc-xianyu-product-" + hex.EncodeToString(sum[:16])
+}
+
+func agentXianyuStyleKnowledgeDocumentID(blueprintID, nodeID, baseID string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{blueprintID, nodeID, baseID, "style"}, "\n")))
+	return "doc-xianyu-style-" + hex.EncodeToString(sum[:16])
+}
+
+func buildAgentXianyuProductKnowledgeDocument(product agentXianyuProduct) string {
+	productContext := redactAgentXianyuProductContext(product.agentXianyuProductContext)
+	var builder strings.Builder
+	builder.WriteString("# 闲鱼商品知识\n\n")
+	builder.WriteString("仅用于回答当前商品咨询，只能依据以下页面明确展示的事实，不得推测未提及信息。\n\n")
+	if productContext.Title != "" {
+		builder.WriteString("## 商品标题\n" + productContext.Title + "\n\n")
+	}
+	if productContext.Status != "" {
+		builder.WriteString("## 页面状态\n" + productContext.Status + "\n\n")
+	}
+	if productContext.Availability != "" {
+		builder.WriteString("## 可售状态\n" + productContext.Availability + "\n\n")
+	}
+	if productContext.Description != "" {
+		builder.WriteString("## 商品描述\n" + productContext.Description + "\n\n")
+	}
+	if productContext.Text != "" && productContext.Text != productContext.Description {
+		builder.WriteString("## 页面补充信息\n" + productContext.Text + "\n\n")
+	}
+	builder.WriteString("## 回复限制\n不得输出个人信息、订单标识、卖家后台数据、成本、利润、底价或未在本商品资料中明确出现的承诺。\n")
+	return strings.TrimSpace(builder.String())
+}
+
+func syncAgentXianyuProducts(
+	ctx context.Context,
+	store *Store,
+	bases []*KnowledgeBase,
+	blueprintID, nodeID string,
+	state *agentXianyuSyncState,
+	products []agentXianyuProduct,
+) ([]agentXianyuKnowledgeDocument, int, error) {
+	if store == nil || state == nil {
+		return nil, 0, errors.New("xianyu product sync requires store and state")
+	}
+	if state.Products == nil {
+		state.Products = map[string]string{}
+	}
+	unique := make(map[string]agentXianyuProduct, len(products))
+	for _, product := range products {
+		product.agentXianyuProductContext = redactAgentXianyuProductContext(product.agentXianyuProductContext)
+		if strings.TrimSpace(product.Title) == "" {
+			continue
+		}
+		identity := agentXianyuProductIdentity(product)
+		if identity == "" {
+			continue
+		}
+		unique[identity] = product
+	}
+	identities := make([]string, 0, len(unique))
+	for identity := range unique {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+	documents := make([]agentXianyuKnowledgeDocument, 0, len(identities)*len(bases))
+	changed := 0
+	for _, identity := range identities {
+		product := unique[identity]
+		hash := agentXianyuProductHash(product)
+		needsUpdate := state.Products[identity] != hash
+		content := buildAgentXianyuProductKnowledgeDocument(product)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		filename := agentXianyuProductFilenamePrefix + agentXianyuShortIdentity(identity) + ".md"
+		for _, base := range bases {
+			if base == nil || strings.TrimSpace(base.ID) == "" {
+				continue
+			}
+			if !needsUpdate && slicesContainAgentXianyuReplyString(state.KnowledgeBaseIDs, base.ID) {
+				continue
+			}
+			documentID := agentXianyuProductKnowledgeDocumentID(blueprintID, nodeID, base.ID, identity)
+			document, err := store.UpsertKnowledgeDocument(ctx, base.ID, documentID, base.UserID, filename, "text/markdown", int64(len([]byte(content))), content)
+			if err != nil {
+				return documents, changed, err
+			}
+			documents = append(documents, agentXianyuKnowledgeDocument{
+				KnowledgeBaseID: base.ID,
+				DocumentID:      document.ID,
+				Filename:        document.Filename,
+				ChunkCount:      document.ChunkCount,
+			})
+		}
+		if needsUpdate {
+			changed++
+		}
+		state.Products[identity] = hash
+	}
+	return documents, changed, nil
+}
+
+func buildAgentXianyuStyleSource(conversations []agentXianyuConversation) string {
+	parts := make([]string, 0, len(conversations))
+	seen := make(map[string]struct{}, len(conversations))
+	for _, conversation := range conversations {
+		identity := agentXianyuConversationIdentity(conversation.Key)
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		lines := make([]string, 0)
+		for _, line := range strings.Split(redactAgentXianyuText(conversation.Transcript), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(line, "卖家：") || strings.HasPrefix(line, "客服：") || strings.HasPrefix(lower, "seller:") || strings.HasPrefix(lower, "merchant:") {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) > 0 {
+			parts = append(parts, strings.Join(lines, "\n"))
+		}
+	}
+	return truncateRunes(strings.Join(parts, "\n---\n"), 24000)
+}
+
+func buildAgentXianyuStyleDocument(summary string) string {
+	summary = strings.TrimSpace(redactAgentXianyuText(summary))
+	var builder strings.Builder
+	builder.WriteString("# 闲鱼账号回复口吻\n\n")
+	builder.WriteString("这是当前账号所有商品共用的表达风格，只用于调整语气和组织方式，不是商品事实。\n\n")
+	builder.WriteString(summary)
+	builder.WriteString("\n\n## 使用限制\n")
+	builder.WriteString("只模仿称呼、句长、语气词、分句方式和收尾习惯；不得复制历史原话，不得输出个人信息、订单标识、敏感经营数据、底价或任何未确认的承诺。商品事实必须以当前商品知识为准。\n")
+	return strings.TrimSpace(builder.String())
+}
+
+func syncAgentXianyuStyle(
+	ctx context.Context,
+	store *Store,
+	bases []*KnowledgeBase,
+	bp *AgentBlueprint,
+	node agentBlueprintGraphNode,
+	state *agentXianyuSyncState,
+	conversations []agentXianyuConversation,
+	sourceURL string,
+) ([]agentXianyuKnowledgeDocument, bool, error) {
+	if store == nil || bp == nil || state == nil {
+		return nil, false, errors.New("xianyu style sync requires store, blueprint and state")
+	}
+	source := buildAgentXianyuStyleSource(conversations)
+	if source == "" {
+		return nil, false, nil
+	}
+	sum := sha256.Sum256([]byte(source))
+	styleHash := hex.EncodeToString(sum[:])
+	allBasesKnown := true
+	for _, base := range bases {
+		if base != nil && !slicesContainAgentXianyuReplyString(state.KnowledgeBaseIDs, base.ID) {
+			allBasesKnown = false
+			break
+		}
+	}
+	if state.StyleHash == styleHash && allBasesKnown {
+		return nil, false, nil
+	}
+	styleNode := node
+	styleNode.Data.Description = "只分析已脱敏的卖家消息，总结可复用的账号级回复口吻。固定输出：称呼、句长、语气、常用收尾、禁用表达。不要复制原文，不要提取个人信息、订单信息、价格底价、经营指标或内部备注。"
+	if extra := strings.TrimSpace(node.Data.Description); extra != "" && extra != agentXianyuDefaultSummaryInstruction {
+		styleNode.Data.Description += "\n附加要求：" + extra
+	}
+	summary, err := callAgentXianyuSummaryLLM(ctx, store, bp, styleNode, map[string]interface{}{
+		"卖家历史消息": source,
+		"来源":     sourceURL,
+		"用途":     "账号级回复口吻",
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if strings.TrimSpace(redactAgentXianyuText(summary)) == "" {
+		return nil, false, errors.New("闲鱼账号回复口吻总结为空")
+	}
+	content := buildAgentXianyuStyleDocument(summary)
+	documents := make([]agentXianyuKnowledgeDocument, 0, len(bases))
+	for _, base := range bases {
+		if base == nil || strings.TrimSpace(base.ID) == "" {
+			continue
+		}
+		documentID := agentXianyuStyleKnowledgeDocumentID(bp.ID, node.ID, base.ID)
+		document, err := store.UpsertKnowledgeDocument(ctx, base.ID, documentID, base.UserID, agentXianyuStyleDocumentFilename, "text/markdown", int64(len([]byte(content))), content)
+		if err != nil {
+			return documents, false, err
+		}
+		documents = append(documents, agentXianyuKnowledgeDocument{
+			KnowledgeBaseID: base.ID,
+			DocumentID:      document.ID,
+			Filename:        document.Filename,
+			ChunkCount:      document.ChunkCount,
+		})
+	}
+	state.StyleHash = styleHash
+	return documents, true, nil
+}
+
 func agentXianyuStatePath(dataDir, blueprintID, nodeID string) string {
 	return filepath.Join(dataDir, agentXianyuStateDir, sanitizeAgentBrowserFilenamePart(blueprintID), sanitizeAgentBrowserFilenamePart(nodeID)+".json")
 }
 
 func loadAgentXianyuSyncState(path string) (agentXianyuSyncState, error) {
-	state := agentXianyuSyncState{Conversations: map[string]string{}}
+	state := agentXianyuSyncState{Conversations: map[string]string{}, Products: map[string]string{}}
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -1694,6 +2195,9 @@ func loadAgentXianyuSyncState(path string) (agentXianyuSyncState, error) {
 	}
 	if state.Conversations == nil {
 		state.Conversations = map[string]string{}
+	}
+	if state.Products == nil {
+		state.Products = map[string]string{}
 	}
 	return state, nil
 }
@@ -1728,6 +2232,111 @@ func agentXianyuShortIdentity(identity string) string {
 func agentXianyuKnowledgeDocumentID(blueprintID, nodeID, baseID, identity string) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{blueprintID, nodeID, baseID, identity}, "\n")))
 	return "doc-xianyu-" + hex.EncodeToString(sum[:16])
+}
+
+func mergeAgentXianyuKnowledgeBaseIDs(existing []string, bases []*KnowledgeBase) []string {
+	seen := make(map[string]struct{}, len(existing)+len(bases))
+	for _, id := range existing {
+		if id = strings.TrimSpace(id); id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, base := range bases {
+		if base != nil {
+			if id := strings.TrimSpace(base.ID); id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for id := range seen {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func agentXianyuKnowledgeBaseBindingsChanged(previousIDs []string, bases []*KnowledgeBase) bool {
+	current := mergeAgentXianyuKnowledgeBaseIDs(nil, bases)
+	previous := append([]string(nil), previousIDs...)
+	sort.Strings(previous)
+	if len(previous) != len(current) {
+		return true
+	}
+	for index := range previous {
+		if strings.TrimSpace(previous[index]) != current[index] {
+			return true
+		}
+	}
+	return false
+}
+
+func agentXianyuConversationStateIdentities(state agentXianyuSyncState) []string {
+	identities := make([]string, 0, len(state.Conversations))
+	for identity := range state.Conversations {
+		if identity = strings.TrimSpace(identity); identity != "" {
+			identities = append(identities, identity)
+		}
+	}
+	sort.Strings(identities)
+	return identities
+}
+
+func resolveAgentXianyuKnowledgeCleanupBases(ctx context.Context, store *Store, current []*KnowledgeBase, previousIDs []string, userID int64) ([]*KnowledgeBase, error) {
+	result := make([]*KnowledgeBase, 0, len(current)+len(previousIDs))
+	seen := make(map[string]struct{}, len(current)+len(previousIDs))
+	for _, base := range current {
+		if base == nil || strings.TrimSpace(base.ID) == "" {
+			continue
+		}
+		if _, exists := seen[base.ID]; exists {
+			continue
+		}
+		seen[base.ID] = struct{}{}
+		result = append(result, base)
+	}
+	for _, id := range previousIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		base, err := store.GetKnowledgeBase(ctx, id, userID)
+		if err != nil {
+			return nil, err
+		}
+		if base == nil {
+			// The old base may have been deleted. Its generated documents are
+			// already unreachable, so there is nothing left to clean up here.
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, base)
+	}
+	return result, nil
+}
+
+func deleteAgentXianyuConversationKnowledge(ctx context.Context, store *Store, bases []*KnowledgeBase, blueprintID, nodeID string, identities []string) error {
+	if store == nil {
+		return errors.New("store is required")
+	}
+	for _, base := range bases {
+		if base == nil {
+			continue
+		}
+		for _, identity := range identities {
+			documentID := agentXianyuKnowledgeDocumentID(blueprintID, nodeID, base.ID, identity)
+			if err := store.DeleteKnowledgeDocument(ctx, base.ID, documentID, base.UserID); err != nil {
+				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+					continue
+				}
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func agentXianyuKnowledgeFilename(identity string) string {
@@ -1769,6 +2378,7 @@ func commitAgentXianyuConversationKnowledge(
 	if state.Conversations == nil {
 		state.Conversations = map[string]string{}
 	}
+	state.KnowledgeBaseIDs = mergeAgentXianyuKnowledgeBaseIDs(state.KnowledgeBaseIDs, bases)
 	state.Conversations[identity] = conversationHash
 	state.UpdatedAt = time.Now().UnixMilli()
 	if err := saveAgentXianyuSyncState(statePath, *state); err != nil {

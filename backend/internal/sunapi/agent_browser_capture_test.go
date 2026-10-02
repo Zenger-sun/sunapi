@@ -75,6 +75,19 @@ func TestResolveAgentBrowserSessionPathsSeparatesNamedSessions(t *testing.T) {
 	}
 }
 
+func TestAgentBrowserProfileLockExists(t *testing.T) {
+	profileDir := t.TempDir()
+	if agentBrowserProfileLockExists(profileDir) {
+		t.Fatal("empty profile should not be considered locked")
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "SingletonLock"), []byte("locked"), 0600); err != nil {
+		t.Fatalf("write profile lock: %v", err)
+	}
+	if !agentBrowserProfileLockExists(profileDir) {
+		t.Fatal("profile lock should be detected")
+	}
+}
+
 func TestOpenAgentBrowserTargetCreatesPageWhenNoReusablePage(t *testing.T) {
 	listCalls := 0
 	newCalls := 0
@@ -142,7 +155,7 @@ func TestOpenAgentBrowserTargetReusesHealthyMatchingPage(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]agentBrowserTarget{{
 				ID:                   "persisted-page",
 				Type:                 "page",
-				URL:                  "https://seller.example.test/dashboard",
+				URL:                  "https://seller.example.test/data",
 				WebSocketDebuggerURL: websocketURL,
 			}})
 		case "/json/new":
@@ -169,7 +182,7 @@ func TestOpenAgentBrowserTargetReusesHealthyMatchingPage(t *testing.T) {
 	}
 }
 
-func TestFindAgentBrowserTargetReusesMatchingHost(t *testing.T) {
+func TestFindAgentBrowserTargetRequiresMatchingURLFamily(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/json/list" {
 			http.NotFound(w, r)
@@ -187,7 +200,28 @@ func TestFindAgentBrowserTargetReusesMatchingHost(t *testing.T) {
 		t.Fatalf("findAgentBrowserTarget error = %v", err)
 	}
 	if !found || target.ID != "seller" {
-		t.Fatalf("target=%+v found=%v, want seller target", target, found)
+		t.Fatalf("target=%+v found=%v, want seller target from the same seller console", target, found)
+	}
+}
+
+func TestAgentBrowserTargetURLMatchesSellerSiteVariants(t *testing.T) {
+	if !agentBrowserTargetURLMatches(
+		"https://seller.goofish.com/?site=COMMONPRO&spm=tracking#/im",
+		"https://seller.goofish.com/?site=COMM",
+	) {
+		t.Fatal("expected seller console site variants to reuse the current page")
+	}
+	if !agentBrowserTargetURLMatches(
+		"https://seller.goofish.com/messages?site=COMMONPRO",
+		"https://seller.goofish.com/?site=COMM",
+	) {
+		t.Fatal("expected different seller console routes to reuse the current page")
+	}
+	if agentBrowserTargetURLMatches(
+		"https://seller.example.com/messages?site=COMMONPRO",
+		"https://seller.goofish.com/?site=COMM",
+	) {
+		t.Fatal("did not expect a different seller host to match")
 	}
 }
 
@@ -226,6 +260,41 @@ func TestCloseAgentBrowserTarget(t *testing.T) {
 	}
 	if closedPath != "/json/close/current-page" {
 		t.Fatalf("closed path=%q", closedPath)
+	}
+}
+
+func TestMakeAgentBrowserTargetCleanupIsOwnedAndIdempotent(t *testing.T) {
+	closeCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/json/close/owned-page" {
+			http.NotFound(w, r)
+			return
+		}
+		closeCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	cleanup := makeAgentBrowserTargetCleanup(server.URL, agentBrowserTarget{ID: "owned-page"}, true)
+	cleanup()
+	cleanup()
+	if closeCalls != 1 {
+		t.Fatalf("close calls=%d, want 1", closeCalls)
+	}
+}
+
+func TestMakeAgentBrowserTargetCleanupKeepsReusedPage(t *testing.T) {
+	closeCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		closeCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	cleanup := makeAgentBrowserTargetCleanup(server.URL, agentBrowserTarget{ID: "reused-page"}, false)
+	cleanup()
+	if closeCalls != 0 {
+		t.Fatalf("close calls=%d, want 0", closeCalls)
 	}
 }
 

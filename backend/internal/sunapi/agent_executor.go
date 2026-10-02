@@ -79,20 +79,71 @@ func enterAgentSubflow(ctx context.Context, blueprintID string) context.Context 
 // ── 蓝图执行入口（异步 goroutine 调用）────────────────────────────────────────
 
 func runBlueprintTask(store *Store, bp *AgentBlueprint) {
-	runBlueprintTaskWithContext(context.Background(), store, bp)
+	runBlueprintTaskWithLease(context.Background(), store, bp, "", "manual")
 }
 
 func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *AgentBlueprint) {
-	ctx := parent
+	runBlueprintTaskWithLease(parent, store, bp, "", "schedule")
+}
+
+func runBlueprintTaskWithLease(parent context.Context, store *Store, bp *AgentBlueprint, runID, runKind string) {
+	if store == nil || bp == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	lease := agentRunLease{BlueprintID: bp.ID, RunID: strings.TrimSpace(runID), Kind: strings.TrimSpace(runKind)}
+	if lease.RunID == "" {
+		lease.RunID = newAgentRunID()
+		acquired, err := store.acquireAgentRunLease(parent, lease.BlueprintID, lease.RunID, lease.Kind)
+		if err != nil || !acquired {
+			if err != nil {
+				log.WithError(err).WithField("blueprint_id", bp.ID).Warn("agent: failed to acquire run lease")
+			}
+			return
+		}
+	}
+	releaseUnstartedLease := func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), agentBlueprintCleanupTimeout)
+		defer cleanupCancel()
+		if releaseErr := store.releaseAgentRunLease(cleanupCtx, lease); releaseErr != nil {
+			log.WithError(releaseErr).WithField("blueprint_id", bp.ID).
+				Debug("agent: failed to release unregistered run lease")
+		}
+	}
+	owned, err := store.ownsAgentRunLease(parent, lease)
+	if err != nil || !owned {
+		releaseUnstartedLease()
+		if err != nil {
+			log.WithError(err).WithField("blueprint_id", bp.ID).Warn("agent: failed to verify run lease")
+		} else {
+			log.WithField("blueprint_id", bp.ID).Debug("agent: run lease was replaced before execution started")
+		}
+		return
+	}
+	leaseCtx, stopLeaseHeartbeat := startAgentRunLeaseHeartbeat(parent, store, lease)
+
+	ctx := leaseCtx
 	cancel := func() {}
 	if timeout := effectiveAgentBlueprintRunTimeout(bp); timeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, timeout)
+		ctx, cancel = context.WithTimeout(leaseCtx, timeout)
 	} else {
-		ctx, cancel = context.WithCancel(parent)
+		ctx, cancel = context.WithCancel(leaseCtx)
 	}
 	defer cancel()
 
 	startedAt := time.Now()
+	if !store.registerAgentRun(bp.ID, lease.RunID, cancel) {
+		cancel()
+		stopLeaseHeartbeat()
+		return
+	}
+	defer func() {
+		cancel()
+		stopLeaseHeartbeat()
+		store.unregisterAgentRun(bp.ID, lease.RunID)
+	}()
 
 	// 创建执行日志
 	execLog, err := store.CreateExecutionLog(ctx, bp.ID, bp.AgentID, bp.UserID)
@@ -101,14 +152,16 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 			Warn("agent: failed to create execution log")
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), agentBlueprintCleanupTimeout)
 		defer cleanupCancel()
-		if statusErr := store.UpdateBlueprintAfterRun(cleanupCtx, bp.ID, "failed", err.Error()); statusErr != nil {
+		updated, statusErr := store.updateAgentBlueprintAfterRunForLease(cleanupCtx, lease, "failed", err.Error())
+		if statusErr != nil {
 			log.WithError(statusErr).WithField("blueprint_id", bp.ID).
 				Warn("agent: failed to release blueprint after execution log error")
+		} else if !updated {
+			log.WithField("blueprint_id", bp.ID).
+				Warn("agent: execution log error could not update blueprint after lease ownership was lost")
 		}
 		return
 	}
-	store.registerAgentRun(bp.ID, execLog.ID, cancel)
-	defer store.unregisterAgentRun(bp.ID, execLog.ID)
 	var progressMu sync.Mutex
 	ctx = withAgentExecutionProgress(ctx, func(progress map[string]interface{}) {
 		// Progress is advisory. Use a short independent context because the
@@ -162,24 +215,20 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 
 	// 更新蓝图执行次数和时间
 	now := time.Now().UnixMilli()
-	if err := store.UpdateBlueprintAfterRun(cleanupCtx, bp.ID, executionStatus, failureReason); err != nil {
+	updated, err := store.updateAgentBlueprintAfterRunForLease(cleanupCtx, lease, executionStatus, failureReason)
+	if err != nil {
 		log.WithError(err).WithField("blueprint_id", bp.ID).
 			Warn("agent: failed to update blueprint execution status")
+	} else if !updated {
+		log.WithField("blueprint_id", bp.ID).
+			Warn("agent: skipped final blueprint status update after lease ownership was lost")
 	}
-	_, _ = store.db.ExecContext(cleanupCtx, `
-		UPDATE agent_blueprints
-		SET execution_count = execution_count + 1,
-		    last_executed_time = ?,
-		    execution_duration_ms = ?,
-		    updated_time = ?
-		WHERE id = ?`,
-		now, durationMs, now, bp.ID)
+	if err := store.updateAgentRunMetricsForLease(cleanupCtx, lease, bp.AgentID, now, durationMs); err != nil {
+		log.WithError(err).WithField("blueprint_id", bp.ID).
+			Warn("agent: failed to update execution metrics")
+	}
 
 	// 更新智能体的最后执行时间
-	_, _ = store.db.ExecContext(cleanupCtx, `
-		UPDATE agents SET last_executed_time = ?, updated_time = ?
-		WHERE id = ?`, now, now, bp.AgentID)
-
 	// 完成执行日志
 	_ = store.FinishExecutionLog(cleanupCtx, execLog.ID, executionStatus, failureReason, archivePath, output)
 
@@ -190,12 +239,15 @@ func runBlueprintTaskWithContext(parent context.Context, store *Store, bp *Agent
 	}).Info("agent: blueprint execution finished")
 }
 
-func (s *Store) registerAgentRun(blueprintID, runID string, cancel context.CancelFunc) {
+func (s *Store) registerAgentRun(blueprintID, runID string, cancel context.CancelFunc) bool {
 	if s == nil || strings.TrimSpace(blueprintID) == "" || strings.TrimSpace(runID) == "" || cancel == nil {
-		return
+		return false
 	}
 	s.agentActiveRunsMu.Lock()
 	defer s.agentActiveRunsMu.Unlock()
+	if s.agentClosing {
+		return false
+	}
 	if s.agentActiveRuns == nil {
 		s.agentActiveRuns = make(map[string]map[string]context.CancelFunc)
 	}
@@ -205,6 +257,8 @@ func (s *Store) registerAgentRun(blueprintID, runID string, cancel context.Cance
 		s.agentActiveRuns[blueprintID] = runs
 	}
 	runs[runID] = cancel
+	s.agentActiveRunsWG.Add(1)
+	return true
 }
 
 func (s *Store) unregisterAgentRun(blueprintID, runID string) {
@@ -214,10 +268,14 @@ func (s *Store) unregisterAgentRun(blueprintID, runID string) {
 	s.agentActiveRunsMu.Lock()
 	defer s.agentActiveRunsMu.Unlock()
 	runs := s.agentActiveRuns[blueprintID]
+	if _, ok := runs[runID]; !ok {
+		return
+	}
 	delete(runs, runID)
 	if len(runs) == 0 {
 		delete(s.agentActiveRuns, blueprintID)
 	}
+	s.agentActiveRunsWG.Done()
 }
 
 func (s *Store) isAgentRunActive(blueprintID string) bool {
@@ -244,10 +302,13 @@ func (s *Store) cancelAgentRuns(blueprintID string) {
 	}
 }
 
-func (s *Store) cancelAllAgentRuns() {
+// stopAllAgentRuns prevents new registrations, cancels existing executions,
+// and waits for their cleanup to finish before the database is closed.
+func (s *Store) stopAllAgentRuns() {
 	if s == nil {
 		return
 	}
+	s.beginAgentRunShutdown()
 	s.agentActiveRunsMu.Lock()
 	cancels := make([]context.CancelFunc, 0)
 	for _, runs := range s.agentActiveRuns {
@@ -259,6 +320,16 @@ func (s *Store) cancelAllAgentRuns() {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	s.agentActiveRunsWG.Wait()
+}
+
+func (s *Store) beginAgentRunShutdown() {
+	if s == nil {
+		return
+	}
+	s.agentActiveRunsMu.Lock()
+	s.agentClosing = true
+	s.agentActiveRunsMu.Unlock()
 }
 
 func effectiveAgentBlueprintRunTimeout(bp *AgentBlueprint) time.Duration {

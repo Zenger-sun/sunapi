@@ -865,11 +865,12 @@ const NODE_META: Record<
     icon: MessagesSquareIcon,
     accent: 'bg-orange-500/12 text-orange-700 dark:text-orange-300',
     description:
-      '复用浏览器中的闲鱼卖家登录态，只读遍历客服会话，逐条完整读取历史，再按固定标题生成脱敏知识库内容。',
-    inputs: ['闲鱼客服会话', '当前智能体知识库'],
+      '复用浏览器中的闲鱼卖家登录态，先读取当前商品目录，再增量归档完整客服会话，并单独学习账号级回复口吻；商品目录不在客服页时可填写商品列表网址；所有写入内容均脱敏。',
+    inputs: ['闲鱼客服会话', '当前商品目录', '当前智能体知识库'],
     outputs: ['知识库文档', '会话统计'],
     settings: {
       网址: 'https://seller.goofish.com/?site=COMM',
+      商品列表网址: '',
       登录态: '持久化登录会话（首次登录后复用）',
       会话名称: '闲鱼客服',
       登录等待: '180s',
@@ -883,6 +884,7 @@ const NODE_META: Record<
       对话列表选择器: '',
       消息区域选择器: '',
       消息滚动容器选择器: '',
+      商品列表选择器: '',
       商品详情选择器: '',
       权限: '只读采集',
       节点超时: '不限制',
@@ -1707,6 +1709,22 @@ export function AgentWorkspace({
     },
     [currentBlueprintId, knowledgeScope]
   )
+  const updateCurrentBlueprintStatus = useCallback(
+    (status: AgentBlueprintStatus) => {
+      if (!currentBlueprintId) return
+      setBlueprints((current) => {
+        const next = current.map((blueprint) =>
+          blueprint.id === currentBlueprintId
+            ? { ...blueprint, status, updatedAt: Date.now() }
+            : blueprint
+        )
+        writeSavedBlueprints(next)
+        notifyAgentBlueprintsChanged()
+        return next
+      })
+    },
+    [currentBlueprintId]
+  )
 
   const applyBackendExecutionLogToPreview = useCallback(
     (
@@ -2250,7 +2268,11 @@ export function AgentWorkspace({
         return
       }
 
-      if (currentBlueprintStatus === 'paused' && !isManualPreview) {
+      if (
+        currentBlueprintStatus === 'paused' &&
+        !isManualPreview &&
+        hasScheduledBlueprint
+      ) {
         const currentBlueprint = blueprints.find(
           (item) => item.id === currentBlueprintId
         )
@@ -2338,6 +2360,9 @@ export function AgentWorkspace({
         )?.backendBlueprintId,
         knowledgeScope,
       }
+      // Reflect the execution state before the asynchronous backend call returns.
+      // The toolbar and sidebar must not wait for the first execution log.
+      updateCurrentBlueprintStatus('running')
       void runSavedBlueprintOnBackend(
         backendBlueprint,
         isManualPreview
@@ -2347,25 +2372,25 @@ export function AgentWorkspace({
         .then(async (synced) => {
           if (!synced) return
           if (previewRunIdRef.current !== runId) return
-          if (!isManualPreview) {
-            setBlueprints((current) => {
-              const exists = current.some((item) => item.id === synced.id)
-              const next = exists
-                ? current.map((item) =>
-                    item.id === synced.id
-                      ? {
-                          ...item,
-                          backendAgentId: synced.backendAgentId,
-                          backendBlueprintId: synced.backendBlueprintId,
-                        }
-                      : item
-                  )
-                : [synced, ...current]
-              writeSavedBlueprints(next)
-              notifyAgentBlueprintsChanged()
-              return next
-            })
-          }
+          setBlueprints((current) => {
+            const exists = current.some((item) => item.id === synced.id)
+            const next = exists
+              ? current.map((item) =>
+                  item.id === synced.id
+                    ? {
+                        ...item,
+                        backendAgentId: synced.backendAgentId,
+                        backendBlueprintId: synced.backendBlueprintId,
+                        syncState: synced.syncState,
+                        status: synced.status ?? 'running',
+                      }
+                    : item
+                )
+              : [synced, ...current]
+            writeSavedBlueprints(next)
+            notifyAgentBlueprintsChanged()
+            return next
+          })
           if (synced.backendAgentId && synced.backendBlueprintId) {
             try {
               if (realtimeListenerIndex >= 0) {
@@ -2538,10 +2563,11 @@ export function AgentWorkspace({
       refreshBackendExecutionLogs,
       skillChoices,
       templateByKind,
+      updateCurrentBlueprintStatus,
     ]
   )
 
-  const handleStopPreview = useCallback(() => {
+  const handleStopPreview = useCallback(async () => {
     const currentBlueprint = blueprints.find(
       (item) => item.id === currentBlueprintId
     )
@@ -2549,16 +2575,19 @@ export function AgentWorkspace({
       currentBlueprint?.backendAgentId &&
       currentBlueprint.backendBlueprintId
     ) {
-      void pauseBlueprint(
-        currentBlueprint.backendAgentId,
-        currentBlueprint.backendBlueprintId
-      ).catch((error) => {
+      try {
+        await pauseBlueprint(
+          currentBlueprint.backendAgentId,
+          currentBlueprint.backendBlueprintId
+        )
+      } catch (error) {
         toast.error(
           error instanceof Error
             ? `暂停后端蓝图失败: ${error.message}`
             : '暂停后端蓝图失败'
         )
-      })
+        return
+      }
     }
     cancelPreviewRun()
     const stoppedAt = Date.now()
@@ -2952,7 +2981,7 @@ type BlueprintWorkspaceProps = {
   onRunPreview: (mode?: AgentPreviewRunMode) => void
   onRefreshReplyRecords: () => void
   onReplyRecordsOpenChange: (open: boolean) => void
-  onStopPreview: () => void
+  onStopPreview: () => Promise<void>
   onUndo: () => void
 }
 
@@ -9337,6 +9366,18 @@ function mergeBackendBlueprints(
     if (restoredIds.has(localId)) continue
 
     if (
+      local?.status === 'paused' &&
+      backendBlueprint.status === 'paused' &&
+      local.backendBlueprintId === backendBlueprint.id &&
+      local.updatedAt >= backendBlueprint.updated_time
+    ) {
+      restored.push({
+        ...local,
+        backendAgentId: agentId,
+        backendBlueprintId: backendBlueprint.id,
+        syncState: 'synced',
+      })
+    } else if (
       local?.syncState === 'draft' &&
       local.updatedAt > backendBlueprint.updated_time
     ) {
@@ -9554,8 +9595,14 @@ async function runSavedBlueprintOnBackend(
   if (options.triggerMode !== 'manual' && hasScheduleNode(blueprint.nodes)) {
     return synced
   }
-  await runBlueprint(synced.backendAgentId, synced.backendBlueprintId)
-  return synced
+  const started = await runBlueprint(
+    synced.backendAgentId,
+    synced.backendBlueprintId
+  )
+  return {
+    ...synced,
+    status: localBlueprintStatusFromBackend(started.status),
+  }
 }
 
 async function ensureCreatorStudioAgent() {

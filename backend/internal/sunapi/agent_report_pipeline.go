@@ -188,11 +188,7 @@ func collectAgentReportBrowserData(
 		createdTarget = !reusedTarget
 	}
 	if createdTarget {
-		defer func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = closeAgentBrowserTarget(cleanupCtx, endpoint, target.ID)
-		}()
+		defer makeAgentBrowserTargetCleanup(endpoint, target, true)()
 	}
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)

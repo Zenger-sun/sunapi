@@ -21,6 +21,7 @@ const (
 	agentXianyuReplyStateDir       = "agent-xianyu-reply-state"
 	agentXianyuReplyPollInterval   = 2 * time.Second
 	agentXianyuReplyEventCheck     = 500 * time.Millisecond
+	agentXianyuReplyCDPHeartbeat   = 15 * time.Second
 	agentXianyuReplyRetryDelay     = 30 * time.Second
 	agentXianyuReplyReconnectDelay = 5 * time.Second
 	// A realtime reply should not hold the buyer for a full minute. When the
@@ -30,10 +31,139 @@ const (
 	agentXianyuReplyDefaultDebounce = 10 * time.Second
 	agentXianyuReplyDefaultBatch    = 20
 	agentXianyuReplyDefaultMaxRunes = 300
+	// A session that stayed alive this long proved that the browser and
+	// listener were healthy; a later disconnect starts a fresh failure streak.
+	agentXianyuReplyHealthySessionWindow = time.Minute
 	// The listener stays responsive while two independent browser pages process
 	// conversations in parallel. This is per running reply node/session.
 	agentXianyuReplyWorkerCount = 2
 )
+
+// Keep the reply workload bounded across all blueprints in this process. The
+// per-session workers still provide isolation, while this gate prevents every
+// concurrently running blueprint from opening two model/browser jobs at once.
+var agentXianyuReplyGlobalSlots = make(chan struct{}, agentXianyuReplyWorkerCount)
+
+// Keep one CDP target per active worker. Reusing orphaned targets prevents a
+// restarted reply node from opening more visible tabs on every run.
+var agentXianyuReplyTargetReservations = struct {
+	sync.Mutex
+	ids map[string]struct{}
+}{ids: make(map[string]struct{})}
+
+// A browser profile is a shared resource. More than one reply node using the
+// same profile would otherwise each allocate a listener and two worker tabs.
+// Serializing at the profile level keeps the visible target count bounded and
+// still allows two conversations to be processed concurrently inside one
+// session.
+var agentXianyuReplySessionLocks = struct {
+	sync.Mutex
+	locks map[string]chan struct{}
+}{locks: make(map[string]chan struct{})}
+
+func acquireAgentXianyuReplySession(ctx context.Context, dataDir string, settings map[string]string) (func(), error) {
+	session := firstNonEmpty(settings["会话名称"], settings["session_name"], agentXianyuDefaultSession)
+	paths := resolveAgentBrowserSessionPaths(dataDir, session)
+	key := filepath.Clean(paths.ProfileDir)
+	agentXianyuReplySessionLocks.Lock()
+	lock := agentXianyuReplySessionLocks.locks[key]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		lock <- struct{}{}
+		agentXianyuReplySessionLocks.locks[key] = lock
+	}
+	agentXianyuReplySessionLocks.Unlock()
+	select {
+	case <-lock:
+		var releaseOnce sync.Once
+		return func() { releaseOnce.Do(func() { lock <- struct{}{} }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func agentXianyuReplyTargetReservationKey(endpoint string, target agentBrowserTarget) string {
+	return strings.TrimSpace(endpoint) + "\x00" + strings.TrimSpace(target.ID)
+}
+
+func reserveAgentXianyuReplyTarget(endpoint string, target agentBrowserTarget) bool {
+	key := agentXianyuReplyTargetReservationKey(endpoint, target)
+	if strings.HasSuffix(key, "\x00") {
+		return false
+	}
+	agentXianyuReplyTargetReservations.Lock()
+	defer agentXianyuReplyTargetReservations.Unlock()
+	if _, exists := agentXianyuReplyTargetReservations.ids[key]; exists {
+		return false
+	}
+	agentXianyuReplyTargetReservations.ids[key] = struct{}{}
+	return true
+}
+
+func releaseAgentXianyuReplyTarget(endpoint string, target agentBrowserTarget) {
+	key := agentXianyuReplyTargetReservationKey(endpoint, target)
+	if strings.HasSuffix(key, "\x00") {
+		return
+	}
+	agentXianyuReplyTargetReservations.Lock()
+	delete(agentXianyuReplyTargetReservations.ids, key)
+	agentXianyuReplyTargetReservations.Unlock()
+}
+
+func openAgentXianyuReplyTarget(ctx context.Context, endpoint, targetURL string) (agentBrowserTarget, bool, error) {
+	targets, err := listAgentBrowserTargets(ctx, endpoint)
+	if err != nil {
+		return agentBrowserTarget{}, false, err
+	}
+	matchingTargets := 0
+	matchingUnreserved := 0
+	var probeErr error
+	for _, target := range targets {
+		if target.Type != "page" || target.WebSocketDebuggerURL == "" || !agentBrowserTargetURLMatches(target.URL, targetURL) {
+			continue
+		}
+		matchingTargets++
+		if !reserveAgentXianyuReplyTarget(endpoint, target) {
+			continue
+		}
+		matchingUnreserved++
+		if err := probeAgentBrowserTarget(ctx, target); err != nil {
+			probeErr = err
+			releaseAgentXianyuReplyTarget(endpoint, target)
+			continue
+		}
+		log.WithFields(log.Fields{
+			"browser_endpoint": endpoint,
+			"target_id":        target.ID,
+			"target_url":       target.URL,
+		}).Debug("agent xianyu reply target reused")
+		return target, true, nil
+	}
+	// A matching target that failed a short CDP probe is usually a transient
+	// websocket/browser interruption. Do not close it and do not create a new
+	// tab: the next reconnect must get a chance to reuse the same page. New
+	// workers are still allowed to create pages when every matching target is
+	// already reserved by another active worker.
+	if matchingUnreserved > 0 && probeErr != nil {
+		return agentBrowserTarget{}, false, fmt.Errorf("闲鱼回复已有 %d 个页面，但调试通道暂时不可用: %w", matchingTargets, probeErr)
+	}
+	target, err := createAgentBrowserTarget(ctx, endpoint, targetURL)
+	if err != nil {
+		return agentBrowserTarget{}, false, err
+	}
+	if !reserveAgentXianyuReplyTarget(endpoint, target) {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = closeAgentBrowserTarget(cleanupCtx, endpoint, target.ID)
+		cancel()
+		return agentBrowserTarget{}, false, errors.New("闲鱼回复页面占用登记失败")
+	}
+	log.WithFields(log.Fields{
+		"browser_endpoint": endpoint,
+		"target_id":        target.ID,
+		"target_url":       target.URL,
+	}).Info("agent xianyu reply target created")
+	return target, false, nil
+}
 
 const agentXianyuReplyInstruction = `根据知识库、当前商品信息和最近对话回答当前闲鱼买家的最新消息。
 本节点是实时客服，覆盖通用组件的结构化输出要求；只输出可直接发送给买家的回复正文，不要输出分析、JSON、Markdown、标题或知识库来源。
@@ -63,6 +193,12 @@ type agentXianyuReplyObserverPayload struct {
 	Dirty           bool   `json:"dirty"`
 	UnreadCount     int    `json:"unread_count"`
 	UnreadSignature string `json:"unread_signature"`
+}
+
+type agentXianyuReplyConnectionPayload struct {
+	Interrupted  bool `json:"interrupted"`
+	Reconnected  bool `json:"reconnected"`
+	Reconnecting bool `json:"reconnecting"`
 }
 
 type agentXianyuReplySendPayload struct {
@@ -169,19 +305,27 @@ func executeAgentXianyuReplyGraphNode(
 		return failAgentXianyuNode(result, "闲鱼实时智能客服状态读取失败。", err.Error())
 	}
 	stats := &agentXianyuReplyStats{}
-
+	consecutiveFailures := 0
 	for {
 		if ctx.Err() != nil {
 			result.Message = "闲鱼实时智能客服已停止监听。"
 			result.Output = agentXianyuReplyStatsOutput(stats, baseIDs)
 			return result
 		}
+		sessionStarted := time.Now()
 		err = runAgentXianyuReplySession(ctx, store, bp, node, baseIDs, statePath, &state, stats)
 		if ctx.Err() != nil {
 			result.Message = "闲鱼实时智能客服已停止监听。"
 			result.Output = agentXianyuReplyStatsOutput(stats, baseIDs)
 			return result
 		}
+		if time.Since(sessionStarted) >= agentXianyuReplyHealthySessionWindow {
+			consecutiveFailures = 0
+		}
+		if err == nil {
+			err = errors.New("xianyu reply session ended")
+		}
+		consecutiveFailures++
 		stats.add(&stats.Reconnects, 1)
 		reconnects := stats.snapshot().Reconnects
 		log.WithError(err).WithFields(log.Fields{
@@ -189,10 +333,22 @@ func executeAgentXianyuReplyGraphNode(
 			"node_id":      node.ID,
 			"reconnects":   reconnects,
 		}).Warn("agent xianyu auto reply browser session interrupted; reconnecting")
-		if waitAgentXianyuDuration(ctx, agentXianyuReplyReconnectDelay) != nil {
+		delay := agentXianyuReplyReconnectDelayAfter(consecutiveFailures)
+		if waitAgentXianyuDuration(ctx, delay) != nil {
 			continue
 		}
 	}
+}
+
+func agentXianyuReplyReconnectDelayAfter(failures int) time.Duration {
+	delay := agentXianyuReplyReconnectDelay
+	for attempt := 1; attempt < failures && delay < time.Minute; attempt++ {
+		delay *= 2
+		if delay > time.Minute {
+			return time.Minute
+		}
+	}
+	return delay
 }
 
 func runAgentXianyuReplySession(
@@ -205,17 +361,30 @@ func runAgentXianyuReplySession(
 	state *agentXianyuReplyState,
 	stats *agentXianyuReplyStats,
 ) error {
+	releaseSession, err := acquireAgentXianyuReplySession(ctx, store.DataDir(), node.Data.Settings)
+	if err != nil {
+		return err
+	}
+	defer releaseSession()
+
 	listenerConn, sessionName, sourceURL, listenerCleanup, err := openAgentXianyuReplyPageWithTarget(ctx, store.DataDir(), node.Data.Settings, false)
 	if err != nil {
 		return err
 	}
+	stopListenerHeartbeat := startAgentXianyuCDPHeartbeat(ctx, listenerConn, nil)
+	defer stopListenerHeartbeat()
 	defer listenerConn.Close()
 	defer listenerCleanup()
 
 	workerConns := make([]*websocket.Conn, 0, agentXianyuReplyWorkerCount)
 	workerCleanups := make([]func(), 0, agentXianyuReplyWorkerCount)
+	workerHeartbeatStops := make([]func(), 0, agentXianyuReplyWorkerCount)
+	workerHeartbeatErrors := make(chan error, 1)
 	closeWorkers := func() {
 		for i := range workerConns {
+			if i < len(workerHeartbeatStops) && workerHeartbeatStops[i] != nil {
+				workerHeartbeatStops[i]()
+			}
 			_ = workerConns[i].Close()
 			if i < len(workerCleanups) && workerCleanups[i] != nil {
 				workerCleanups[i]()
@@ -230,6 +399,12 @@ func runAgentXianyuReplySession(
 		}
 		workerConns = append(workerConns, workerConn)
 		workerCleanups = append(workerCleanups, cleanup)
+		workerHeartbeatStops = append(workerHeartbeatStops, startAgentXianyuCDPHeartbeat(ctx, workerConn, func(heartbeatErr error) {
+			select {
+			case workerHeartbeatErrors <- heartbeatErr:
+			default:
+			}
+		}))
 	}
 
 	listSelector := firstNonEmpty(node.Data.Settings["对话列表选择器"], node.Data.Settings["会话列表选择器"])
@@ -259,7 +434,8 @@ func runAgentXianyuReplySession(
 	schedulerMu := &sync.Mutex{}
 	inFlight := make(map[string]struct{})
 	retryUntil := make(map[string]time.Time)
-	jobs := make(chan agentXianyuReplyJob, agentXianyuReplyWorkerCount*2)
+	jobs := make(chan agentXianyuReplyJob, agentXianyuReplyWorkerCount*4)
+	pendingJobs := make([]agentXianyuReplyJob, 0, agentXianyuReplyWorkerCount*4)
 	workerCtx, workerCancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	enqueue := func(job agentXianyuReplyJob) bool {
@@ -281,16 +457,30 @@ func runAgentXianyuReplySession(
 		select {
 		case jobs <- job:
 			return true
-		default:
-			schedulerMu.Lock()
-			delete(inFlight, identity)
-			schedulerMu.Unlock()
-			return false
 		case <-ctx.Done():
 			schedulerMu.Lock()
 			delete(inFlight, identity)
 			schedulerMu.Unlock()
 			return false
+		default:
+			// Keep the listener responsive when all workers are busy. The main
+			// loop flushes this backlog on every poll, so it can continue
+			// monitoring the active conversation and human takeover.
+			pendingJobs = append(pendingJobs, job)
+			return true
+		}
+	}
+	flushPending := func() {
+		for len(pendingJobs) > 0 {
+			select {
+			case jobs <- pendingJobs[0]:
+				pendingJobs = pendingJobs[1:]
+			case <-ctx.Done():
+				pendingJobs = nil
+				return
+			default:
+				return
+			}
 		}
 	}
 	for _, workerConn := range workerConns {
@@ -298,6 +488,8 @@ func runAgentXianyuReplySession(
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
+			idleKeepalive := time.NewTicker(2 * time.Second)
+			defer idleKeepalive.Stop()
 			workerCallID := 100
 			workerNextID := func() int {
 				workerCallID++
@@ -307,12 +499,49 @@ func runAgentXianyuReplySession(
 				select {
 				case <-workerCtx.Done():
 					return
+				case <-idleKeepalive.C:
+					// Idle workers are usually background tabs. Keep the renderer
+					// active and run the page watchdog without waiting for a job.
+					if err := activateAgentXianyuPage(workerCtx, workerConn, workerNextID()); err != nil {
+						select {
+						case workerHeartbeatErrors <- err:
+						default:
+						}
+						continue
+					}
+					if _, err := evaluateAgentXianyuJSON(workerCtx, workerConn, workerNextID(), buildAgentXianyuConnectionKeepaliveExpression(), agentXianyuReplyConnectionPayload{}); err != nil {
+						select {
+						case workerHeartbeatErrors <- err:
+						default:
+						}
+					}
 				case job, ok := <-jobs:
 					if !ok {
 						return
 					}
+					select {
+					case agentXianyuReplyGlobalSlots <- struct{}{}:
+					case <-workerCtx.Done():
+						return
+					}
 					identity := agentXianyuConversationIdentity(agentXianyuCandidateKey(job.candidate))
-					jobErr := processAgentXianyuReplyCandidate(workerCtx, workerConn, workerNextID, store, bp, node, baseIDs, statePath, state, stateMu, stats, job.candidate, job.previewHash, listSelector, messageSelector, messageScrollSelector, productSelector, inputSelector, sendSelector, conversationWait, replyDebounce, maxReplyRunes, job.allowUnknown)
+					var jobErr error
+					// A worker has its own seller-page websocket. Check it immediately
+					// before touching a conversation so a stale worker page cannot
+					// click or send behind a connection-error dialog.
+					if activationErr := activateAgentXianyuPage(workerCtx, workerConn, workerNextID()); activationErr != nil {
+						jobErr = activationErr
+					} else {
+						connection, connectionErr := evaluateAgentXianyuJSON(workerCtx, workerConn, workerNextID(), buildAgentXianyuConnectionKeepaliveExpression(), agentXianyuReplyConnectionPayload{})
+						if connectionErr != nil {
+							jobErr = connectionErr
+						} else if connection.Interrupted {
+							jobErr = errors.New("闲鱼工作页连接正在恢复")
+						} else {
+							jobErr = processAgentXianyuReplyCandidate(workerCtx, workerConn, workerNextID, store, bp, node, baseIDs, statePath, state, stateMu, stats, job.candidate, job.previewHash, listSelector, messageSelector, messageScrollSelector, productSelector, inputSelector, sendSelector, conversationWait, replyDebounce, maxReplyRunes, job.allowUnknown)
+						}
+					}
+					<-agentXianyuReplyGlobalSlots
 					schedulerMu.Lock()
 					delete(inFlight, identity)
 					if jobErr != nil && !errors.Is(jobErr, errAgentXianyuReplyBatchChanged) {
@@ -342,6 +571,9 @@ func runAgentXianyuReplySession(
 	lastCurrentConversationKey := ""
 	lastCurrentBatchHash := ""
 	monitorCurrentConversation := func() error {
+		if !defaultReplyEnabled {
+			return nil
+		}
 		currentPayload, err := evaluateAgentXianyuJSON(ctx, listenerConn, nextID(), buildAgentXianyuReplyLatestMessageExpression(messageSelector), agentXianyuReplyMessagePayload{})
 		if err != nil {
 			return err
@@ -365,7 +597,14 @@ func runAgentXianyuReplySession(
 			return nil
 		}
 		if currentBatchHash == lastCurrentBatchHash {
-			return nil
+			identity := agentXianyuConversationIdentity(currentKey)
+			schedulerMu.Lock()
+			_, inFlightNow := inFlight[identity]
+			retryAt, retryScheduled := retryUntil[identity]
+			schedulerMu.Unlock()
+			if inFlightNow || (retryScheduled && time.Now().Before(retryAt)) {
+				return nil
+			}
 		}
 		identity := agentXianyuConversationIdentity(currentKey)
 		stateMu.Lock()
@@ -390,6 +629,27 @@ func runAgentXianyuReplySession(
 		if err := waitAgentXianyuDuration(ctx, agentXianyuReplyEventCheck); err != nil {
 			return err
 		}
+		select {
+		case heartbeatErr := <-workerHeartbeatErrors:
+			return fmt.Errorf("闲鱼回复工作页心跳失败: %w", heartbeatErr)
+		default:
+		}
+		if err := activateAgentXianyuPage(ctx, listenerConn, nextID()); err != nil {
+			return err
+		}
+		connection, err := evaluateAgentXianyuJSON(ctx, listenerConn, nextID(), buildAgentXianyuConnectionKeepaliveExpression(), agentXianyuReplyConnectionPayload{})
+		if err != nil {
+			return err
+		}
+		if connection.Interrupted {
+			// Give the seller page a moment to finish its own websocket
+			// handshake. Keep the current conversation selected and do not scan
+			// or click another row during this recovery window. The page-level
+			// reconnect expression keeps retrying, so an unavailable button must
+			// not tear down the session and cause another page to be opened.
+			continue
+		}
+		flushPending()
 		observer, err := evaluateAgentXianyuJSON(ctx, listenerConn, nextID(), buildAgentXianyuReplyObserverStatusExpression(), agentXianyuReplyObserverPayload{})
 		if err != nil {
 			return err
@@ -407,11 +667,12 @@ func runAgentXianyuReplySession(
 			return err
 		}
 		now := time.Now()
-		// The inbox path is strictly unread-only. The active conversation path
-		// below remains independent so a buyer message in the already-open chat
-		// can be handled even after the site clears its unread badge.
-		scanUnread := (firstScan && observer.UnreadCount > 0) || (observer.UnreadCount > 0 &&
-			(lastUnreadScanAt.IsZero() || observer.Dirty || now.Sub(lastUnreadScanAt) >= pollInterval))
+		// The inbox path is strictly unread-only. Read the list on the normal
+		// polling cadence even when the observer count is zero: platform DOM
+		// changes can hide the badge from the observer while the candidate
+		// expression can still identify a real unread row. An empty result never
+		// clicks or changes conversation, so idle inboxes remain stationary.
+		scanUnread := firstScan || lastUnreadScanAt.IsZero() || observer.Dirty || now.Sub(lastUnreadScanAt) >= pollInterval
 		if scanUnread {
 			lastUnreadScanAt = now
 			stats.add(&stats.Scans, 1)
@@ -470,6 +731,7 @@ func runAgentXianyuReplySession(
 					return saveErr
 				}
 			}
+			flushPending()
 		}
 
 		firstScan = false
@@ -617,9 +879,20 @@ func processAgentXianyuReplyCandidate(
 		}).Warn("agent xianyu auto reply knowledge search failed; continuing with safe reply policy")
 		record.Error = "knowledge_search: " + knowledgeErr.Error()
 	}
+	styleMatches, styleErr := store.SearchKnowledgeForScope(ctx, bp.UserID, "账号级回复口吻 称呼 语气 句长 收尾", 2, scope)
+	if styleErr != nil {
+		log.WithError(styleErr).WithFields(log.Fields{
+			"blueprint_id": bp.ID,
+			"node_id":      node.ID,
+		}).Warn("agent xianyu auto reply style search failed")
+	} else {
+		matches = append(matches, styleMatches...)
+	}
+	matches = mergeAgentXianyuReplyKnowledgeMatches(matches, 8)
 	matches = filterAgentXianyuReplyKnowledgeMatches(matches, safeLatestForQuery, product.Title)
-	record.KnowledgeMatchCount = len(matches)
-	if len(matches) == 0 {
+	factMatches, styleKnowledgeMatches := splitAgentXianyuReplyKnowledgeMatches(matches)
+	record.KnowledgeMatchCount = len(factMatches)
+	if len(factMatches) == 0 {
 		stats.add(&stats.NoMatch, 1)
 	}
 
@@ -649,7 +922,7 @@ func processAgentXianyuReplyCandidate(
 	usedFallback := false
 	var modelErr error
 	var reply string
-	if len(matches) == 0 {
+	if len(factMatches) == 0 {
 		// No knowledge hit is an expected state for a new product/question. Do
 		// not spend up to a minute asking the model to invent an answer; send the
 		// safe clarification immediately and let later knowledge updates improve
@@ -658,7 +931,8 @@ func processAgentXianyuReplyCandidate(
 		usedFallback = true
 		record.Status = "no_knowledge_match"
 	} else {
-		replyNode.Data.Description += buildAgentXianyuReplyKnowledgeContext(matches)
+		contextMatches := append(factMatches, styleKnowledgeMatches...)
+		replyNode.Data.Description += buildAgentXianyuReplyKnowledgeContext(contextMatches)
 		record.ModelStartedAt = time.Now().UnixMilli()
 		reply, modelErr = callAgentXianyuReplyWithHumanMonitor(ctx, conn, nextID, messageSelector, payload, func(modelCtx context.Context) (string, error) {
 			return callLLMForAgentNodeWithPolicy(modelCtx, store, bp, replyNode, map[string]interface{}{
@@ -672,7 +946,7 @@ func processAgentXianyuReplyCandidate(
 				"product_description":          firstNonEmpty(product.Description, product.Text),
 				"product_status":               firstNonEmpty(product.Status, product.Availability),
 				"product_availability":         product.Availability,
-				"knowledge_match_count":        len(matches),
+				"knowledge_match_count":        len(factMatches),
 			}, map[string]interface{}{"knowledge_disabled": true}, agentXianyuReplyRequestTimeout, 2)
 		})
 		record.ModelCompletedAt = time.Now().UnixMilli()
@@ -737,6 +1011,14 @@ func processAgentXianyuReplyCandidate(
 		return err
 	}
 	currentBatch := agentXianyuReplyUnansweredCustomerMessages(currentPayload.Messages, allowUnknownLatest)
+	if agentXianyuReplyHumanMessageAppeared(payload, currentPayload) {
+		// A seller message can arrive between model completion and this final
+		// read. Treat it as a takeover even when the buyer batch is unchanged,
+		// so an outdated draft is never sent after human handling.
+		record.Status = "interrupted_by_human"
+		record.Error = "human seller reply appeared before automatic reply was sent"
+		return errAgentXianyuReplyInterruptedByHuman
+	}
 	if agentXianyuReplyBatchHash(candidate.Key, currentBatch) != incomingHash {
 		// Do not send a draft for an incomplete burst. The next scan will observe
 		// the changed preview, wait for another quiet window, and analyze it anew.
@@ -771,7 +1053,7 @@ func processAgentXianyuReplyCandidate(
 	confirmErr := error(nil)
 	if waitAgentXianyuDuration(ctx, agentXianyuHistoryQuietPeriod) == nil {
 		confirmation, confirmErr = evaluateAgentXianyuJSON(ctx, conn, nextID(), buildAgentXianyuReplyLatestMessageExpression(messageSelector), agentXianyuReplyMessagePayload{})
-		verified = confirmErr == nil && confirmation.Latest.Direction == "self" && strings.TrimSpace(confirmation.Latest.Text) == strings.TrimSpace(reply)
+		verified = confirmErr == nil && normalizeAgentXianyuMessageDirection(confirmation.Latest.Direction) == "seller" && strings.TrimSpace(confirmation.Latest.Text) == strings.TrimSpace(reply)
 	}
 
 	// A knowledge-backed answer gets one bounded quality check after it is sent.
@@ -780,17 +1062,32 @@ func processAgentXianyuReplyCandidate(
 	followUpReply := ""
 	followUpError := error(nil)
 	handledIncomingHash := incomingHash
-	if !usedFallback && len(matches) > 0 && !entry.FollowUpUsed && confirmErr == nil && strings.EqualFold(strings.TrimSpace(confirmation.Latest.Direction), "customer") && strings.TrimSpace(confirmation.Latest.Text) != "" {
-		entry.FollowUpUsed = true
-		reviewPayload := payload
-		reviewLatestText := latestText
-		// If the buyer sent a new message while the first answer was being
-		// confirmed, use that message as the one allowed follow-up target.
-		reviewPayload = confirmation
-		reviewLatestText = confirmation.Latest.Text
-		followUpReply, followUpError = callAgentXianyuReplyWithHumanMonitor(ctx, conn, nextID, messageSelector, confirmation, func(reviewCtx context.Context) (string, error) {
-			return reviewAgentXianyuReplyOnce(reviewCtx, store, bp, replyNode, matches, reviewPayload, reviewLatestText, reply, product, maxReplyRunes)
-		})
+	if !usedFallback && len(matches) > 0 && !entry.FollowUpUsed && confirmErr == nil && normalizeAgentXianyuMessageDirection(confirmation.Latest.Direction) == "customer" && strings.TrimSpace(confirmation.Latest.Text) != "" {
+		// The confirmation read may contain the first message of a new burst.
+		// Reuse the same quiet-window collector before asking the model again so
+		// every buyer message in that burst is answered together.
+		reviewPayload, reviewPending, reviewIncomingHash, waitErr := waitForAgentXianyuReplyBatch(ctx, conn, nextID, messageSelector, confirmation, candidate.Key, allowUnknownLatest, replyDebounce)
+		if waitErr != nil {
+			followUpError = waitErr
+		} else if len(reviewPending) > 0 {
+			entry.FollowUpUsed = true
+			reviewLatestText := agentXianyuReplyBatchText(reviewPending)
+			followUpReply, followUpError = callAgentXianyuReplyWithHumanMonitor(ctx, conn, nextID, messageSelector, reviewPayload, func(reviewCtx context.Context) (string, error) {
+				return reviewAgentXianyuReplyOnce(reviewCtx, store, bp, replyNode, matches, reviewPayload, reviewLatestText, reply, product, maxReplyRunes)
+			})
+			if followUpError == nil && strings.TrimSpace(followUpReply) != "" && agentXianyuReplyHash(followUpReply) != agentXianyuReplyHash(reply) {
+				// Apply the same final guard as the first reply before sending the
+				// follow-up draft.
+				latestReviewPayload, readErr := evaluateAgentXianyuJSON(ctx, conn, nextID(), buildAgentXianyuReplyLatestMessageExpression(messageSelector), agentXianyuReplyMessagePayload{})
+				if readErr != nil {
+					followUpError = readErr
+				} else if agentXianyuReplyHumanMessageAppeared(reviewPayload, latestReviewPayload) {
+					followUpError = errAgentXianyuReplyInterruptedByHuman
+				} else if latestReviewPending := agentXianyuReplyUnansweredCustomerMessages(latestReviewPayload.Messages, allowUnknownLatest); agentXianyuReplyBatchHash(candidate.Key, latestReviewPending) != reviewIncomingHash {
+					followUpError = errAgentXianyuReplyBatchChanged
+				}
+			}
+		}
 		if followUpError != nil {
 			if errors.Is(followUpError, errAgentXianyuReplyInterruptedByHuman) {
 				record.Error = firstNonEmpty(record.Error, "reply_review_interrupted_by_human")
@@ -811,7 +1108,7 @@ func processAgentXianyuReplyCandidate(
 				record.FollowUpReply = followUpReply
 				record.FollowUpSentAt = time.Now().UnixMilli()
 				record.FinalReply = followUpReply
-				followUpMessages := agentXianyuReplyUnansweredCustomerMessages(confirmation.Messages, allowUnknownLatest)
+				followUpMessages := reviewPending
 				if len(followUpMessages) > 0 {
 					handledIncomingHash = agentXianyuReplyBatchHash(candidate.Key, followUpMessages)
 				}
@@ -881,6 +1178,44 @@ func openAgentXianyuReplyWorkerPage(ctx context.Context, dataDir string, setting
 	return conn, cleanup, err
 }
 
+// startAgentXianyuCDPHeartbeat keeps an otherwise idle DevTools websocket
+// alive through proxies and browser-side idle timeouts. WriteControl is safe
+// while the main loop is issuing normal CDP requests; a failed ping closes the
+// connection so the existing session supervisor can reconnect cleanly.
+func startAgentXianyuCDPHeartbeat(ctx context.Context, conn *websocket.Conn, onFailure func(error)) func() {
+	if conn == nil {
+		return func() {}
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	var once sync.Once
+	stop := func() { once.Do(cancel) }
+	go func() {
+		ticker := time.NewTicker(agentXianyuReplyCDPHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				deadline := time.Now().Add(5 * time.Second)
+				if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					if onFailure != nil {
+						onFailure(err)
+					}
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	return stop
+}
+
+func activateAgentXianyuPage(ctx context.Context, conn *websocket.Conn, id int) error {
+	_, err := agentBrowserCDPCall(ctx, conn, id, "Page.setWebLifecycleState", map[string]any{"state": "active"})
+	return err
+}
+
 func openAgentXianyuReplyPageWithTarget(ctx context.Context, dataDir string, settings map[string]string, forceNew bool) (*websocket.Conn, string, string, func(), error) {
 	targetURL, err := normalizeAgentXianyuURL(firstNonEmpty(settings["网址"], settings["URL"], agentXianyuDefaultURL))
 	if err != nil {
@@ -888,27 +1223,33 @@ func openAgentXianyuReplyPageWithTarget(ctx context.Context, dataDir string, set
 	}
 	session := firstNonEmpty(settings["会话名称"], agentXianyuDefaultSession)
 	paths := resolveAgentBrowserSessionPaths(dataDir, session)
-	endpoint, err := ensureAgentBrowserDevtoolsForSession(ctx, paths)
+	endpoint, err := ensureAgentBrowserDevtoolsForSessionWithInitialURL(ctx, paths, targetURL)
 	if err != nil {
 		return nil, paths.Name, targetURL, nil, err
 	}
 	var target agentBrowserTarget
 	reused := false
-	if forceNew {
-		target, err = createAgentBrowserTarget(ctx, endpoint, targetURL)
-	} else {
-		target, reused, err = openAgentBrowserTarget(ctx, endpoint, targetURL)
-	}
+	// forceNew is retained for the component API, but reply workers now reuse
+	// unreserved matching targets first. This avoids tab growth after retries or
+	// process restarts while still creating an isolated target when necessary.
+	_ = forceNew
+	target, reused, err = openAgentXianyuReplyTarget(ctx, endpoint, targetURL)
 	if err != nil {
 		return nil, paths.Name, targetURL, nil, err
 	}
-	cleanupTarget := func() {}
-	if forceNew || !reused {
-		cleanupTarget = func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = closeAgentBrowserTarget(cleanupCtx, endpoint, target.ID)
-			cancel()
-		}
+	// Keep every reply target across reconnects and select it by URL on the
+	// next session. Closing a newly-created listener target here would make the
+	// next reconnect claim a worker target and create one more visible tab.
+	// The target pool is intentionally bounded by the listener plus the two
+	// reserved workers for this process.
+	owned := false
+	baseCleanup := makeAgentBrowserTargetCleanup(endpoint, target, owned)
+	var cleanupOnce sync.Once
+	cleanupTarget := func() {
+		cleanupOnce.Do(func() {
+			releaseAgentXianyuReplyTarget(endpoint, target)
+			baseCleanup()
+		})
 	}
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
@@ -926,10 +1267,24 @@ func openAgentXianyuReplyPageWithTarget(ctx context.Context, dataDir string, set
 	if _, err := agentBrowserCDPCall(ctx, conn, 2, "Runtime.enable", nil); err != nil {
 		return closeWithError(err)
 	}
+	// Install the page-level watchdog before navigation. Unlike the Go polling
+	// loop, this script keeps checking while the tab is idle or backgrounded,
+	// and it is automatically reinstalled after a page reload.
+	if _, err := agentBrowserCDPCall(ctx, conn, 3, "Page.addScriptToEvaluateOnNewDocument", map[string]any{
+		"source": buildAgentXianyuConnectionKeepaliveExpression(),
+	}); err != nil {
+		return closeWithError(err)
+	}
+	if _, err := agentBrowserCDPCall(ctx, conn, 4, "Runtime.evaluate", map[string]any{
+		"expression":    buildAgentXianyuConnectionKeepaliveExpression(),
+		"returnByValue": true,
+	}); err != nil {
+		return closeWithError(err)
+	}
 	// Reuse the already-open seller page without refreshing it. Reloading here
 	// loses the precise message-list position and can retrigger platform checks.
 	if !reused {
-		if _, err := agentBrowserCDPCall(ctx, conn, 3, "Page.navigate", map[string]any{"url": targetURL}); err != nil {
+		if _, err := agentBrowserCDPCall(ctx, conn, 5, "Page.navigate", map[string]any{"url": targetURL}); err != nil {
 			return closeWithError(err)
 		}
 	}
@@ -982,6 +1337,64 @@ func buildAgentXianyuReplyObserverInstallExpression(selector string) string {
 })()`, selectorJSON)
 }
 
+func buildAgentXianyuConnectionKeepaliveExpression() string {
+	return `(() => {
+ const run = () => {
+   const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+   const visible = el => { const r=el.getBoundingClientRect(),s=getComputedStyle(el); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };
+   const body = clean(document.body && (document.body.innerText || document.body.textContent));
+   const interruptionPattern = /(\u8fde\u63a5\u4e2d\u65ad|\u8fde\u63a5\u65ad\u5f00|\u8bf7\u91cd\u8fde|connection\s+lost|connection\s+interrupted|disconnected)/i;
+   const dialogCandidates = [...document.querySelectorAll('[role="dialog"],[role="alert"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"]')].filter(visible);
+   const dialog = dialogCandidates.find(el => interruptionPattern.test(clean(el.innerText || el.textContent)));
+   const interrupted = Boolean(dialog) || interruptionPattern.test(body);
+   if (!interrupted) {
+     window.__sunapiXianyuReconnectAt = 0;
+     window.__sunapiXianyuReconnectAttempts = 0;
+     window.__sunapiXianyuReconnectStartedAt = 0;
+     window.__sunapiXianyuReconnectReloadAt = 0;
+     return {interrupted:false,reconnected:false,reconnecting:false};
+   }
+   const now = Date.now();
+   const lastReconnect = Number(window.__sunapiXianyuReconnectAt || 0);
+   const reconnectAttempts = Number(window.__sunapiXianyuReconnectAttempts || 0);
+   const startedAt = Number(window.__sunapiXianyuReconnectStartedAt || now);
+   if (!window.__sunapiXianyuReconnectStartedAt) window.__sunapiXianyuReconnectStartedAt = startedAt;
+   if (lastReconnect && now-lastReconnect < 5000) return {interrupted:true,reconnected:false,reconnecting:true};
+   const lastReload = Number(window.__sunapiXianyuReconnectReloadAt || 0);
+   // A visible reconnect button can remain present even after repeated clicks
+   // fail. Reload before clicking it forever so the business websocket gets a
+   // clean page lifecycle and the same target can recover unattended.
+   if (now-startedAt >= 20000 && (!lastReload || now-lastReload >= 60000)) {
+     window.__sunapiXianyuReconnectReloadAt = now;
+     try { window.location.reload(); } catch (_) {}
+     return {interrupted:true,reconnected:false,reconnecting:true,reloaded:true};
+   }
+   const buttons = [...document.querySelectorAll('button,[role="button"],a,[tabindex]')].filter(visible);
+   const reconnect = buttons.find(el => /(\u91cd\u8fde|\u91cd\u65b0\u8fde\u63a5|retry|reconnect)/i.test(clean(el.innerText || el.textContent || el.getAttribute('aria-label'))));
+   if (reconnect) try {
+     window.__sunapiXianyuReconnectAt = now;
+     window.__sunapiXianyuReconnectAttempts = lastReconnect && now-lastReconnect < 30000 ? reconnectAttempts + 1 : 1;
+     if (typeof reconnect.click === 'function') reconnect.click();
+     else reconnect.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
+     return {interrupted:true,reconnected:true,reconnecting:true};
+   } catch (_) {}
+   // Some versions render the reconnect control outside the visible dialog or
+   // omit it while the transport is dead. Reload this same page at a low rate
+   // so its websocket can be rebuilt without creating another browser tab.
+   return {interrupted:true,reconnected:false,reconnecting:true};
+ };
+ // Install a page-local watchdog once. This runs even when the Go polling
+ // loop is busy or the seller page receives no user interaction.
+ if (!window.__sunapiXianyuReconnectWatchdog) {
+   window.__sunapiXianyuReconnectWatchdog = true;
+   window.__sunapiXianyuReconnectTimer = window.setInterval(() => {
+     try { run(); } catch (_) {}
+   }, 2000);
+ }
+ return JSON.stringify(run());
+})()`
+}
+
 func buildAgentXianyuReplyObserverStatusExpression() string {
 	return `(() => {
  const installed = Boolean(window.__sunapiXianyuObserver);
@@ -992,6 +1405,10 @@ func buildAgentXianyuReplyObserverStatusExpression() string {
  const selectors = ['[data-conversation-id]','[data-session-id]','[data-testid*="conversation"]','[class*="conversation-item"]','[class*="session-item"]','[class*="chat-item"]','[class*="contact-item"]','[class*="list-item"]','[class*="listItem"]','[class*="message-item"]','[class*="item-row"]','[class*="itemRow"]','[role="listitem"]','[role="option"]'];
  const unreadOf = el => {
    if (!el) return false;
+   const rowText = clean(el.innerText || el.textContent);
+   const firstLine = rowText.split(/\n+/).map(value => clean(value)).find(Boolean) || '';
+   const systemTitle = /^(?:\u901a\u77e5\u6d88\u606f|\u7cfb\u7edf\u6d88\u606f|\u5e73\u53f0\u6d88\u606f|\u516c\u544a|\u6d3b\u52a8\u901a\u77e5|\u7269\u6d41\u901a\u77e5|\u8ba2\u5355\u901a\u77e5|\u6d88\u606f\u901a\u77e5|\u95f2\u9c7c\u5b98\u65b9\u5c0f\u4e8c)(?:\s*\d+)?$/i.test(firstLine) || /(?:notification|system message|notice|\u5b98\u65b9\u5c0f\u4e8c)/i.test(firstLine);
+   if (systemTitle) return false;
    const value = clean(el.getAttribute && (el.getAttribute('data-unread-count') || el.getAttribute('data-unread') || el.getAttribute('aria-label')));
    const cls = String(el.className || '');
    const child = [...(el.querySelectorAll ? el.querySelectorAll('[data-unread-count],[data-unread],[class*="unread"],[class*="Unread"]') : [])].some(item => { const v=clean(item.getAttribute('data-unread-count') || item.getAttribute('data-unread') || item.textContent); return v !== '' && v !== '0' && v !== 'false'; });
@@ -999,7 +1416,9 @@ func buildAgentXianyuReplyObserverStatusExpression() string {
 	   const rect=item.getBoundingClientRect(),style=getComputedStyle(item,pseudo),text=clean(item.textContent),content=String(style.content||'').replace(/[\"']/g,'').trim();
 	   const width=pseudo?(parseFloat(style.width)||0):rect.width,height=pseudo?(parseFloat(style.height)||0):rect.height;
 	   if(width<3||height<3||width>34||height>34)return false;
-	   if(text!==''&&!/^\d{1,2}$/.test(text)&&(!pseudo||!/^\d{1,2}$/.test(content)))return false;
+	   const numeric=/^\d{1,2}$/.test(text)||(pseudo&&/^\d{1,2}$/.test(content));
+	   const hint=/(unread|un-read|new-message|newMessage|badge|count|dot)/i.test(String(item.className||'')+' '+String(item.getAttribute&&item.getAttribute('aria-label')||''));
+	   if(!numeric&&!hint)return false;
 		 if(pseudo&&(content==='none'||content==='normal'))return false;
 	   const colors=(style.backgroundColor+' '+style.color).match(/\d+/g)||[];
 	   for(let i=0;i+2<colors.length;i+=3){const r=Number(colors[i]),g=Number(colors[i+1]),b=Number(colors[i+2]);if(r>180&&g<150&&b<150)return true;}
@@ -1012,6 +1431,13 @@ func buildAgentXianyuReplyObserverStatusExpression() string {
 	 if (root) for (const query of selectors) { try { rows.push(...root.querySelectorAll(query)); } catch (_) {} }
 	 if (root) { try { rows.push(...root.querySelectorAll('li,button,[role="listitem"],[role="option"],[data-id],[class*="item"],[class*="Item"]')); } catch (_) {} }
 	rows = [...new Set(rows)].filter(unreadOf);
+ const seen = new Set();
+ rows = rows.filter((el,index) => {
+   const key = clean(el.getAttribute('data-conversation-id') || el.getAttribute('data-session-id') || el.getAttribute('data-sunapi-xianyu-key') || (clean(el.innerText || el.textContent).split(/\n+/)[0]) || index);
+   if (!key || seen.has(key)) return false;
+   seen.add(key);
+   return true;
+ });
  const signature = rows.map((el,index) => clean(el.getAttribute('data-conversation-id') || el.getAttribute('data-session-id') || el.getAttribute('data-sunapi-xianyu-key') || el.innerText || index)).join('|');
  window.__sunapiXianyuDirty = false;
  return JSON.stringify({installed,connected,dirty,unread_count:rows.length,unread_signature:signature});
@@ -1041,8 +1467,12 @@ func buildAgentXianyuReplyLatestMessageExpression(selector string) string {
    let bubble=row,bubbleArea=Infinity; for(const el of row.querySelectorAll('div,span,p')){if(!visible(el))continue;const value=textOnly(el);if(!value||(!value.includes(text)&&!text.includes(value)))continue;const r=el.getBoundingClientRect(),area=r.width*r.height;if(r.width<root.getBoundingClientRect().width*.82&&area<bubbleArea){bubble=el;bubbleArea=area;}}
    const rr=root.getBoundingClientRect(),br=bubble.getBoundingClientRect(),delta=(br.left+br.width/2)-(rr.left+rr.width/2);
    if(delta>rr.width*.08)return 'self'; if(delta<rr.width*-.08)return 'customer'; return 'unknown';
- };
+  };
+  const isSystemMessage = (row,text) => { const attrs=[row.getAttribute('data-message-type'),row.getAttribute('data-type'),row.getAttribute('data-sender-type'),row.getAttribute('aria-label'),String(row.className||'')].join(' '); return /(?:system|notice|notification|official|platform-message|\u5b98\u65b9\u5c0f\u4e8c)/i.test(attrs) || /(?:\u6b64\u6d88\u606f\u4e0d\u652f\u6301\u5728PC\u7aef\u6d4f\u89c8|\u7cfb\u7edf\u6d88\u606f|\u901a\u77e5\u6d88\u606f|\u5e73\u53f0\u6d88\u606f)/.test(text); };
+ rows = rows.filter(row => !isSystemMessage(row,textOnly(row)));
  const messages=[]; rows.forEach((row,index)=>{const text=textOnly(row);if(!text||/^(\d{1,2}:\d{2}|\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}(\s+\d{1,2}:\d{2})?|已读|未读)$/.test(text))return;const direction=directionOf(row,text);const key=String(row.getAttribute('data-message-id')||row.getAttribute('data-msg-id')||row.getAttribute('data-id')||index);messages.push({key,text:text.slice(0,2000),direction});});
+	const systemText=/(?:\u6b64\u6d88\u606f\u4e0d\u652f\u6301\u5728PC\u7aef\u6d4f\u89c8|\u7cfb\u7edf\u6d88\u606f|\u901a\u77e5\u6d88\u606f|\u5e73\u53f0\u6d88\u606f)/;
+	for(let i=messages.length-1;i>=0;i--){if(systemText.test(messages[i].text))messages.splice(i,1);}
 	const recent=messages.slice(-50); let latest=recent[recent.length-1]||{text:'',direction:'unknown'}; for(let i=recent.length-1;i>=0;i--){if(recent[i].direction==='customer'||recent[i].direction==='self'){latest=recent[i];break;}}
  return JSON.stringify({url:location.href||'',title:document.title||'',messages:recent,latest,container_found:true});
 })()`, selectorJSON)
@@ -1073,6 +1503,7 @@ func buildAgentXianyuCurrentConversationExpression(selector string) string {
  const lines = linesOf(row.innerText || row.textContent);
  const text = lines.join(' ');
  const title = lines[0] || '';
+ if (/^(?:通知消息|系统消息|平台消息|公告|活动通知|物流通知|订单通知|消息通知|闲鱼官方小二)(?:\s*\d+)?$/i.test(title) || /(?:notification|system message|notice|官方小二)/i.test(title)) return JSON.stringify({});
  const stableID = clean(row.getAttribute('data-conversation-id') || row.getAttribute('data-session-id') || row.getAttribute('href') || row.getAttribute('data-sunapi-xianyu-key') || row.getAttribute('data-id'));
  const unreadValue = clean(row.getAttribute('data-unread-count') || row.getAttribute('data-unread') || row.getAttribute('aria-label'));
  const unread = /(unread|un-read|new-message|newMessage)/i.test(String(row.className || '')) || (unreadValue !== '' && unreadValue !== '0' && unreadValue !== 'false' && /(^|\\D)[1-9]\\d*/.test(unreadValue));
@@ -1145,13 +1576,27 @@ func agentXianyuReplyMessageSignature(message agentXianyuReplyMessage) string {
 }
 
 func agentXianyuReplyLatestSelfSignature(payload agentXianyuReplyMessagePayload) string {
+	sellerCount := 0
+	latest := agentXianyuReplyMessage{}
 	for i := len(payload.Messages) - 1; i >= 0; i-- {
 		message := payload.Messages[i]
-		if strings.EqualFold(strings.TrimSpace(message.Direction), "self") && strings.TrimSpace(message.Text) != "" {
-			return agentXianyuReplyMessageSignature(message)
+		if normalizeAgentXianyuMessageDirection(message.Direction) == "seller" && strings.TrimSpace(message.Text) != "" {
+			sellerCount++
+			if latest.Text == "" {
+				latest = message
+			}
 		}
 	}
-	return ""
+	if strings.TrimSpace(latest.Text) == "" {
+		return ""
+	}
+	if strings.TrimSpace(latest.Key) == "" {
+		// Some pages do not expose message IDs. Include the seller-message
+		// count so a repeated manual reply is still detected, while a buyer
+		// follow-up or a shifting virtualized list does not look like takeover.
+		return agentXianyuReplyHash(strings.TrimSpace(latest.Text) + "\n" + fmt.Sprintf("%d", sellerCount))
+	}
+	return agentXianyuReplyMessageSignature(latest)
 }
 
 func agentXianyuReplyHumanMessageAppeared(before, after agentXianyuReplyMessagePayload) bool {
@@ -1209,6 +1654,9 @@ func callAgentXianyuReplyWithHumanMonitor(
 }
 
 func shouldProcessAgentXianyuCandidate(candidate agentXianyuConversationCandidate, entry agentXianyuReplyConversationState, exists bool, previewHash string, defaultReplyEnabled bool) bool {
+	if !defaultReplyEnabled {
+		return false
+	}
 	if !exists {
 		return candidate.Unread
 	}
@@ -1218,26 +1666,51 @@ func shouldProcessAgentXianyuCandidate(candidate agentXianyuConversationCandidat
 	return defaultReplyEnabled && shouldResumeAgentXianyuReply(entry.Status)
 }
 
+func isAgentXianyuSystemMessage(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return false
+	}
+	for _, phrase := range []string{
+		"\u6b64\u6d88\u606f\u4e0d\u652f\u6301\u5728pc\u7aef\u6d4f\u89c8",
+		"\u7cfb\u7edf\u6d88\u606f",
+		"\u901a\u77e5\u6d88\u606f",
+		"\u5e73\u53f0\u6d88\u606f",
+	} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 func agentXianyuReplyUnansweredCustomerMessages(messages []agentXianyuReplyMessage, allowUnknownLatest bool) []agentXianyuReplyMessage {
 	lastSellerMessage := -1
 	lastMessage := -1
 	for i, message := range messages {
-		if strings.TrimSpace(message.Text) == "" {
+		if strings.TrimSpace(message.Text) == "" || isAgentXianyuSystemMessage(message.Text) {
 			continue
 		}
 		lastMessage = i
-		if strings.EqualFold(strings.TrimSpace(message.Direction), "self") {
+		if normalizeAgentXianyuMessageDirection(message.Direction) == "seller" {
 			lastSellerMessage = i
 		}
 	}
+	// When the page exposes a reliable seller message boundary, unknown-side
+	// rows after that boundary are part of the same buyer burst. Keeping all of
+	// them preserves context for consecutive messages even when a row's CSS
+	// alignment or direction attribute is temporarily unavailable. With no
+	// seller boundary, only the latest unknown row is safe to consider inbound;
+	// older unknown rows may be historical seller messages.
+	includeUnknownBatch := allowUnknownLatest && lastSellerMessage >= 0
 	pending := make([]agentXianyuReplyMessage, 0, len(messages))
 	for i := lastSellerMessage + 1; i <= lastMessage; i++ {
 		message := messages[i]
-		if strings.TrimSpace(message.Text) == "" {
+		if strings.TrimSpace(message.Text) == "" || isAgentXianyuSystemMessage(message.Text) {
 			continue
 		}
-		direction := strings.ToLower(strings.TrimSpace(message.Direction))
-		if direction == "customer" || (allowUnknownLatest && i == lastMessage && direction == "unknown") {
+		direction := normalizeAgentXianyuMessageDirection(message.Direction)
+		if direction == "customer" || (allowUnknownLatest && direction == "unknown" && (includeUnknownBatch || i == lastMessage)) {
 			message.Direction = "customer"
 			pending = append(pending, message)
 		}
@@ -1348,7 +1821,21 @@ func filterAgentXianyuReplyKnowledgeMatches(matches []KnowledgeSearchMatch, late
 		if strings.TrimSpace(redactAgentXianyuText(match.Content)) == "" {
 			continue
 		}
+		if isAgentXianyuStyleKnowledgeMatch(match) {
+			filtered = append(filtered, match)
+			continue
+		}
 		text := strings.ToLower(strings.Join([]string{match.KnowledgeBaseName, match.Filename, match.Content}, " "))
+		if strings.HasPrefix(match.Filename, agentXianyuProductFilenamePrefix) {
+			// Product documents contain generic terms such as price and
+			// availability. Only use the document when the current detail pane
+			// identifies the same product, otherwise facts can bleed across
+			// products with similar questions.
+			if normalizedTitle != "" && strings.Contains(text, normalizedTitle) {
+				filtered = append(filtered, match)
+			}
+			continue
+		}
 		if strings.HasPrefix(match.Filename, "闲鱼客服知识-") {
 			if normalizedTitle != "" && strings.Contains(text, normalizedTitle) {
 				filtered = append(filtered, match)
@@ -1360,6 +1847,50 @@ func filterAgentXianyuReplyKnowledgeMatches(matches []KnowledgeSearchMatch, late
 		}
 	}
 	return filtered
+}
+
+// splitAgentXianyuReplyKnowledgeMatches keeps account style guidance separate
+// from product facts. Style can shape a grounded answer, but it must never
+// make an otherwise unknown product question look answerable.
+func splitAgentXianyuReplyKnowledgeMatches(matches []KnowledgeSearchMatch) (facts, styles []KnowledgeSearchMatch) {
+	facts = make([]KnowledgeSearchMatch, 0, len(matches))
+	styles = make([]KnowledgeSearchMatch, 0, len(matches))
+	for _, match := range matches {
+		if isAgentXianyuStyleKnowledgeMatch(match) {
+			styles = append(styles, match)
+			continue
+		}
+		facts = append(facts, match)
+	}
+	return facts, styles
+}
+
+func isAgentXianyuStyleKnowledgeMatch(match KnowledgeSearchMatch) bool {
+	filename := strings.ToLower(strings.TrimSpace(match.Filename))
+	return filename == strings.ToLower(agentXianyuStyleDocumentFilename) || strings.Contains(filename, "口吻") || strings.Contains(filename, "style")
+}
+
+func mergeAgentXianyuReplyKnowledgeMatches(matches []KnowledgeSearchMatch, limit int) []KnowledgeSearchMatch {
+	if limit <= 0 {
+		limit = 8
+	}
+	result := make([]KnowledgeSearchMatch, 0, min(limit, len(matches)))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		key := strings.Join([]string{match.DocumentID, fmt.Sprintf("%d", match.ChunkIndex), match.Filename}, "\n")
+		if strings.TrimSpace(key) == "" {
+			key = strings.TrimSpace(match.Content)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, match)
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result
 }
 
 func agentXianyuReplyTermsRelevant(text string, terms []string) bool {
@@ -1394,7 +1925,11 @@ func buildAgentXianyuReplyKnowledgeContext(matches []KnowledgeSearchMatch) strin
 		if content == "" {
 			continue
 		}
-		builder.WriteString(fmt.Sprintf("\n[知识片段 %d]\n%s\n", match.ChunkIndex+1, content))
+		label := "知识片段"
+		if isAgentXianyuStyleKnowledgeMatch(match) {
+			label = "账号回复口吻"
+		}
+		builder.WriteString(fmt.Sprintf("\n[%s %d]\n%s\n", label, match.ChunkIndex+1, content))
 	}
 	return builder.String()
 }
@@ -1486,12 +2021,11 @@ func agentXianyuReplyContainsPrivateData(value string) bool {
 }
 
 func shouldResumeAgentXianyuReply(status string) bool {
-	switch strings.TrimSpace(status) {
-	case "model_declined", "no_knowledge_match":
+	status = strings.TrimSpace(status)
+	if status == "model_declined" || status == "no_knowledge_match" || status == "send_error" {
 		return true
-	default:
-		return false
 	}
+	return strings.HasPrefix(status, "send_")
 }
 
 func buildAgentXianyuFallbackReply(latestText string, product agentXianyuProductContext, maxRunes int) string {

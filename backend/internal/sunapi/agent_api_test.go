@@ -1,6 +1,12 @@
 package sunapi
 
-import "testing"
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+)
 
 func TestMergeAgentWebhookInputPreservesBlueprintKnowledgeScope(t *testing.T) {
 	vars := map[string]interface{}{
@@ -32,5 +38,35 @@ func TestMergeAgentWebhookInputPreservesBlueprintKnowledgeScope(t *testing.T) {
 	}
 	if merged["webhook_body"] == "stale" || merged["webhook_method"] != "POST" || merged["webhook_path"] != "/hooks/support" {
 		t.Fatalf("webhook fields were not overlaid: %#v", merged)
+	}
+}
+
+func TestBuildAgentWebhookInputRedactsSensitiveMetadata(t *testing.T) {
+	req := httptest.NewRequest("POST", "/hooks/support?source=crm&token=secret&email=user@example.com&mobile=13800138000", strings.NewReader(`{"ticket":"T-42"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", "req-1")
+	req.Header.Set("X-Customer-Phone", "13800138000")
+	req.Header.Set("Authorization", "Bearer should-not-be-captured")
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = req
+	input, err := buildAgentWebhookInput(c)
+	if err != nil {
+		t.Fatalf("buildAgentWebhookInput error = %v", err)
+	}
+	headers := input["headers"].(map[string]string)
+	if _, ok := headers["Authorization"]; ok {
+		t.Fatal("authorization header was captured")
+	}
+	if _, ok := headers["X-Customer-Phone"]; ok {
+		t.Fatal("customer phone header was captured")
+	}
+	query := input["query"].(map[string]string)
+	for _, key := range []string{"token", "email", "mobile"} {
+		if _, ok := query[key]; ok {
+			t.Fatalf("sensitive query parameter %q was captured", key)
+		}
+	}
+	if headers["X-Request-Id"] != "req-1" {
+		t.Fatalf("safe header missing: %#v", headers)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,17 +68,20 @@ func TestAgentXianyuIncrementalStateStoresOnlyHashes(t *testing.T) {
 		Title:      "会话 1",
 		Transcript: "买家：订单号 12345678901 怎么处理？",
 	}}
-	changed, hashes := filterAgentXianyuChangedConversations(items, agentXianyuSyncState{}, false)
+	changed, hashes, removed := filterAgentXianyuChangedConversations(items, agentXianyuSyncState{}, false)
 	if len(changed) != 1 || len(hashes) != 1 {
 		t.Fatalf("unexpected first incremental result: %+v / %+v", changed, hashes)
 	}
+	if len(removed) != 0 {
+		t.Fatalf("incremental sync should not remove identities: %+v", removed)
+	}
 	state := agentXianyuSyncState{Conversations: hashes}
-	changed, _ = filterAgentXianyuChangedConversations(items, state, false)
+	changed, _, _ = filterAgentXianyuChangedConversations(items, state, false)
 	if len(changed) != 0 {
 		t.Fatalf("unchanged conversation should not be archived again: %+v", changed)
 	}
 	items[0].Transcript += "\n客服：已处理。"
-	changed, hashes = filterAgentXianyuChangedConversations(items, state, false)
+	changed, hashes, _ = filterAgentXianyuChangedConversations(items, state, false)
 	if len(changed) != 1 {
 		t.Fatal("updated conversation should be archived")
 	}
@@ -96,6 +100,25 @@ func TestAgentXianyuIncrementalStateStoresOnlyHashes(t *testing.T) {
 	var persisted agentXianyuSyncState
 	if err := json.Unmarshal(raw, &persisted); err != nil || len(persisted.Conversations) != 1 {
 		t.Fatalf("unexpected persisted state: %+v, %v", persisted, err)
+	}
+}
+
+func TestFilterAgentXianyuFullSyncReturnsRemovedIdentities(t *testing.T) {
+	kept := agentXianyuConversation{Key: "kept", Transcript: "current"}
+	removed := agentXianyuConversation{Key: "removed", Transcript: "old"}
+	state := agentXianyuSyncState{Conversations: map[string]string{
+		agentXianyuConversationIdentity(kept.Key):    agentXianyuConversationHash(kept),
+		agentXianyuConversationIdentity(removed.Key): "old-hash",
+	}}
+	changed, next, removedIdentities := filterAgentXianyuChangedConversations([]agentXianyuConversation{kept}, state, true)
+	if len(changed) != 1 {
+		t.Fatalf("full sync should reprocess the current conversation: %+v", changed)
+	}
+	if len(removedIdentities) != 1 || removedIdentities[0] != agentXianyuConversationIdentity(removed.Key) {
+		t.Fatalf("unexpected removed identities: %+v", removedIdentities)
+	}
+	if len(next) != 1 {
+		t.Fatalf("full sync state should contain only current conversations: %+v", next)
 	}
 }
 
@@ -221,6 +244,66 @@ func TestCommitAgentXianyuConversationKnowledgeCheckpointsAndReplaces(t *testing
 	}
 	if persisted.Conversations[identity] != secondHash {
 		t.Fatalf("updated conversation hash was not checkpointed: %+v", persisted)
+	}
+}
+
+func TestDeleteAgentXianyuConversationKnowledgeRemovesOnlyStableGeneratedDocument(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	base, err := store.CreateKnowledgeBase(ctx, 7, KnowledgeBaseFormData{Name: "xianyu-cleanup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agentXianyuConversation{Key: "old-buyer", Transcript: "old transcript"}
+	identity := agentXianyuConversationIdentity(conversation.Key)
+	statePath := agentXianyuStatePath(t.TempDir(), "bp-cleanup", "node-cleanup")
+	state := agentXianyuSyncState{Conversations: map[string]string{}}
+	generated, err := commitAgentXianyuConversationKnowledge(
+		ctx, store, []*KnowledgeBase{base}, "bp-cleanup", "node-cleanup", statePath,
+		&state, conversation, "hash", agentXianyuDefaultURL, agentXianyuDefaultSession, "generated answer",
+	)
+	if err != nil || len(generated) != 1 {
+		t.Fatalf("expected generated document, got %+v / %v", generated, err)
+	}
+	manual, err := store.UpsertKnowledgeDocument(ctx, base.ID, "manual-doc", 7, "manual.md", "text/markdown", 6, "manual")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteAgentXianyuConversationKnowledge(ctx, store, []*KnowledgeBase{base}, "bp-cleanup", "node-cleanup", []string{identity}); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := store.GetKnowledgeDocument(ctx, base.ID, generated[0].DocumentID, 7); err != nil || loaded != nil {
+		t.Fatalf("expected generated document to be removed: %+v / %v", loaded, err)
+	}
+	if loaded, err := store.GetKnowledgeDocument(ctx, base.ID, manual.ID, 7); err != nil || loaded == nil {
+		t.Fatalf("manual document should remain: %+v / %v", loaded, err)
+	}
+}
+
+func TestMergeAgentXianyuKnowledgeBaseIDsKeepsHistoricalBindings(t *testing.T) {
+	bases := []*KnowledgeBase{{ID: "base-current"}, {ID: "base-current"}, {ID: "base-new"}}
+	got := mergeAgentXianyuKnowledgeBaseIDs([]string{"base-old", "base-current", ""}, bases)
+	want := []string{"base-current", "base-new", "base-old"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged knowledge base ids = %v, want %v", got, want)
+	}
+}
+
+func TestAgentXianyuKnowledgeBaseBindingsChanged(t *testing.T) {
+	bases := []*KnowledgeBase{{ID: "base-b"}, {ID: "base-a"}}
+	if agentXianyuKnowledgeBaseBindingsChanged([]string{"base-a", "base-b"}, bases) {
+		t.Fatal("same binding set should not be treated as changed")
+	}
+	if !agentXianyuKnowledgeBaseBindingsChanged([]string{"base-a"}, bases) {
+		t.Fatal("added binding should be treated as changed")
+	}
+	if !agentXianyuKnowledgeBaseBindingsChanged(nil, bases) {
+		t.Fatal("missing historical bindings should trigger a rebuild")
 	}
 }
 
@@ -547,6 +630,83 @@ func TestRedactAgentXianyuTextRemovesPrivateSellerData(t *testing.T) {
 		if strings.Contains(redacted, private) {
 			t.Fatalf("redaction leaked %q: %q", private, redacted)
 		}
+	}
+}
+
+func TestAgentXianyuProductAndStyleDocumentsStayPublic(t *testing.T) {
+	product := agentXianyuProduct{agentXianyuProductContext: agentXianyuProductContext{
+		Key:          "item-1",
+		Title:        "自动充值服务",
+		Description:  "支持在线办理，当前页面可见。曝光 1589，订单号 3312858145451060750。",
+		Availability: "在线",
+		Found:        true,
+	}}
+	productDoc := buildAgentXianyuProductKnowledgeDocument(product)
+	if !strings.Contains(productDoc, "自动充值服务") || !strings.Contains(productDoc, "在线") {
+		t.Fatalf("public product facts were lost: %q", productDoc)
+	}
+	for _, private := range []string{"曝光", "1589", "订单号", "3312858145451060750"} {
+		if strings.Contains(productDoc, private) {
+			t.Fatalf("product document leaked %q: %q", private, productDoc)
+		}
+	}
+
+	source := buildAgentXianyuStyleSource([]agentXianyuConversation{{
+		Key:        "buyer-1",
+		Transcript: "买家：还在吗？\n卖家：在的亲，您具体想问哪方面？\n卖家：订单号 3312858145451060750 请勿复制。",
+	}})
+	if !strings.Contains(source, "在的亲") || strings.Contains(source, "买家：") || strings.Contains(source, "3312858145451060750") {
+		t.Fatalf("style source should contain only redacted seller messages: %q", source)
+	}
+	styleDoc := buildAgentXianyuStyleDocument("称呼：亲；语气：简短自然。订单号 3312858145451060750")
+	if !strings.Contains(styleDoc, "简短自然") || strings.Contains(styleDoc, "3312858145451060750") {
+		t.Fatalf("style document leaked sensitive data: %q", styleDoc)
+	}
+}
+
+func TestSyncAgentXianyuProductsOnlyBackfillsNewKnowledgeBase(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	first, err := store.CreateKnowledgeBase(ctx, 7, KnowledgeBaseFormData{Name: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateKnowledgeBase(ctx, 7, KnowledgeBaseFormData{Name: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	product := agentXianyuProduct{agentXianyuProductContext: agentXianyuProductContext{
+		Key:         "item-1",
+		Title:       "在售商品",
+		Description: "公开商品说明",
+		Found:       true,
+	}}
+	redactedProduct := product
+	redactedProduct.agentXianyuProductContext = redactAgentXianyuProductContext(product.agentXianyuProductContext)
+	state := agentXianyuSyncState{
+		Products:         map[string]string{agentXianyuProductIdentity(redactedProduct): agentXianyuProductHash(redactedProduct)},
+		KnowledgeBaseIDs: []string{first.ID},
+	}
+	documents, changed, err := syncAgentXianyuProducts(ctx, store, []*KnowledgeBase{first, second}, "bp-1", "node-1", &state, []agentXianyuProduct{product})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed != 0 || len(documents) != 1 || documents[0].KnowledgeBaseID != second.ID {
+		t.Fatalf("expected only the newly selected base to be backfilled: changed=%d documents=%+v", changed, documents)
+	}
+
+	state.KnowledgeBaseIDs = []string{first.ID, second.ID}
+	documents, changed, err = syncAgentXianyuProducts(ctx, store, []*KnowledgeBase{first, second}, "bp-1", "node-1", &state, []agentXianyuProduct{product})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed != 0 || len(documents) != 0 {
+		t.Fatalf("unchanged product should not be rewritten after both bases are known: changed=%d documents=%+v", changed, documents)
 	}
 }
 

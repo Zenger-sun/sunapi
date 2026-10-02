@@ -117,10 +117,11 @@ func captureAgentBrowserPage(ctx context.Context, dataDir string, req AgentBrows
 		return AgentBrowserCaptureResult{}, err
 	}
 
-	target, _, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
+	target, reusedTarget, err := openAgentBrowserTarget(ctx, endpoint, targetURL)
 	if err != nil {
 		return AgentBrowserCaptureResult{}, err
 	}
+	defer makeAgentBrowserTargetCleanup(endpoint, target, !reusedTarget)()
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
 	if err != nil {
@@ -223,17 +224,39 @@ func ensureAgentBrowserDevtools(ctx context.Context, dataDir string) (string, er
 }
 
 func ensureAgentBrowserDevtoolsForSession(ctx context.Context, session agentBrowserSessionPaths) (string, error) {
+	return ensureAgentBrowserDevtoolsForSessionWithInitialURL(ctx, session, "about:blank")
+}
+
+// ensureAgentBrowserDevtoolsForSessionWithInitialURL starts a fresh browser
+// session on the requested page. Keeping the initial URL configurable avoids
+// leaving an extra visible about:blank tab for long-running page agents.
+func ensureAgentBrowserDevtoolsForSessionWithInitialURL(ctx context.Context, session agentBrowserSessionPaths, initialURL string) (string, error) {
 	agentBrowserDevtoolsMu.Lock()
 	defer agentBrowserDevtoolsMu.Unlock()
 
 	portPath := session.PortPath
+	portFileFound := false
 	if raw, err := os.ReadFile(portPath); err == nil {
+		portFileFound = true
 		if port := strings.TrimSpace(string(raw)); port != "" {
 			endpoint := "http://127.0.0.1:" + port
 			if waitAgentBrowserDevtoolsQuick(ctx, endpoint) == nil {
 				return endpoint, nil
 			}
 		}
+	}
+
+	// Starting Chromium with a user-data-dir that is already owned by another
+	// browser process does not create an independent debug endpoint. Chromium
+	// forwards the requested URL to the existing process instead, which creates
+	// another visible tab on every reconnect. Refuse to start a second process
+	// while the profile lock is present; the next retry can reuse the existing
+	// endpoint once it becomes available.
+	if agentBrowserProfileLockExists(session.ProfileDir) {
+		if portFileFound {
+			return "", fmt.Errorf("browser profile is already in use but its devtools endpoint is unavailable: %s", session.ProfileDir)
+		}
+		return "", fmt.Errorf("browser profile is already in use: %s", session.ProfileDir)
 	}
 
 	port, err := reserveAgentBrowserPort()
@@ -251,15 +274,24 @@ func ensureAgentBrowserDevtoolsForSession(ctx context.Context, session agentBrow
 		return "", err
 	}
 
+	initialURL = strings.TrimSpace(initialURL)
+	if initialURL == "" {
+		initialURL = "about:blank"
+	}
 	args := []string{
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--user-data-dir=" + session.ProfileDir,
 		"--profile-directory=Default",
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--disable-background-networking",
+		// Reply pages must keep running their business websocket and timers even
+		// when all seller tabs are backgrounded or occluded overnight.
+		"--disable-background-timer-throttling",
+		"--disable-renderer-backgrounding",
+		"--disable-backgrounding-occluded-windows",
+		"--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
 		"--window-size=1280,900",
-		"about:blank",
+		initialURL,
 	}
 	cmd := exec.Command(browserPath, args...)
 	if err := cmd.Start(); err != nil {
@@ -276,6 +308,18 @@ func ensureAgentBrowserDevtoolsForSession(ctx context.Context, session agentBrow
 	_ = cmd.Process.Release()
 	_ = os.WriteFile(portPath, []byte(fmt.Sprintf("%d", port)), 0644)
 	return endpoint, nil
+}
+
+func agentBrowserProfileLockExists(profileDir string) bool {
+	profileDir = strings.TrimSpace(profileDir)
+	if profileDir == "" {
+		return false
+	}
+	// Chromium stores SingletonLock as a symlink on some platforms. Lstat is
+	// intentional: the link itself is the ownership marker, even when its
+	// target is a host/pid name that is not a regular file.
+	_, err := os.Lstat(filepath.Join(profileDir, "SingletonLock"))
+	return err == nil || !os.IsNotExist(err)
 }
 
 func resolveAgentBrowserSessionPaths(dataDir, requested string) agentBrowserSessionPaths {
@@ -400,24 +444,45 @@ func findAgentBrowserTarget(ctx context.Context, endpoint, targetURL string) (ag
 	if err != nil {
 		return agentBrowserTarget{}, false, err
 	}
-	wantedHost := ""
-	if parsed, err := url.Parse(targetURL); err == nil {
-		wantedHost = strings.ToLower(parsed.Hostname())
-	}
 	for _, target := range targets {
 		if target.Type != "page" || target.WebSocketDebuggerURL == "" {
 			continue
 		}
-		if strings.TrimSpace(target.URL) == strings.TrimSpace(targetURL) {
+		if agentBrowserTargetURLMatches(target.URL, targetURL) {
 			return target, true, nil
-		}
-		if wantedHost != "" {
-			if parsed, err := url.Parse(target.URL); err == nil && strings.EqualFold(parsed.Hostname(), wantedHost) {
-				return target, true, nil
-			}
 		}
 	}
 	return agentBrowserTarget{}, false, nil
+}
+
+func agentBrowserTargetURLMatches(actualURL, expectedURL string) bool {
+	actual := strings.TrimSpace(actualURL)
+	expected := strings.TrimSpace(expectedURL)
+	if actual == expected {
+		return true
+	}
+	actualParsed, actualErr := url.Parse(actual)
+	expectedParsed, expectedErr := url.Parse(expected)
+	if actualErr != nil || expectedErr != nil || actualParsed.Host == "" || expectedParsed.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(actualParsed.Scheme, expectedParsed.Scheme) || !strings.EqualFold(actualParsed.Host, expectedParsed.Host) {
+		return false
+	}
+	// The seller console is a single-page application. Its pathname can change
+	// while the same authenticated workbench remains open, so route changes on
+	// seller.goofish.com must not create another visible tab.
+	sellerConsole := strings.EqualFold(actualParsed.Hostname(), "seller.goofish.com") &&
+		strings.EqualFold(expectedParsed.Hostname(), "seller.goofish.com")
+	if !sellerConsole && actualParsed.Path != expectedParsed.Path {
+		return false
+	}
+	if actualParsed.Query().Encode() == expectedParsed.Query().Encode() {
+		return true
+	}
+	actualSite := strings.ToUpper(strings.TrimSpace(actualParsed.Query().Get("site")))
+	expectedSite := strings.ToUpper(strings.TrimSpace(expectedParsed.Query().Get("site")))
+	return (actualSite == "COMM" || actualSite == "COMMONPRO") && (expectedSite == "COMM" || expectedSite == "COMMONPRO")
 }
 
 func findAgentBrowserTargetByID(ctx context.Context, endpoint, targetID string) (agentBrowserTarget, bool, error) {
@@ -492,6 +557,23 @@ func closeAgentBrowserTarget(ctx context.Context, endpoint, targetID string) err
 		return fmt.Errorf("关闭浏览器页面失败: %s", resp.Status)
 	}
 	return nil
+}
+
+// makeAgentBrowserTargetCleanup returns an idempotent cleanup function for a
+// target created by the current operation. Reused pages belong to the caller
+// and must remain open after the operation completes.
+func makeAgentBrowserTargetCleanup(endpoint string, target agentBrowserTarget, owned bool) func() {
+	if !owned || strings.TrimSpace(target.ID) == "" {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = closeAgentBrowserTarget(cleanupCtx, endpoint, target.ID)
+		})
+	}
 }
 
 func captureAgentBrowserTargetScreenshot(ctx context.Context, target agentBrowserTarget) (string, error) {

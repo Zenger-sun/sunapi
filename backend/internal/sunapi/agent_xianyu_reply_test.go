@@ -3,11 +3,32 @@ package sunapi
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestXianyuReplyReconnectBackoffIsCapped(t *testing.T) {
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{failures: 1, want: 5 * time.Second},
+		{failures: 2, want: 10 * time.Second},
+		{failures: 3, want: 20 * time.Second},
+		{failures: 4, want: 40 * time.Second},
+		{failures: 5, want: time.Minute},
+		{failures: 20, want: time.Minute},
+	}
+	for _, test := range tests {
+		if got := agentXianyuReplyReconnectDelayAfter(test.failures); got != test.want {
+			t.Errorf("reconnect delay after %d failures = %s, want %s", test.failures, got, test.want)
+		}
+	}
+}
 
 func TestXianyuReplyComponentDefaultsToRealtimeDirectSend(t *testing.T) {
 	for _, component := range customAgentComponents {
@@ -44,6 +65,12 @@ func TestParseAgentBlueprintNodesNormalizesXianyuReplyComponent(t *testing.T) {
 }
 
 func TestXianyuReplyExpressionsStayMessageScoped(t *testing.T) {
+	keepalive := buildAgentXianyuConnectionKeepaliveExpression()
+	for _, required := range []string{"reconnected", "reconnecting", "connection", "\\u8fde\\u63a5\\u4e2d\\u65ad", "\\u91cd\\u8fde", "reconnect", "setInterval", "__sunapiXianyuReconnectWatchdog", "window.location.reload"} {
+		if !strings.Contains(keepalive, required) {
+			t.Fatalf("connection keepalive expression is missing %q: %s", required, keepalive)
+		}
+	}
 	observer := buildAgentXianyuReplyObserverInstallExpression(".conversation-list")
 	if !strings.Contains(observer, "MutationObserver") || !strings.Contains(observer, "__sunapiXianyuDirty") {
 		t.Fatalf("observer expression does not install a page change listener: %s", observer)
@@ -55,13 +82,16 @@ func TestXianyuReplyExpressionsStayMessageScoped(t *testing.T) {
 		}
 	}
 	unreadCandidates := buildAgentXianyuCandidatesExpressionWithUnread(".conversation-list", 20, true)
-	for _, required := range []string{"const unreadOnly = true", "if (unreadOnly && !unread) return", "const scope = custom", "const selectors = ['[data-conversation-id]'", "[class*=\"Item\"]", "isUnreadBadge", "::after"} {
+	for _, required := range []string{"const unreadOnly = true", "if (unreadOnly && !unread) return", "const scope = custom", "const selectors = ['[data-conversation-id]'", "[class*=\"Item\"]", "isUnreadBadge", "::after", "systemTitle"} {
 		if !strings.Contains(unreadCandidates, required) {
 			t.Fatalf("candidate expression is missing unread robustness marker %q: %s", required, unreadCandidates)
 		}
 	}
+	if !strings.Contains(status, "systemTitle") || !strings.Contains(status, "const seen = new Set()") {
+		t.Fatalf("observer status must exclude notices and deduplicate rows: %s", status)
+	}
 	latest := buildAgentXianyuReplyLatestMessageExpression(".message-list")
-	for _, required := range []string{"data-message-id", "direction", "messages.slice(-50)", "container_found"} {
+	for _, required := range []string{"data-message-id", "direction", "messages.slice(-50)", "container_found", "isSystemMessage", "systemText"} {
 		if !strings.Contains(latest, required) {
 			t.Fatalf("latest-message expression is missing %q", required)
 		}
@@ -86,6 +116,98 @@ func TestXianyuReplyExpressionsStayMessageScoped(t *testing.T) {
 	}
 }
 
+func TestAgentXianyuReplySkipsSystemMessages(t *testing.T) {
+	systemText := "\u6b64\u6d88\u606f\u4e0d\u652f\u6301\u5728PC\u7aef\u6d4f\u89c8\uff0c\u8bf7\u5230APP\u4e0a\u67e5\u770b"
+	if !isAgentXianyuSystemMessage(systemText) {
+		t.Fatal("PC-only system notice should be recognized")
+	}
+	if isAgentXianyuSystemMessage("\u5728\u7684\uff0c\u60a8\u5177\u4f53\u60f3\u95ee\u54ea\u65b9\u9762\uff1f") {
+		t.Fatal("ordinary buyer message must not be classified as a system notice")
+	}
+	messages := []agentXianyuReplyMessage{
+		{Key: "system", Text: systemText, Direction: "customer"},
+		{Key: "buyer", Text: "\u5728\u7684\uff0c\u60a8\u5177\u4f53\u60f3\u95ee\u54ea\u65b9\u9762\uff1f", Direction: "customer"},
+	}
+	got := agentXianyuReplyUnansweredCustomerMessages(messages, true)
+	if len(got) != 1 || got[0].Key != "buyer" {
+		t.Fatalf("system notice should be skipped while preserving buyer messages: %#v", got)
+	}
+}
+
+func TestXianyuReplyTargetReservationsPreventDuplicateWorkers(t *testing.T) {
+	endpoint := "http://127.0.0.1:12345"
+	target := agentBrowserTarget{ID: "target-1"}
+	if !reserveAgentXianyuReplyTarget(endpoint, target) {
+		t.Fatal("first target reservation should succeed")
+	}
+	if reserveAgentXianyuReplyTarget(endpoint, target) {
+		t.Fatal("the same target must not be reserved twice")
+	}
+	releaseAgentXianyuReplyTarget(endpoint, target)
+	if !reserveAgentXianyuReplyTarget(endpoint, target) {
+		t.Fatal("released target should be reusable")
+	}
+	releaseAgentXianyuReplyTarget(endpoint, target)
+}
+
+func TestXianyuReplyDoesNotCreateTabWhenExistingTargetProbeFails(t *testing.T) {
+	newCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/json/list":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"id":"existing","type":"page","url":"https://seller.goofish.com/?site=COMMONPRO&spm=im","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/existing"}]`))
+		case "/json/new":
+			newCalls++
+			http.Error(w, "unexpected tab creation", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	target, reused, err := openAgentXianyuReplyTarget(context.Background(), server.URL, "https://seller.goofish.com/?site=COMMONPRO")
+	if err == nil {
+		t.Fatal("expected a transient probe error")
+	}
+	if reused || target.ID != "" {
+		t.Fatalf("failed probe must not return a target: %#v, reused=%v", target, reused)
+	}
+	if newCalls != 0 {
+		t.Fatalf("probe failure must not create another tab, got %d /json/new calls", newCalls)
+	}
+	// The failed probe must release its reservation so the same target can be
+	// claimed after the browser's websocket becomes available again.
+	listed, listErr := listAgentBrowserTargets(context.Background(), server.URL)
+	if listErr != nil || len(listed) != 1 || !reserveAgentXianyuReplyTarget(server.URL, listed[0]) {
+		t.Fatalf("failed probe left a stale reservation: targets=%#v err=%v", listed, listErr)
+	}
+	releaseAgentXianyuReplyTarget(server.URL, listed[0])
+}
+
+func TestXianyuReplySessionLockSerializesSharedProfile(t *testing.T) {
+	dataDir := t.TempDir()
+	settings := map[string]string{"会话名称": "shared-session"}
+	release, err := acquireAgentXianyuReplySession(context.Background(), dataDir, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := acquireAgentXianyuReplySession(ctx, dataDir, settings); err == nil {
+		t.Fatal("expected a second reply session to wait for the shared profile")
+	}
+
+	release()
+	nextRelease, err := acquireAgentXianyuReplySession(context.Background(), dataDir, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRelease()
+}
+
 func TestAgentXianyuReplyUsesAllUnansweredBuyerMessages(t *testing.T) {
 	messages := []agentXianyuReplyMessage{
 		{Key: "1", Text: "之前的问题", Direction: "customer"},
@@ -99,6 +221,21 @@ func TestAgentXianyuReplyUsesAllUnansweredBuyerMessages(t *testing.T) {
 	}
 	if got := agentXianyuReplyUnansweredCustomerMessages(messages[:2], false); len(got) != 0 {
 		t.Fatalf("seller reply should close the previous buyer batch: %#v", got)
+	}
+}
+
+func TestAgentXianyuReplyKeepsUnknownRowsAfterSellerBoundary(t *testing.T) {
+	messages := []agentXianyuReplyMessage{
+		{Key: "1", Text: "seller", Direction: "self"},
+		{Key: "2", Text: "first buyer message", Direction: "unknown"},
+		{Key: "3", Text: "second buyer message", Direction: "unknown"},
+	}
+	got := agentXianyuReplyUnansweredCustomerMessages(messages, true)
+	if len(got) != 2 || got[0].Key != "2" || got[1].Key != "3" {
+		t.Fatalf("unknown buyer burst should preserve all rows after seller boundary: %#v", got)
+	}
+	if got[0].Direction != "customer" || got[1].Direction != "customer" {
+		t.Fatalf("unknown buyer rows should be normalized: %#v", got)
 	}
 }
 
@@ -129,6 +266,14 @@ func TestAgentXianyuReplyDetectsHumanSellerMessage(t *testing.T) {
 	if agentXianyuReplyHumanMessageAppeared(baseline, buyerFollowUp) {
 		t.Fatal("a buyer follow-up alone must not be classified as a human takeover")
 	}
+	duplicateHuman := agentXianyuReplyMessagePayload{Messages: append(append([]agentXianyuReplyMessage{}, baseline.Messages...),
+		agentXianyuReplyMessage{Text: "same seller reply", Direction: "self"},
+		agentXianyuReplyMessage{Text: "same seller reply", Direction: "self"},
+	)}
+	previousDuplicate := agentXianyuReplyMessagePayload{Messages: duplicateHuman.Messages[:len(duplicateHuman.Messages)-1]}
+	if !agentXianyuReplyHumanMessageAppeared(previousDuplicate, duplicateHuman) {
+		t.Fatal("a repeated seller reply without message ids must interrupt the auto reply")
+	}
 }
 
 func TestAgentXianyuReplyProcessesNewOrChangedConversationPreview(t *testing.T) {
@@ -144,6 +289,12 @@ func TestAgentXianyuReplyProcessesNewOrChangedConversationPreview(t *testing.T) 
 	}
 	if !shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, agentXianyuReplyConversationState{}, false, "new", true) {
 		t.Fatal("new unread conversation should be processed")
+	}
+	if shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{Unread: true}, agentXianyuReplyConversationState{}, false, "new", false) {
+		t.Fatal("disabled default reply must not process unread conversations")
+	}
+	if shouldProcessAgentXianyuCandidate(agentXianyuConversationCandidate{}, agentXianyuReplyConversationState{}, true, "changed", false) {
+		t.Fatal("disabled default reply must not process changed conversations")
 	}
 }
 
@@ -192,6 +343,30 @@ func TestFilterAgentXianyuReplyKnowledgeMatchesRejectsWeakOverlap(t *testing.T) 
 	short := filterAgentXianyuReplyKnowledgeMatches([]KnowledgeSearchMatch{{DocumentID: "refund", Content: "退款规则"}}, "退款", "")
 	if len(short) != 1 {
 		t.Fatalf("an exact two-rune buyer question should remain searchable: %#v", short)
+	}
+}
+
+func TestFilterAgentXianyuReplyKnowledgeMatchesScopesProductDocuments(t *testing.T) {
+	matches := []KnowledgeSearchMatch{
+		{DocumentID: "other-product", Filename: agentXianyuProductFilenamePrefix + "other.md", Content: "其他充值商品 当前有货"},
+		{DocumentID: "current-product", Filename: agentXianyuProductFilenamePrefix + "current.md", Content: "移动话费充值 100 元 当前有货"},
+	}
+	filtered := filterAgentXianyuReplyKnowledgeMatches(matches, "现在还有货吗", "移动话费充值 100 元")
+	if len(filtered) != 1 || filtered[0].DocumentID != "current-product" {
+		t.Fatalf("product knowledge must be scoped to the current product: %#v", filtered)
+	}
+}
+
+func TestSplitAgentXianyuReplyKnowledgeMatchesDoesNotTreatStyleAsFact(t *testing.T) {
+	facts, styles := splitAgentXianyuReplyKnowledgeMatches([]KnowledgeSearchMatch{
+		{DocumentID: "style", Filename: agentXianyuStyleDocumentFilename, Content: "绠€鐭嚜鐒剁殑鍥炲"},
+		{DocumentID: "product", Filename: "闂查奔商品知识-current.md", Content: "鍦ㄥ敭"},
+	})
+	if len(facts) != 1 || facts[0].DocumentID != "product" {
+		t.Fatalf("style document must not count as a product fact: %#v", facts)
+	}
+	if len(styles) != 1 || styles[0].DocumentID != "style" {
+		t.Fatalf("style document should remain available as context: %#v", styles)
 	}
 }
 
@@ -262,9 +437,14 @@ func TestShouldResumeAgentXianyuReplyMigratesSilentTerminalStates(t *testing.T) 
 			t.Fatalf("legacy silent status %q must be retried when default reply is enabled", status)
 		}
 	}
-	for _, status := range []string{"sent", "sent_fallback", "skipped_self", "model_error"} {
+	for _, status := range []string{"sent", "sent_fallback", "skipped_self", "model_error", "interrupted_by_human"} {
 		if shouldResumeAgentXianyuReply(status) {
 			t.Fatalf("status %q must not be replayed", status)
+		}
+	}
+	for _, status := range []string{"send_error", "send_input_not_found", "send_button_disabled"} {
+		if !shouldResumeAgentXianyuReply(status) {
+			t.Fatalf("transient send status %q must be replayed after its retry delay", status)
 		}
 	}
 }
@@ -302,5 +482,33 @@ func TestCancelAgentRunsStopsLongListener(t *testing.T) {
 	store.unregisterAgentRun("blueprint", "run")
 	if store.isAgentRunActive("blueprint") {
 		t.Fatal("listener remained registered after completion")
+	}
+}
+
+func TestStopAllAgentRunsWaitsBeforeShutdown(t *testing.T) {
+	store := &Store{agentActiveRuns: map[string]map[string]context.CancelFunc{}}
+	release := make(chan struct{})
+	canceled := make(chan struct{})
+	store.registerAgentRun("blueprint", "run", func() { close(canceled) })
+	go func() {
+		<-canceled
+		<-release
+		store.unregisterAgentRun("blueprint", "run")
+	}()
+	done := make(chan struct{})
+	go func() {
+		store.stopAllAgentRuns()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("store shutdown returned before active run cleanup")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("store shutdown did not wait for active run cleanup")
 	}
 }

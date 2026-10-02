@@ -29,10 +29,15 @@ type Store struct {
 	agentSchedulerMu          sync.Mutex
 	agentSchedulerCancel      context.CancelFunc
 	agentSchedulerWG          sync.WaitGroup
+	agentSchedulerClosed      bool
+	agentCloseOnce            sync.Once
+	agentCloseErr             error
 	agentScheduledRunsMu      sync.Mutex
 	agentScheduledRuns        map[string]struct{}
 	agentActiveRunsMu         sync.Mutex
 	agentActiveRuns           map[string]map[string]context.CancelFunc
+	agentActiveRunsWG         sync.WaitGroup
+	agentClosing              bool
 }
 
 const (
@@ -69,15 +74,23 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	s.agentSchedulerMu.Lock()
-	cancel := s.agentSchedulerCancel
-	s.agentSchedulerMu.Unlock()
-	if cancel != nil {
-		cancel()
-		s.agentSchedulerWG.Wait()
-	}
-	s.cancelAllAgentRuns()
-	return s.db.Close()
+	s.agentCloseOnce.Do(func() {
+		s.agentSchedulerMu.Lock()
+		s.agentSchedulerClosed = true
+		cancel := s.agentSchedulerCancel
+		s.agentSchedulerMu.Unlock()
+
+		// Prevent a run that is between lease acquisition and local
+		// registration from entering while shutdown is in progress.
+		s.beginAgentRunShutdown()
+		if cancel != nil {
+			cancel()
+			s.agentSchedulerWG.Wait()
+		}
+		s.stopAllAgentRuns()
+		s.agentCloseErr = s.db.Close()
+	})
+	return s.agentCloseErr
 }
 
 // StartAgentScheduler starts the background worker that executes scheduled blueprints.
@@ -88,7 +101,7 @@ func (s *Store) StartAgentScheduler() {
 	}
 	s.agentSchedulerMu.Lock()
 	defer s.agentSchedulerMu.Unlock()
-	if s.agentSchedulerCancel != nil {
+	if s.agentSchedulerClosed || s.agentSchedulerCancel != nil {
 		return
 	}
 	s.startAgentScheduler()
@@ -440,6 +453,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			error_msg TEXT NOT NULL DEFAULT '',
 			archive_path TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS agent_run_leases (
+			blueprint_id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			kind TEXT NOT NULL DEFAULT '',
+			acquired_time INTEGER NOT NULL,
+			heartbeat_time INTEGER NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_agents_user_updated ON agents(user_id, updated_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_blueprints_agent ON agent_blueprints(agent_id, updated_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_blueprints_user ON agent_blueprints(user_id, status)`,
@@ -452,6 +472,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_base ON knowledge_bindings(knowledge_base_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_bindings_scope ON knowledge_bindings(user_id, target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_execution_logs_blueprint ON agent_execution_logs(blueprint_id, start_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_run_leases_heartbeat ON agent_run_leases(heartbeat_time)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
