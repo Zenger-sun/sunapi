@@ -28,14 +28,14 @@ import { RouterProvider, createRouter } from '@tanstack/react-router'
 import i18next from 'i18next'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
-import { getStatus } from '@/lib/api'
+import { getStatus, isCurrentAdminSessionError } from '@/lib/api'
 import { installBuildMetadata } from '@/lib/build-metadata'
 import { DEFAULT_SYSTEM_NAME, normalizeLogoUrl } from '@/lib/constants'
-import { clearAdminSessionToken } from '@/features/sunapi/admin-session-token'
 import '@/lib/dayjs'
 import { applyFaviconToDom } from '@/lib/dom-utils'
 import { initializeFrontendCache } from '@/lib/frontend-cache'
 import { handleServerError } from '@/lib/handle-server-error'
+import { clearAdminSessionToken } from '@/features/sunapi/admin-session-token'
 import { DirectionProvider } from './context/direction-provider'
 import { FontProvider } from './context/font-provider'
 import { ThemeProvider } from './context/theme-provider'
@@ -83,7 +83,10 @@ const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error) => {
       if (error instanceof AxiosError) {
-        if (error.response?.status === 401) {
+        if (
+          error.response?.status === 401 &&
+          isCurrentAdminSessionError(error)
+        ) {
           toast.error(i18next.t('Session expired!'))
           useAuthStore.getState().auth.reset()
           clearAdminSessionToken()

@@ -94,3 +94,70 @@ func TestRecalculateUsageCostsUsesModelPricingAndGroupMultiplier(t *testing.T) {
 		t.Fatalf("quota = %d, want 70000", items[0].Quota)
 	}
 }
+
+func TestRecalculateUsageCostsRelinksUnmatchedChannelName(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sunapi.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	channel, err := store.CreateChannel(ctx, ChannelPayload{
+		Name:    "codex",
+		Group:   "default",
+		BaseURL: "https://example.com",
+		APIKey:  "test-key",
+		Models:  "gpt-5.5",
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().Unix()
+	createdAt := now - 45*24*3600
+	err = store.InsertUsageLog(ctx, UsageLog{
+		CreatedAt:        createdAt,
+		ChannelName:      "codex",
+		Group:            "unknown",
+		Model:            "gpt-5.5",
+		Endpoint:         "proxy",
+		PromptTokens:     1000,
+		CompletionTokens: 1000,
+		TotalTokens:      2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.RecalculateUsageCosts(ctx, createdAt-60, createdAt+60, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Total != 1 || result.Updated != 1 || result.Skipped != 0 {
+		t.Fatalf("result = %+v, want total=1 updated=1 skipped=0", result)
+	}
+
+	logs, err := store.ListUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("got %d usage logs, want 1", len(logs))
+	}
+	if logs[0].ChannelID != channel.ID || logs[0].ChannelName != channel.Name || logs[0].Group != channel.Group {
+		t.Fatalf("relinked usage log = channel %d/%q group %q, want channel %d/%q group %q", logs[0].ChannelID, logs[0].ChannelName, logs[0].Group, channel.ID, channel.Name, channel.Group)
+	}
+	if logs[0].Cost <= 0 {
+		t.Fatalf("recalculated cost = %v, want > 0", logs[0].Cost)
+	}
+
+	updated, err := store.GetChannel(ctx, channel.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.UsedQuota != quotaFromCost(logs[0].Cost) {
+		t.Fatalf("channel used quota = %d, want %d", updated.UsedQuota, quotaFromCost(logs[0].Cost))
+	}
+}

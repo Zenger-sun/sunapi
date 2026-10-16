@@ -17,7 +17,12 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 /* eslint-disable react-refresh/only-export-components */
-import React, { createContext, useContext, useState, useCallback } from 'react'
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+} from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useChannelUpstreamUpdates } from '../hooks/use-channel-upstream-updates'
 import { channelsQueryKeys } from '../lib'
@@ -55,6 +60,9 @@ type ChannelsContextType = {
   setEnableTagMode: (enabled: boolean) => void
   idSort: boolean
   setIdSort: (enabled: boolean) => void
+  isChannelTesting: (channelId: number) => boolean
+  startChannelTest: (channelId: number) => void
+  finishChannelTest: (channelId: number) => void
   upstream: UpstreamUpdateState
 }
 
@@ -82,6 +90,32 @@ export function ChannelsProvider({ children }: { children: React.ReactNode }) {
   const [idSort, setIdSort] = useState(() => {
     return localStorage.getItem('channels-id-sort') === 'true'
   })
+  // Keep test state outside of table rows. A channel list refetch can replace
+  // rows while other channel tests are still in flight.
+  const [testingChannelIds, setTestingChannelIds] = useState<Set<number>>(
+    () => new Set()
+  )
+
+  const isChannelTesting = useCallback(
+    (channelId: number) => testingChannelIds.has(channelId),
+    [testingChannelIds]
+  )
+  const startChannelTest = useCallback((channelId: number) => {
+    setTestingChannelIds((current) => {
+      if (current.has(channelId)) return current
+      const next = new Set(current)
+      next.add(channelId)
+      return next
+    })
+  }, [])
+  const finishChannelTest = useCallback((channelId: number) => {
+    setTestingChannelIds((current) => {
+      if (!current.has(channelId)) return current
+      const next = new Set(current)
+      next.delete(channelId)
+      return next
+    })
+  }, [])
 
   const queryClient = useQueryClient()
   const refreshChannels = useCallback(async () => {
@@ -104,6 +138,9 @@ export function ChannelsProvider({ children }: { children: React.ReactNode }) {
         setEnableTagMode,
         idSort,
         setIdSort,
+        isChannelTesting,
+        startChannelTest,
+        finishChannelTest,
         upstream,
       }}
     >

@@ -70,14 +70,21 @@ interface DataTableRowActionsProps {
 export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const { t } = useTranslation()
   const channel = row.original
-  const { setOpen, setCurrentRow, upstream } = useChannels()
+  const {
+    setOpen,
+    setCurrentRow,
+    upstream,
+    isChannelTesting,
+    startChannelTest,
+    finishChannelTest,
+  } = useChannels()
   const queryClient = useQueryClient()
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
-  const [isTesting, setIsTesting] = useState(false)
   const [isTogglingStatus, setIsTogglingStatus] = useState(false)
 
   const isEnabled = isChannelEnabled(channel)
   const isMultiKey = isMultiKeyChannel(channel)
+  const isTesting = isChannelTesting(channel.id)
 
   const handleEdit = () => {
     setCurrentRow(channel)
@@ -91,13 +98,14 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
 
   const handleDirectTest = async (e: React.MouseEvent<HTMLButtonElement>) => {
     e.stopPropagation()
-    setIsTesting(true)
+    if (isTesting) return
+    startChannelTest(channel.id)
     try {
       await handleTestChannel(channel.id, undefined, () => {
         queryClient.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
       })
     } finally {
-      setIsTesting(false)
+      finishChannelTest(channel.id)
     }
   }
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useMutation } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, KeyRound, Loader2, ShieldCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -19,7 +19,6 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   adminAuthErrorMessage,
-  getAdminAuthStatus,
   loginAdmin,
   setupAdmin,
   type AdminCredentials,
@@ -36,20 +35,12 @@ const ADMIN_USERNAME = 'admin'
 export function AdminAuthPage({ mode }: AdminAuthPageProps) {
   const { t } = useTranslation()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const { systemName, logo } = useSystemConfig()
   const { auth } = useAuthStore()
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [errorText, setErrorText] = useState('')
 
-  const statusQuery = useQuery({
-    queryKey: ['sunapi-admin-auth-status'],
-    queryFn: getAdminAuthStatus,
-    retry: false,
-  })
-
-  const status = statusQuery.data
   const isSetup = mode === 'setup'
 
   useEffect(() => {
@@ -57,33 +48,6 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
     setPassword('')
     setConfirmPassword('')
   }, [mode])
-
-  useEffect(() => {
-    if (!status) return
-    if (status.authenticated && status.user) {
-      auth.setUser(status.user)
-      navigate({ to: '/dashboard', replace: true })
-      return
-    }
-    if (mode === 'login' && !status.initialized) {
-      navigate({ to: '/setup', replace: true })
-      return
-    }
-    if (mode === 'setup' && status.initialized) {
-      navigate({ to: '/login', replace: true })
-    }
-  }, [auth, mode, navigate, status])
-
-  useEffect(() => {
-    if (!statusQuery.error) return
-    setErrorText(
-      adminAuthErrorMessage(
-        statusQuery.error,
-        t('Failed to read local authentication status. Please try again later'),
-        t
-      )
-    )
-  }, [statusQuery.error, t])
 
   const copy = useMemo(
     () =>
@@ -144,11 +108,8 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
   const mutation = useMutation({
     mutationFn: (credentials: AdminCredentials) =>
       isSetup ? setupAdmin(credentials) : loginAdmin(credentials),
-    onSuccess: async (user) => {
+    onSuccess: (user) => {
       auth.setUser(user)
-      await queryClient.invalidateQueries({
-        queryKey: ['sunapi-admin-auth-status'],
-      })
       toast.success(copy.success)
       navigate({ to: '/dashboard', replace: true })
     },
@@ -163,14 +124,14 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
     },
   })
 
-  const loading = statusQuery.isLoading || mutation.isPending
+  const loading = mutation.isPending
   const Icon = copy.icon
 
   return (
     <main className='bg-background relative flex min-h-svh items-center justify-center px-4 py-10'>
       <Link
         to='/home'
-        className='focus-visible:ring-ring/40 absolute top-6 left-6 inline-flex items-center gap-2 rounded-md px-1.5 py-1 text-sm font-semibold outline-none transition-colors hover:bg-accent focus-visible:ring-2'
+        className='focus-visible:ring-ring/40 hover:bg-accent absolute top-6 left-6 inline-flex items-center gap-2 rounded-md px-1.5 py-1 text-sm font-semibold transition-colors outline-none focus-visible:ring-2'
         aria-label={t('Back to Home')}
       >
         <img
@@ -198,7 +159,7 @@ export function AdminAuthPage({ mode }: AdminAuthPageProps) {
         </CardHeader>
         <CardContent>
           <form className='space-y-4' onSubmit={handleSubmit}>
-            <div className='rounded-lg border bg-muted/40 px-3 py-2 text-sm'>
+            <div className='bg-muted/40 rounded-lg border px-3 py-2 text-sm'>
               <span className='text-muted-foreground'>
                 {t('Admin account')}
               </span>

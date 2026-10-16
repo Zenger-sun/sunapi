@@ -69,6 +69,32 @@ export const api = axios.create({
   },
 })
 
+function getRequestAdminSessionToken(error: unknown) {
+  const config = (error as { config?: ApiRequestConfig }).config
+  const headers = config?.headers as
+    | (Record<string, unknown> & {
+        get?: (name: string) => unknown
+      })
+    | undefined
+  const authorization =
+    typeof headers?.get === 'function'
+      ? headers.get('Authorization')
+      : (headers?.Authorization ?? headers?.authorization)
+
+  if (typeof authorization !== 'string') return ''
+  return authorization.replace(/^Bearer\s+/i, '').trim()
+}
+
+/**
+ * Ignore a 401 from a request that belongs to an older admin session.
+ * Otherwise an in-flight request from before re-login can clear the new token.
+ */
+export function isCurrentAdminSessionError(error: unknown) {
+  const requestToken = getRequestAdminSessionToken(error)
+  const currentToken = getAdminSessionToken()
+  return requestToken === currentToken
+}
+
 // ============================================================================
 // Request Deduplication
 // ============================================================================
@@ -122,7 +148,7 @@ api.interceptors.response.use(
     const skip = error?.config?.skipErrorHandler
     const status = error?.response?.status
 
-    if (status === 401) {
+    if (status === 401 && isCurrentAdminSessionError(error)) {
       try {
         useAuthStore.getState().auth.reset()
         clearAdminSessionToken()
@@ -133,7 +159,7 @@ api.interceptors.response.use(
       if (!skip) {
         toast.error(responseErrorMessage(error) || t('Session expired!'))
       }
-    } else if (!skip) {
+    } else if (status !== 401 && !skip) {
       // Other errors: show error message from response or default
       const msg = responseErrorMessage(error) || t('Request failed')
       toast.error(msg)

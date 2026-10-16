@@ -2989,28 +2989,29 @@ func (s *Store) ChannelForUsage(ctx context.Context, apiKey, baseURL, provider s
 		COALESCE(g.price_multiplier, 1)
 		FROM channels c
 		LEFT JOIN groups g ON g.name = c.group_name
-		WHERE 1 = 1`
-	args := []any{}
-	if channelID, ok := channelIDFromCompatProvider(provider); ok {
-		query += ` AND c.id = ?`
-		args = append(args, channelID)
-	} else if apiKey != "" {
-		query += ` AND c.api_key = ?`
-		args = append(args, apiKey)
-	} else if baseURL != "" {
-		query += ` AND c.base_url = ?`
-		args = append(args, baseURL)
-	} else if provider != "" {
-		query += ` AND lower(c.name) = lower(?)`
-		args = append(args, provider)
-	} else {
-		return Channel{}, 1, sql.ErrNoRows
-	}
-	query += ` ORDER BY c.id LIMIT 1`
+		WHERE (? > 0 AND c.id = ?)
+			OR (? <> '' AND c.api_key = ?)
+			OR (? <> '' AND c.base_url = ?)
+			OR (? <> '' AND lower(c.name) = lower(?))
+		ORDER BY CASE
+			WHEN ? > 0 AND c.id = ? THEN 0
+			WHEN ? <> '' AND c.api_key = ? THEN 1
+			WHEN ? <> '' AND c.base_url = ? THEN 2
+			ELSE 3
+		END, c.id LIMIT 1`
+	channelID, _ := channelIDFromCompatProvider(provider)
 	var channel Channel
 	var enabled int
 	var multiplier float64
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&channel.ID, &channel.Type, &channel.Name, &channel.Group, &channel.BaseURL, &channel.APIKey, &channel.Models, &enabled, &channel.InputPricePer1K, &channel.OutputPricePer1K, &channel.Remark, &channel.CreatedAt, &channel.UpdatedAt, &multiplier)
+	err := s.db.QueryRowContext(ctx, query,
+		channelID, channelID,
+		apiKey, apiKey,
+		baseURL, baseURL,
+		provider, provider,
+		channelID, channelID,
+		apiKey, apiKey,
+		baseURL, baseURL,
+	).Scan(&channel.ID, &channel.Type, &channel.Name, &channel.Group, &channel.BaseURL, &channel.APIKey, &channel.Models, &enabled, &channel.InputPricePer1K, &channel.OutputPricePer1K, &channel.Remark, &channel.CreatedAt, &channel.UpdatedAt, &multiplier)
 	channel.Enabled = enabled != 0
 	return channel, multiplier, err
 }
@@ -3223,7 +3224,8 @@ func (s *Store) RecalculateUsageCosts(ctx context.Context, start, end int64, use
 		return RecalculateUsageCostsResult{}, err
 	}
 
-	where := `WHERE u.created_at >= ? AND u.created_at <= ? AND u.channel_id > 0
+	where := `WHERE u.created_at >= ? AND u.created_at <= ?
+		AND (u.channel_id > 0 OR TRIM(COALESCE(u.channel_name, '')) <> '')
 		AND (u.prompt_tokens <> 0 OR u.completion_tokens <> 0 OR u.total_tokens <> 0)`
 	args := []any{start, end}
 	if username != "" {
@@ -3235,12 +3237,14 @@ func (s *Store) RecalculateUsageCosts(ctx context.Context, start, end int64, use
 	}
 
 	rows, err := s.db.QueryContext(ctx, `SELECT
-		u.id, u.model, u.prompt_tokens, u.completion_tokens,
-		c.id, c.type, c.name, c.group_name, c.base_url, c.api_key, c.models, c.enabled,
-		c.input_price_per_1k, c.output_price_per_1k, c.remark, c.created_at, c.updated_at,
+		u.id, u.model, u.prompt_tokens, u.completion_tokens, u.channel_id, COALESCE(u.channel_name, ''),
+		COALESCE(c.id, 0), COALESCE(c.type, 0), COALESCE(c.name, ''), COALESCE(c.group_name, ''),
+		COALESCE(c.base_url, ''), COALESCE(c.api_key, ''), COALESCE(c.models, ''), COALESCE(c.enabled, 0),
+		COALESCE(c.input_price_per_1k, 0), COALESCE(c.output_price_per_1k, 0), COALESCE(c.remark, ''),
+		COALESCE(c.created_at, 0), COALESCE(c.updated_at, 0),
 		COALESCE(g.price_multiplier, 1)
 		FROM usage_logs u
-		JOIN channels c ON c.id = u.channel_id
+		LEFT JOIN channels c ON c.id = u.channel_id
 		LEFT JOIN groups g ON g.name = CASE
 			WHEN TRIM(COALESCE(u.group_name, '')) = '' OR lower(TRIM(COALESCE(u.group_name, ''))) = 'unknown' THEN c.group_name
 			ELSE u.group_name
@@ -3253,55 +3257,98 @@ func (s *Store) RecalculateUsageCosts(ctx context.Context, start, end int64, use
 	defer rows.Close()
 
 	type usageCostUpdate struct {
-		ID   int64
-		Cost float64
+		ID          int64
+		ChannelID   int64
+		ChannelName string
+		Group       string
+		Cost        float64
+		LinkChannel bool
 	}
+	type usageCostCandidate struct {
+		id                int64
+		model             string
+		inputTokens       int64
+		outputTokens      int64
+		storedChannelID   int64
+		storedChannelName string
+		channel           Channel
+		multiplier        float64
+	}
+	candidates := make([]usageCostCandidate, 0)
 	updates := make([]usageCostUpdate, 0)
 	var result RecalculateUsageCostsResult
 	for rows.Next() {
 		var (
-			id           int64
-			model        string
-			inputTokens  int64
-			outputTokens int64
-			channel      Channel
-			enabled      int
-			multiplier   float64
+			candidate usageCostCandidate
+			enabled   int
 		)
 		err := rows.Scan(
-			&id,
-			&model,
-			&inputTokens,
-			&outputTokens,
-			&channel.ID,
-			&channel.Type,
-			&channel.Name,
-			&channel.Group,
-			&channel.BaseURL,
-			&channel.APIKey,
-			&channel.Models,
+			&candidate.id,
+			&candidate.model,
+			&candidate.inputTokens,
+			&candidate.outputTokens,
+			&candidate.storedChannelID,
+			&candidate.storedChannelName,
+			&candidate.channel.ID,
+			&candidate.channel.Type,
+			&candidate.channel.Name,
+			&candidate.channel.Group,
+			&candidate.channel.BaseURL,
+			&candidate.channel.APIKey,
+			&candidate.channel.Models,
 			&enabled,
-			&channel.InputPricePer1K,
-			&channel.OutputPricePer1K,
-			&channel.Remark,
-			&channel.CreatedAt,
-			&channel.UpdatedAt,
-			&multiplier,
+			&candidate.channel.InputPricePer1K,
+			&candidate.channel.OutputPricePer1K,
+			&candidate.channel.Remark,
+			&candidate.channel.CreatedAt,
+			&candidate.channel.UpdatedAt,
+			&candidate.multiplier,
 		)
 		if err != nil {
 			return result, err
 		}
+		candidate.channel.Enabled = enabled != 0
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+	if err := rows.Close(); err != nil {
+		return result, err
+	}
+
+	for _, candidate := range candidates {
 		result.Total++
-		channel.Enabled = enabled != 0
-		cost := UsageCostForModel(channel, settings, multiplier, model, inputTokens, outputTokens)
+		channel := candidate.channel
+		multiplier := candidate.multiplier
+		if candidate.storedChannelID > 0 && channel.ID == 0 {
+			result.Skipped++
+			continue
+		}
+		if candidate.storedChannelID == 0 {
+			var resolveErr error
+			channel, multiplier, resolveErr = s.ChannelForUsage(ctx, "", "", candidate.storedChannelName)
+			if resolveErr != nil {
+				if !errors.Is(resolveErr, sql.ErrNoRows) {
+					return result, resolveErr
+				}
+				result.Skipped++
+				continue
+			}
+		}
+		cost := UsageCostForModel(channel, settings, multiplier, candidate.model, candidate.inputTokens, candidate.outputTokens)
 		if cost <= 0 || math.IsNaN(cost) || math.IsInf(cost, 0) {
 			result.Skipped++
 			continue
 		}
-		updates = append(updates, usageCostUpdate{ID: id, Cost: cost})
-	}
-	if err := rows.Err(); err != nil {
-		return result, err
+		updates = append(updates, usageCostUpdate{
+			ID:          candidate.id,
+			ChannelID:   channel.ID,
+			ChannelName: channel.Name,
+			Group:       channel.Group,
+			Cost:        cost,
+			LinkChannel: candidate.storedChannelID == 0,
+		})
 	}
 	if len(updates) == 0 {
 		return result, nil
@@ -3319,8 +3366,19 @@ func (s *Store) RecalculateUsageCosts(ctx context.Context, start, end int64, use
 		return result, err
 	}
 	defer stmt.Close()
+	linkStmt, err := tx.PrepareContext(ctx, `UPDATE usage_logs
+		SET channel_id = ?, channel_name = ?, group_name = ?, cost = ? WHERE id = ?`)
+	if err != nil {
+		return result, err
+	}
+	defer linkStmt.Close()
 	for _, update := range updates {
-		res, err := stmt.ExecContext(ctx, update.Cost, update.ID)
+		var res sql.Result
+		if update.LinkChannel {
+			res, err = linkStmt.ExecContext(ctx, update.ChannelID, update.ChannelName, update.Group, update.Cost, update.ID)
+		} else {
+			res, err = stmt.ExecContext(ctx, update.Cost, update.ID)
+		}
 		if err != nil {
 			return result, err
 		}
