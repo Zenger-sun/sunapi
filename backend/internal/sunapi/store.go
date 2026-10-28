@@ -2112,14 +2112,12 @@ func (s *Store) SavePlaygroundAttachment(ctx context.Context, userID int64, medi
 	if userID <= 0 {
 		userID = 1
 	}
-	mediaType = strings.TrimSpace(mediaType)
 	filename = truncateRunes(strings.TrimSpace(filepath.Base(filename)), 255)
-	if !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
-		return PlaygroundAttachment{}, errors.New("only image attachments are supported")
+	kind, normalizedType, _, err := playgroundAttachmentContent(filename, data)
+	if err != nil {
+		return PlaygroundAttachment{}, err
 	}
-	if len(data) == 0 {
-		return PlaygroundAttachment{}, errors.New("attachment is empty")
-	}
+	mediaType = normalizedType
 
 	id, err := generatePlaygroundAttachmentID()
 	if err != nil {
@@ -2128,9 +2126,10 @@ func (s *Store) SavePlaygroundAttachment(ctx context.Context, userID int64, medi
 	now := time.Now().Unix()
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO playground_attachments
 		(id, user_id, type, media_type, filename, size, data, created_at)
-		VALUES (?, ?, 'image', ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		id,
 		userID,
+		kind,
 		mediaType,
 		filename,
 		int64(len(data)),
@@ -2144,7 +2143,7 @@ func (s *Store) SavePlaygroundAttachment(ctx context.Context, userID int64, medi
 		ID:        id,
 		FileID:    id,
 		UserID:    userID,
-		Type:      "image",
+		Type:      kind,
 		URL:       "/api/playground/attachments/" + id,
 		MediaType: mediaType,
 		Filename:  filename,

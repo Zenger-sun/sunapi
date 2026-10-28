@@ -11,8 +11,14 @@ hosting, sale, resale, sublicensing, or commercial use requires prior written
 permission from the SunAPI project owner.
 */
 import { useEffect, useMemo, useState } from 'react'
+import { DownloadIcon, FileIcon } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import {
+  fetchAuthenticatedBlob,
+  useAuthenticatedImageSource,
+} from '@/lib/authenticated-media'
 import { cn } from '@/lib/utils'
-import { useAuthenticatedImageSource } from '@/lib/authenticated-media'
 import { Button } from '@/components/ui/button'
 import {
   HoverCard,
@@ -193,10 +199,17 @@ export function PlaygroundChat({
                                     attachment.type === 'image' &&
                                     attachment.omitted
                                 ).length ?? 0
+                              const fileAttachments =
+                                message.attachments?.filter(
+                                  (attachment) =>
+                                    attachment.type === 'file' &&
+                                    !attachment.omitted
+                                ) ?? []
                               const showAttachments =
                                 message.from === MESSAGE_ROLES.USER &&
                                 (imageAttachments.length > 0 ||
-                                  omittedImageCount > 0)
+                                  omittedImageCount > 0 ||
+                                  fileAttachments.length > 0)
 
                               // Extract visible content (remove <think> tags for assistant messages)
                               const displayContent = isAssistant
@@ -279,6 +292,19 @@ export function PlaygroundChat({
                                             omittedCount={omittedImageCount}
                                           />
                                         )}
+                                        {showAttachments &&
+                                          fileAttachments.length > 0 && (
+                                            <div className='mb-2 flex flex-wrap gap-2'>
+                                              {fileAttachments.map(
+                                                (attachment) => (
+                                                  <MessageFileAttachment
+                                                    attachment={attachment}
+                                                    key={attachment.id}
+                                                  />
+                                                )
+                                              )}
+                                            </div>
+                                          )}
                                         {showMessageContent && (
                                           <MessageContent
                                             variant='flat'
@@ -320,6 +346,62 @@ export function PlaygroundChat({
       </ConversationContent>
       <ConversationScrollButton />
     </Conversation>
+  )
+}
+
+function MessageFileAttachment({
+  attachment,
+}: {
+  attachment: NonNullable<MessageType['attachments']>[number]
+}) {
+  const { t } = useTranslation()
+  const [isDownloading, setIsDownloading] = useState(false)
+
+  const handleDownload = async () => {
+    setIsDownloading(true)
+    try {
+      const blob = await fetchAuthenticatedBlob(attachment.url)
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = attachment.filename || 'attachment'
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch {
+      toast.error(t('Failed to download file'))
+    } finally {
+      setIsDownloading(false)
+    }
+  }
+
+  return (
+    <Button
+      className='h-auto max-w-72 gap-2 px-3 py-2'
+      disabled={isDownloading || !attachment.url}
+      onClick={handleDownload}
+      title={attachment.filename}
+      variant='outline'
+    >
+      <FileIcon className='size-5 shrink-0' />
+      <span className='min-w-0 text-left'>
+        <span className='block truncate text-sm'>
+          {attachment.filename || t('File')}
+        </span>
+        {attachment.size != null && (
+          <span className='text-muted-foreground block text-xs'>
+            {attachment.size < 1024 * 1024
+              ? `${Math.ceil(attachment.size / 1024)} KB`
+              : `${(attachment.size / (1024 * 1024)).toFixed(1)} MB`}
+          </span>
+        )}
+      </span>
+      <DownloadIcon
+        aria-label={t('Download')}
+        className='ml-1 size-4 shrink-0'
+      />
+    </Button>
   )
 }
 

@@ -61,7 +61,7 @@ function getSessionTitle(messages: Message[]) {
   }
 
   if (firstUserMessage?.attachments?.length) {
-    return 'Image'
+    return firstUserMessage.attachments[0].filename || 'Image'
   }
 
   return 'Current conversation'
@@ -81,7 +81,7 @@ function getSessionSummary(messages: Message[]) {
     .reverse()
     .find((message) => message.attachments?.length)
   if (lastMessageWithAttachments?.attachments?.length) {
-    return 'Image'
+    return lastMessageWithAttachments.attachments[0].filename || 'Image'
   }
 
   return ''

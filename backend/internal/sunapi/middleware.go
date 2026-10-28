@@ -139,7 +139,20 @@ func playgroundResolveAttachments(store *Store) gin.HandlerFunc {
 					}
 					for _, rawPart := range parts {
 						part, ok := rawPart.(map[string]any)
-						if !ok || part["type"] != "image_url" {
+						if !ok {
+							continue
+						}
+						if part["type"] == "file" {
+							if err := playgroundResolveAttachmentFile(c, store, part); err != nil {
+								c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{
+									"message": err.Error(), "type": "invalid_request_error", "code": "invalid_attachment",
+								}})
+								return
+							}
+							changed = true
+							continue
+						}
+						if part["type"] != "image_url" {
 							continue
 						}
 						imageURL, ok := part["image_url"].(map[string]any)
@@ -261,7 +274,7 @@ func playgroundAttachmentDataURL(c *gin.Context, store *Store, id string) (strin
 		return "", false
 	}
 	attachment, err := store.GetPlaygroundAttachment(c.Request.Context(), playgroundUserID(c), id)
-	if err != nil || len(attachment.Data) == 0 || attachment.MediaType == "" {
+	if err != nil || attachment.Type != "image" || len(attachment.Data) == 0 || !strings.HasPrefix(attachment.MediaType, "image/") {
 		return "", false
 	}
 	return "data:" + attachment.MediaType + ";base64," + base64.StdEncoding.EncodeToString(attachment.Data), true

@@ -152,7 +152,10 @@ export function formatMessageForAPI(message: Message): ChatCompletionMessage {
 
   return {
     role: message.from,
-    content: buildMessageContent(currentVersion.content, images),
+    content: appendMessageFiles(
+      buildMessageContent(currentVersion.content, images),
+      message.attachments
+    ),
   }
 }
 
@@ -163,8 +166,31 @@ export function formatMessageForAPIWithoutImages(
 
   return {
     role: message.from,
-    content: currentVersion.content,
+    content: appendMessageFiles(currentVersion.content, message.attachments),
   }
+}
+
+function appendMessageFiles(
+  content: string | ContentPart[],
+  attachments: MessageAttachment[] = []
+): string | ContentPart[] {
+  const files = attachments.filter(
+    (attachment) =>
+      attachment.type === 'file' && !attachment.omitted && attachment.file_id
+  )
+  if (!files.length) return content
+
+  return [
+    ...(typeof content === 'string'
+      ? content.trim()
+        ? [{ type: 'text' as const, text: content }]
+        : []
+      : content),
+    ...files.map((attachment) => ({
+      type: 'file' as const,
+      file: { file_id: attachment.file_id!, filename: attachment.filename },
+    })),
+  ]
 }
 
 /**

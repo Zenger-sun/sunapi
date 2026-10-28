@@ -110,14 +110,15 @@ export function ChatWorkspace({
         versions: [{ id: 'v1', content: text }],
         attachments,
       }
-      if (isAgentTaskPrompt(text)) {
+      if (attachments.length === 0 && isAgentTaskPrompt(text)) {
         const assistantMessage: MessageType = {
           key: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           from: 'assistant',
           versions: [
             {
               id: 'v1',
-              content: '已根据这条对话开启智能体任务草稿，可在智能体中继续调整蓝图。',
+              content:
+                '已根据这条对话开启智能体任务草稿，可在智能体中继续调整蓝图。',
             },
           ],
           status: 'complete',
@@ -257,8 +258,12 @@ export function ChatWorkspace({
 }
 
 function isAgentTaskPrompt(text: string) {
-  return /^\s*\/agent\b/i.test(text) ||
-    /开启智能体|创建智能体|启动智能体|智能体任务|生成蓝图|创建蓝图|蓝图任务/.test(text)
+  return (
+    /^\s*\/agent\b/i.test(text) ||
+    /开启智能体|创建智能体|启动智能体|智能体任务|生成蓝图|创建蓝图|蓝图任务/.test(
+      text
+    )
+  )
 }
 
 function EmptyState({

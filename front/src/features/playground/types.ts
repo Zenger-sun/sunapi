@@ -23,7 +23,7 @@ export interface MessageVersion {
 export interface MessageAttachment {
   id: string
   file_id?: string
-  type: 'image'
+  type: 'image' | 'file'
   url: string
   mediaType?: string
   filename?: string
@@ -62,11 +62,15 @@ export interface ChatCompletionMessage {
 }
 
 export interface ContentPart {
-  type: 'text' | 'image_url'
+  type: 'text' | 'image_url' | 'file'
   text?: string
   image_url?: {
     url: string
     file_id?: string
+  }
+  file?: {
+    file_id: string
+    filename?: string
   }
 }
 
@@ -151,7 +155,7 @@ export interface PlaygroundSessionPayload {
 export interface PlaygroundAttachment {
   id: string
   file_id: string
-  type: 'image'
+  type: 'image' | 'file'
   url: string
   media_type: string
   filename: string

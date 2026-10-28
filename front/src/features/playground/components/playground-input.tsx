@@ -10,10 +10,11 @@ This source is available for evaluation, but modification, redistribution,
 hosting, sale, resale, sublicensing, or commercial use requires prior written
 permission from the SunAPI project owner.
 */
-import { useState, type ComponentType, type CSSProperties } from 'react'
+import { useRef, useState, type ComponentType, type CSSProperties } from 'react'
 import {
   PaperclipIcon,
   FileIcon,
+  ImageIcon,
   ScreenShareIcon,
   CameraIcon,
   SendIcon,
@@ -34,7 +35,6 @@ import {
 } from '@/components/ui/dropdown-menu'
 import {
   PromptInput,
-  PromptInputActionAddAttachments,
   PromptInputAttachment,
   PromptInputButton,
   PromptInputFooter,
@@ -141,21 +141,19 @@ export function PlaygroundInput({
 
   const handleSubmit = async (message: PromptInputMessage) => {
     const text = message.text?.trim() ?? ''
-    const imageFiles = (message.files ?? []).filter(
-      (file) => file.mediaType?.startsWith('image/') && file.file
-    )
+    const files = (message.files ?? []).filter((file) => file.file)
 
-    if ((!text && imageFiles.length === 0) || disabled || isUploading) return
+    if ((!text && files.length === 0) || disabled || isUploading) return
 
     setIsUploading(true)
     try {
       const attachments = await Promise.all(
-        imageFiles.map<Promise<MessageAttachment>>(async (file) => {
+        files.map<Promise<MessageAttachment>>(async (file) => {
           const uploaded = await uploadPlaygroundAttachment(file.file!)
           return {
             id: uploaded.id,
             file_id: uploaded.file_id || uploaded.id,
-            type: 'image',
+            type: uploaded.type,
             url: uploaded.url,
             mediaType: uploaded.media_type || file.mediaType,
             filename: uploaded.filename || file.filename,
@@ -191,7 +189,7 @@ export function PlaygroundInput({
   return (
     <div className='grid shrink-0 gap-3 px-1'>
       <PromptInput
-        accept='image/*'
+        accept='image/*,.pdf,.docx,.xlsx,.txt,.md,.csv,.json,.html,.htm,.xml,.yaml,.yml,.log,.js,.jsx,.ts,.tsx,.py,.go,.java,.c,.cpp,.h,.css,.sql,.sh,.rs,.toml,.ini'
         globalDrop
         groupClassName='rounded-xl'
         maxFileSize={12 * 1024 * 1024}
@@ -231,11 +229,8 @@ export function PlaygroundInput({
                 <span className='sr-only sm:hidden'>{t('Attach')}</span>
               </DropdownMenuTrigger>
               <DropdownMenuContent align='start'>
-                <PromptInputActionAddAttachments label={t('Upload photo')} />
-                <DropdownMenuItem onClick={() => handleFileAction('file')}>
-                  <FileIcon className='mr-2' size={16} />
-                  {t('Upload file')}
-                </DropdownMenuItem>
+                <PlaygroundUploadAction imageOnly />
+                <PlaygroundUploadAction />
                 <DropdownMenuItem
                   onClick={() => handleFileAction('take-screenshot')}
                 >
@@ -315,20 +310,59 @@ export function PlaygroundInput({
 
 function PlaygroundAttachmentPreview() {
   const attachments = usePromptInputAttachments()
-  const imageAttachments = attachments.files.filter((file) =>
-    file.mediaType?.startsWith('image/')
-  )
 
-  if (imageAttachments.length === 0) {
+  if (attachments.files.length === 0) {
     return null
   }
 
   return (
     <PromptInputHeader className='px-3 pt-3 pb-0'>
-      {imageAttachments.map((attachment) => (
+      {attachments.files.map((attachment) => (
         <PromptInputAttachment data={attachment} key={attachment.id} />
       ))}
     </PromptInputHeader>
+  )
+}
+
+function PlaygroundUploadAction({
+  imageOnly = false,
+}: {
+  imageOnly?: boolean
+}) {
+  const { t } = useTranslation()
+  const attachments = usePromptInputAttachments()
+  const inputRef = useRef<HTMLInputElement>(null)
+  const Icon = imageOnly ? ImageIcon : FileIcon
+
+  return (
+    <>
+      {imageOnly && (
+        <input
+          accept='image/*'
+          aria-label={t('Upload photo')}
+          className='hidden'
+          multiple
+          onChange={(event) => {
+            if (event.currentTarget.files)
+              attachments.add(event.currentTarget.files)
+            event.currentTarget.value = ''
+          }}
+          ref={inputRef}
+          type='file'
+        />
+      )}
+      <DropdownMenuItem
+        onSelect={(event) => {
+          if (imageOnly) {
+            event.preventDefault()
+            inputRef.current?.click()
+          } else attachments.openFileDialog()
+        }}
+      >
+        <Icon className='mr-2' size={16} />
+        {t(imageOnly ? 'Upload photo' : 'Upload file')}
+      </DropdownMenuItem>
+    </>
   )
 }
 
@@ -341,14 +375,11 @@ function PlaygroundSubmitButton({
 }) {
   const { t } = useTranslation()
   const attachments = usePromptInputAttachments()
-  const hasImageAttachment = attachments.files.some((file) =>
-    file.mediaType?.startsWith('image/')
-  )
 
   return (
     <PromptInputButton
       className='text-foreground font-medium'
-      disabled={disabled || (!text.trim() && !hasImageAttachment)}
+      disabled={disabled || (!text.trim() && attachments.files.length === 0)}
       type='submit'
       variant='secondary'
     >

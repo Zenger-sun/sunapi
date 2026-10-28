@@ -477,6 +477,7 @@ export const PromptInput = ({
 
   // Refs
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const submittingRef = useRef(false)
   const anchorRef = useRef<HTMLSpanElement>(null)
   const formRef = useRef<HTMLFormElement | null>(null)
 
@@ -501,36 +502,40 @@ export const PromptInput = ({
       if (!accept || accept.trim() === '') {
         return true
       }
-      if (accept.includes('image/*')) {
-        return f.type.startsWith('image/')
-      }
-      // NOTE: keep simple; expand as needed
-      return true
+      const mediaType = f.type.toLowerCase()
+      const filename = f.name.toLowerCase()
+      return accept.split(',').some((value) => {
+        const type = value.trim().toLowerCase()
+        if (type === '*/*') return true
+        if (type.startsWith('.')) return filename.endsWith(type)
+        if (type.endsWith('/*')) return mediaType.startsWith(type.slice(0, -1))
+        return mediaType === type
+      })
     },
     [accept]
   )
 
   const addLocal = useCallback(
     (fileList: File[] | FileList) => {
+      if (submittingRef.current) return
       const incoming = Array.from(fileList)
       const accepted = incoming.filter((f) => matchesAccept(f))
-      if (incoming.length && accepted.length === 0) {
+      if (accepted.length < incoming.length) {
         onError?.({
           code: 'accept',
-          message: t('No files match the accepted types.'),
+          message: t('Some files do not match the accepted types.'),
         })
-        return
       }
       const withinSize = (f: File) =>
         maxFileSize ? f.size <= maxFileSize : true
       const sized = accepted.filter(withinSize)
-      if (accepted.length > 0 && sized.length === 0) {
+      if (sized.length < accepted.length) {
         onError?.({
           code: 'max_file_size',
-          message: t('All files exceed the maximum size.'),
+          message: t('Some files exceed the maximum size.'),
         })
-        return
       }
+      if (sized.length === 0) return
 
       setItems((prev) => {
         const capacity =
@@ -634,6 +639,7 @@ export const PromptInput = ({
       }
     }
     const onDrop = (e: DragEvent) => {
+      if (globalDrop) return
       if (e.dataTransfer?.types?.includes('Files')) {
         e.preventDefault()
       }
@@ -647,7 +653,7 @@ export const PromptInput = ({
       form.removeEventListener('dragover', onDragOver)
       form.removeEventListener('drop', onDrop)
     }
-  }, [add])
+  }, [add, globalDrop])
 
   useEffect(() => {
     if (!globalDrop) return
@@ -673,21 +679,27 @@ export const PromptInput = ({
     }
   }, [add, globalDrop])
 
+  const filesRef = useRef(files)
+  useEffect(() => {
+    filesRef.current = files
+  }, [files])
+
   useEffect(
     () => () => {
       if (!usingProvider) {
-        for (const f of files) {
+        for (const f of filesRef.current) {
           if (f.url) URL.revokeObjectURL(f.url)
         }
       }
     },
-    [usingProvider, files]
+    [usingProvider]
   )
 
   const handleChange: ChangeEventHandler<HTMLInputElement> = (event) => {
     if (event.currentTarget.files) {
       add(event.currentTarget.files)
     }
+    event.currentTarget.value = ''
   }
 
   const ctx = useMemo<AttachmentsContext>(
@@ -704,6 +716,7 @@ export const PromptInput = ({
 
   const handleSubmit: FormEventHandler<HTMLFormElement> = (event) => {
     event.preventDefault()
+    if (submittingRef.current) return
 
     const form = event.currentTarget
     const text = usingProvider
@@ -713,12 +726,7 @@ export const PromptInput = ({
           return (formData.get('message') as string) || ''
         })()
 
-    // Reset form immediately after capturing text to avoid race condition
-    // where user input during async blob conversion would be lost
-    if (!usingProvider) {
-      form.reset()
-    }
-
+    submittingRef.current = true
     try {
       const result = onSubmit({ text, files }, event)
 
@@ -726,6 +734,7 @@ export const PromptInput = ({
       if (result instanceof Promise) {
         result
           .then(() => {
+            if (!usingProvider) form.reset()
             clear()
             if (usingProvider) {
               controller.textInput.clear()
@@ -734,15 +743,21 @@ export const PromptInput = ({
           .catch(() => {
             // Don't clear on error - user may want to retry
           })
+          .finally(() => {
+            submittingRef.current = false
+          })
       } else {
         // Sync function completed without throwing, clear attachments
+        if (!usingProvider) form.reset()
         clear()
         if (usingProvider) {
           controller.textInput.clear()
         }
+        submittingRef.current = false
       }
     } catch (_error) {
       // Don't clear on error - user may want to retry
+      submittingRef.current = false
     }
   }
 

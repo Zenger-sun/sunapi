@@ -884,6 +884,12 @@ func RegisterPlaygroundRoutes(engine *gin.Engine, store *Store, base *handlers.B
 
 func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 	api.POST("/playground/attachments", func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPlaygroundAttachmentBytes+1024*1024)
+		defer func() {
+			if c.Request.MultipartForm != nil {
+				_ = c.Request.MultipartForm.RemoveAll()
+			}
+		}()
 		file, err := c.FormFile("file")
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
@@ -893,7 +899,7 @@ func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 			fail(c, http.StatusBadRequest, errors.New("attachment is empty"))
 			return
 		}
-		if file.Size > 12*1024*1024 {
+		if file.Size > maxPlaygroundAttachmentBytes {
 			fail(c, http.StatusBadRequest, errors.New("attachment is too large"))
 			return
 		}
@@ -905,12 +911,12 @@ func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 		}
 		defer src.Close()
 
-		data, err := io.ReadAll(io.LimitReader(src, 12*1024*1024+1))
+		data, err := io.ReadAll(io.LimitReader(src, maxPlaygroundAttachmentBytes+1))
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		if len(data) > 12*1024*1024 {
+		if len(data) > maxPlaygroundAttachmentBytes {
 			fail(c, http.StatusBadRequest, errors.New("attachment is too large"))
 			return
 		}
@@ -922,11 +928,6 @@ func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 		if parsed, _, err := mime.ParseMediaType(mediaType); err == nil {
 			mediaType = parsed
 		}
-		if !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
-			fail(c, http.StatusBadRequest, errors.New("only image attachments are supported"))
-			return
-		}
-
 		attachment, err := store.SavePlaygroundAttachment(c.Request.Context(), playgroundUserID(c), mediaType, file.Filename, data)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
@@ -941,8 +942,13 @@ func registerPlaygroundSessionRoutes(api *gin.RouterGroup, store *Store) {
 			return
 		}
 		c.Header("Cache-Control", "private, max-age=86400")
+		c.Header("X-Content-Type-Options", "nosniff")
 		if attachment.Filename != "" {
-			c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%q", attachment.Filename))
+			disposition := "inline"
+			if attachment.Type != "image" {
+				disposition = "attachment"
+			}
+			c.Header("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": attachment.Filename}))
 		}
 		c.Data(http.StatusOK, attachment.MediaType, attachment.Data)
 	})
